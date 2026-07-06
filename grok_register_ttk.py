@@ -386,13 +386,17 @@ def add_token_to_grok2api_remote_pool(raw_token, email="", log_callback=None):
 
     # 兜底：旧版全量保存接口
     current = {}
-    try:
-        resp = http_get(f"{base}/tokens", headers=headers, params=query, timeout=20, proxies={})
-        if resp.status_code == 200:
-            payload = resp.json()
-            current = payload.get("tokens", {}) if isinstance(payload, dict) else {}
-    except Exception:
-        current = {}
+    fallback_base = api_bases[0] if api_bases else base
+    for api_base in api_bases or [base]:
+        try:
+            resp = http_get(f"{api_base}/tokens", headers=headers, params=query, timeout=20, proxies={})
+            if resp.status_code == 200:
+                payload = resp.json()
+                current = payload.get("tokens", {}) if isinstance(payload, dict) else {}
+                fallback_base = api_base
+                break
+        except Exception:
+            continue
     if not isinstance(current, dict):
         current = {}
     pool = current.get(pool_name)
@@ -407,11 +411,21 @@ def add_token_to_grok2api_remote_pool(raw_token, email="", log_callback=None):
     if token not in existing:
         pool.append({"token": token, "tags": ["auto-register"], "note": email})
     current[pool_name] = pool
-    resp2 = http_post(f"{base}/tokens", headers=headers, params=query, json=current, timeout=30, proxies={})
-    resp2.raise_for_status()
-    if log_callback:
-        log_callback(f"[+] 已写入 grok2api 远端池: {pool_name} ({base}/tokens)")
-    return True
+    save_errors = []
+    save_bases = []
+    for item in [fallback_base, *(api_bases or [base])]:
+        if item and item not in save_bases:
+            save_bases.append(item)
+    for api_base in save_bases:
+        try:
+            resp2 = http_post(f"{api_base}/tokens", headers=headers, params=query, json=current, timeout=30, proxies={})
+            resp2.raise_for_status()
+            if log_callback:
+                log_callback(f"[+] 已写入 grok2api 远端池: {pool_name} ({api_base}/tokens)")
+            return True
+        except Exception as save_exc:
+            save_errors.append(f"{api_base}/tokens: {save_exc}")
+    raise RuntimeError(f"grok2api 远端 /tokens 全量模式写入失败: {'; '.join(save_errors)}")
 
 
 def add_token_to_grok2api_pools(raw_token, email="", log_callback=None):
