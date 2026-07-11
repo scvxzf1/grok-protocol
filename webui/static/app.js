@@ -64,14 +64,34 @@ function appendLog(line) {
   if ($("autoScroll").checked) logBox.scrollTop = logBox.scrollHeight;
 }
 
+
+function formatElapsed(sec) {
+  const n = Math.max(0, Number(sec) || 0);
+  if (n < 60) return `${n}s`;
+  const m = Math.floor(n / 60);
+  const s = n % 60;
+  return `${m}m${String(s).padStart(2, "0")}s`;
+}
+
+function formatSpeed(v) {
+  if (v === null || v === undefined || Number.isNaN(Number(v))) return "-";
+  return `${Number(v).toFixed(1)} 个/分钟`;
+}
+
+function formatRate(v) {
+  if (v === null || v === undefined || Number.isNaN(Number(v))) return "-";
+  return `${(Number(v) * 100).toFixed(1)}%`;
+}
+
 function renderSnapshot(snap) {
   if (!snap) return;
   const total = snap.count || 0;
   const done = (snap.completed || 0);
   const pct = total ? Math.round(done * 100 / total) : 0;
   $("progressBar").style.width = pct + "%";
-  $("progressStats").textContent =
-    `run=${snap.run_id || "-"} | 完成 ${done}/${total} | 成功 ${snap.succeeded || 0} | 失败 ${snap.failed || 0} | 活动 ${snap.active || 0}`;
+  const line1 = `run=${snap.run_id || "-"} | 完成 ${done}/${total} | 成功 ${snap.succeeded || 0} | 失败 ${snap.failed || 0} | 活动 ${snap.active || 0}`;
+  const line2 = `速度 ${formatSpeed(snap.avg_success_per_min)} | 成功率 ${formatRate(snap.success_rate)} | 耗时 ${formatElapsed(snap.elapsed_sec)}`;
+  $("progressStats").textContent = `${line1}\n${line2}`;
   const fc = snap.failure_counts || {};
   $("failureBox").textContent = Object.keys(fc).length
     ? Object.entries(fc).map(([k,v]) => `${k}: ${v}`).join("\n")

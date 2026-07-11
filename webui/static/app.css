@@ -69,7 +69,11 @@ button.primary { background: #1d4f91; border-color: #2f6fbd; }
 button:hover { filter: brightness(1.08); }
 .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
 .msg { min-height: 1.2em; color: var(--warn); }
-.stats { font-variant-numeric: tabular-nums; }
+.stats {
+  font-variant-numeric: tabular-nums;
+  white-space: pre-line;
+  line-height: 1.5;
+}
 .bar { height: 8px; background: #0f1419; border-radius: 99px; overflow: hidden; margin: 10px 0; }
 #progressBar { height: 100%; width: 0; background: linear-gradient(90deg, #2f6fbd, #3dd68c); }
 .box, .log {
