@@ -176,7 +176,25 @@ function renderSnapshotNow(snap) {
     line1 = `run=${snap.run_id || "-"} | 完成 ${done}/${total} | 成功 ${snap.succeeded || 0} | 失败 ${snap.failed || 0}${stopPart} | 活动 ${snap.active || 0}`;
   }
   const phase = snap.phase ? ` | 阶段 ${snap.phase}` : "";
-  const line2 = `速度 ${formatSpeed(snap.avg_success_per_min)} | 成功率 ${formatRate(snap.success_rate)} | 耗时 ${formatElapsed(snap.elapsed_sec)}${phase}`;
+  const pauseReason = snap.refill_pause_reason || snap.pause_reason || "";
+  const paused = !!snap.refill_paused;
+  const circuit = !!snap.circuit_open;
+  const proxyBad = !!snap.proxy_unhealthy;
+  let pausePart = "";
+  if (paused || circuit || proxyBad) {
+    const tags = [];
+    if (circuit) tags.push("熔断");
+    if (proxyBad) tags.push("代理不可用");
+    if (paused && !circuit && !proxyBad) tags.push("补货暂停");
+    const why = pauseReason ? `：${String(pauseReason).slice(0, 80)}` : "";
+    pausePart = ` | ${tags.join('+')}${why}`;
+  }
+  const recentTotal = Number(snap.recent_total || 0);
+  const recentRate = snap.recent_fail_rate;
+  const recentPart = recentTotal > 0
+    ? ` | 近窗失败 ${snap.recent_fail_count || 0}/${recentTotal} (${formatRate(recentRate)})`
+    : "";
+  const line2 = `速度 ${formatSpeed(snap.avg_success_per_min)} | 成功率 ${formatRate(snap.success_rate)} | 耗时 ${formatElapsed(snap.elapsed_sec)}${phase}${recentPart}${pausePart}`;
   $("progressStats").textContent = `${line1}\n${line2}`;
   const fc = snap.failure_counts || {};
   $("failureBox").textContent = Object.keys(fc).length
@@ -215,8 +233,19 @@ function renderSnapshotNow(snap) {
     setFormDisabled(false);
     esShouldRun = false;
   } else if (snap.started) {
-    badge.textContent = snap.stopping ? "停止中" : "运行中";
-    badge.className = "badge run";
+    if (snap.stopping) {
+      badge.textContent = "停止中";
+      badge.className = "badge run";
+    } else if (snap.circuit_open) {
+      badge.textContent = "熔断暂停";
+      badge.className = "badge warn";
+    } else if (snap.proxy_unhealthy || snap.refill_paused) {
+      badge.textContent = "补货暂停";
+      badge.className = "badge warn";
+    } else {
+      badge.textContent = "运行中";
+      badge.className = "badge run";
+    }
     setFormDisabled(true);
   }
 }

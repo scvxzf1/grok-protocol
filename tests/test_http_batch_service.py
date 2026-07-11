@@ -583,6 +583,84 @@ class SnapshotMetricsTests(unittest.TestCase):
             self.assertEqual(runner.started_tasks, 3)
 
 
+
+    def test_recent_failure_circuit_pauses_refill(self):
+        runner = self._make_runner(count=1)
+        runner.plan.target_mode = svc.TARGET_MODE_CONTINUOUS
+        runner.plan.target_success = 0
+        runner.plan.workers = 4
+        runner.started = True
+        runner.phase = "running"
+        # fill outcome window with mostly failures
+        for i in range(svc.CIRCUIT_WINDOW_SIZE):
+            w = svc.WorkerState(index=i + 1)
+            runner.workers.append(w)
+            runner.worker_by_index[w.index] = w
+            # 90% fail
+            runner._mark_terminal(w, "failed" if i < int(svc.CIRCUIT_WINDOW_SIZE * 0.9) else "succeeded")
+        self.assertTrue(runner.refill_paused)
+        self.assertTrue(runner.circuit_open)
+        self.assertIn("熔断", runner.refill_pause_reason)
+        # while paused, no new spawns
+        with mock.patch.object(runner, "_spawn_one", side_effect=AssertionError("should not spawn")):
+            runner._spawn_available()
+        self.assertEqual(runner.started_tasks, 0)
+        snap = runner.snapshot()
+        self.assertTrue(snap["circuit_open"])
+        self.assertGreaterEqual(snap["recent_fail_rate"], svc.CIRCUIT_FAIL_RATE)
+
+    def test_proxy_death_pauses_and_auto_resumes(self):
+        runner = self._make_runner(count=1)
+        runner.plan.target_mode = svc.TARGET_MODE_CONTINUOUS
+        runner.plan.target_success = 0
+        runner.plan.workers = 2
+        runner.plan.embedded_proxy_enabled = True
+        runner.started = True
+        runner.phase = "running"
+
+        class Manager:
+            def __init__(self):
+                self.running = False
+                self.healthy = 0
+                self.total = 3
+
+            def status(self):
+                return {
+                    "running": self.running,
+                    "healthy": self.healthy,
+                    "total": self.total,
+                }
+
+            def acquire(self, exclude_ids=None):
+                if self.healthy <= 0:
+                    return None
+                return mock.Mock(id="1", name="n1", local_http="http://127.0.0.1:28001", ref_count=1)
+
+            def release(self, *a, **k):
+                return None
+
+        mgr = Manager()
+        runner.embedded_proxy_manager = mgr
+        # force immediate check
+        runner._last_proxy_health_check_at = 0.0
+        runner._evaluate_proxy_health(force=True)
+        self.assertTrue(runner.refill_paused)
+        self.assertTrue(runner._proxy_unhealthy)
+        self.assertIn("内嵌代理", runner.refill_pause_reason)
+
+        # recover
+        mgr.running = True
+        mgr.healthy = 2
+        runner._last_proxy_health_check_at = 0.0
+        runner._evaluate_proxy_health(force=True)
+        self.assertFalse(runner._proxy_unhealthy)
+        self.assertFalse(runner.refill_paused)
+
+        # can spawn after resume
+        with mock.patch.object(runner, "_spawn_one", side_effect=lambda w, acquire_proxy=True: (setattr(w, "status", "running") or True)):
+            runner._spawn_available()
+        self.assertEqual(runner.started_tasks, 2)
+
     def test_continuous_proxy_shortage_does_not_storm_failures(self):
         """Proxy lease misses must pause refill, not inflate failed into thousands."""
         runner = self._make_runner(count=1)

@@ -38,6 +38,11 @@ TARGET_MODE_COUNT = "count"
 TARGET_MODE_CONTINUOUS = "continuous"
 DEFAULT_REFILL_PAUSE_SEC = 2.0
 REFILL_PAUSE_LOG_INTERVAL_SEC = 5.0
+CIRCUIT_WINDOW_SIZE = 50
+CIRCUIT_FAIL_RATE = 0.8
+CIRCUIT_PAUSE_SEC = 30.0
+PROXY_HEALTH_CHECK_INTERVAL_SEC = 15.0
+PROXY_DEAD_PAUSE_SEC = 15.0
 RECENT_WORKER_WINDOW = 200
 MAX_WORKERS = 32
 MAX_LOCAL_TURNSTILE_WORKERS = 3  # default local Turnstile concurrency cap
@@ -1080,6 +1085,11 @@ class BatchRunner:
         self.refill_pause_until: float = 0.0
         self.refill_pause_reason: str = ""
         self._last_refill_pause_log_at: float = 0.0
+        # outcome window for circuit breaker: True=success, False=failed (ignore stopped)
+        self._outcome_window: Deque[bool] = deque(maxlen=CIRCUIT_WINDOW_SIZE)
+        self.circuit_open = False
+        self._last_proxy_health_check_at: float = 0.0
+        self._proxy_unhealthy = False
 
     @staticmethod
     def _free_loopback_port() -> int:
@@ -1239,8 +1249,12 @@ class BatchRunner:
         worker.status = status
         if status == "succeeded":
             self.succeeded_count += 1
+            self._outcome_window.append(True)
+            self._maybe_trip_circuit()
         elif status == "failed":
             self.failed_count += 1
+            self._outcome_window.append(False)
+            self._maybe_trip_circuit()
         elif status == "stopped":
             self.stopped_count += 1
         # Keep a compact recent window for UI; full history stays on disk logs.
@@ -1516,39 +1530,196 @@ class BatchRunner:
         )
         worker.convert_thread.start()
 
-    def _pause_refill(self, reason: str, *, seconds: float | None = None) -> None:
-        """Temporarily stop creating new tasks (resource shortage, not business failure)."""
+    def _pause_refill(
+        self,
+        reason: str,
+        *,
+        seconds: float | None = None,
+        hold: bool = False,
+        kind: str = "resource",
+    ) -> None:
+        """Temporarily stop creating new tasks.
+
+        hold=True means "pause until condition clears" (proxy dead / circuit).
+        Timed pauses still auto-clear after seconds.
+        """
         wait = DEFAULT_REFILL_PAUSE_SEC if seconds is None else max(0.2, float(seconds))
         now = time.monotonic()
-        until = now + wait
+        if hold:
+            # far-future sentinel; health/circuit logic clears it explicitly
+            until = now + max(wait, 24 * 3600)
+        else:
+            until = now + wait
         # Keep the longer pause if already paused.
         if self.refill_paused and self.refill_pause_until > until:
             until = self.refill_pause_until
+        prev_reason = self.refill_pause_reason
         self.refill_paused = True
         self.refill_pause_until = until
         self.refill_pause_reason = str(reason or "补货暂停")
-        if (now - float(self._last_refill_pause_log_at or 0.0)) >= REFILL_PAUSE_LOG_INTERVAL_SEC:
+        if kind == "circuit":
+            self.circuit_open = True
+        if kind == "proxy":
+            self._proxy_unhealthy = True
+        should_log = (
+            prev_reason != self.refill_pause_reason
+            or (now - float(self._last_refill_pause_log_at or 0.0)) >= REFILL_PAUSE_LOG_INTERVAL_SEC
+        )
+        if should_log:
             self._last_refill_pause_log_at = now
-            self._log(
-                "SYSTEM",
-                f"补货暂停 {wait:.1f}s：{self.refill_pause_reason}（不计入失败）",
-            )
+            if hold:
+                self._log(
+                    "SYSTEM",
+                    f"补货暂停（等待恢复）：{self.refill_pause_reason}",
+                )
+            else:
+                self._log(
+                    "SYSTEM",
+                    f"补货暂停 {wait:.1f}s：{self.refill_pause_reason}（不计入失败）",
+                )
 
-    def _clear_refill_pause(self, *, resume_log: bool = False) -> None:
+    def _clear_refill_pause(self, *, resume_log: bool = False, clear_circuit: bool = False) -> None:
         was_paused = bool(self.refill_paused)
+        reason = self.refill_pause_reason
         self.refill_paused = False
         self.refill_pause_until = 0.0
-        reason = self.refill_pause_reason
         self.refill_pause_reason = ""
+        if clear_circuit:
+            self.circuit_open = False
         if was_paused and resume_log:
             self._log("SYSTEM", f"补货恢复：{reason or '资源已恢复'}")
 
+    def _recent_fail_rate(self) -> tuple[int, int, float]:
+        outcomes = list(self._outcome_window)
+        total = len(outcomes)
+        if total <= 0:
+            return 0, 0, 0.0
+        fails = sum(1 for ok in outcomes if not ok)
+        return fails, total, float(fails) / float(total)
+
+    def _maybe_trip_circuit(self) -> None:
+        fails, total, rate = self._recent_fail_rate()
+        if total < CIRCUIT_WINDOW_SIZE:
+            return
+        if rate < CIRCUIT_FAIL_RATE:
+            # healthy enough; allow circuit to close on next timed resume
+            if self.circuit_open and rate <= 0.5:
+                self.circuit_open = False
+            return
+        self._pause_refill(
+            f"近窗失败熔断：最近 {total} 单失败率 {rate:.0%}（失败 {fails}）",
+            seconds=CIRCUIT_PAUSE_SEC,
+            hold=False,
+            kind="circuit",
+        )
+
+    def _proxy_health_snapshot(self) -> dict:
+        manager = self.embedded_proxy_manager
+        if manager is None:
+            return {"enabled": True, "ready": False, "running": False, "healthy": 0, "total": 0}
+        try:
+            st = dict(manager.status() or {})
+        except Exception as exc:  # pragma: no cover - defensive
+            return {
+                "enabled": True,
+                "ready": False,
+                "running": False,
+                "healthy": 0,
+                "total": 0,
+                "error": str(exc),
+            }
+        healthy = int(st.get("healthy") or 0)
+        total = int(st.get("total") or 0)
+        running = bool(st.get("running"))
+        ready = running and healthy > 0
+        return {
+            "enabled": True,
+            "ready": ready,
+            "running": running,
+            "healthy": healthy,
+            "total": total,
+            "error": st.get("error") or "",
+        }
+
+    def _evaluate_proxy_health(self, *, force: bool = False) -> None:
+        """Pause when embedded proxy is dead; auto-resume when healthy nodes return."""
+        if not self.plan.embedded_proxy_enabled:
+            self._proxy_unhealthy = False
+            return
+        if self.done or self.stopping or self.phase == "draining":
+            return
+        now = time.monotonic()
+        if (
+            not force
+            and (now - float(self._last_proxy_health_check_at or 0.0)) < PROXY_HEALTH_CHECK_INTERVAL_SEC
+        ):
+            return
+        self._last_proxy_health_check_at = now
+        snap = self._proxy_health_snapshot()
+        if not snap.get("ready"):
+            if snap.get("error"):
+                reason = f"内嵌代理不可用：{snap.get('error')}"
+            elif not snap.get("running"):
+                reason = "内嵌代理进程未运行"
+            elif int(snap.get("total") or 0) <= 0:
+                reason = "内嵌代理无节点"
+            else:
+                reason = (
+                    f"内嵌代理无可用节点（healthy={snap.get('healthy')}/"
+                    f"{snap.get('total')}）"
+                )
+            self._proxy_unhealthy = True
+            self._pause_refill(reason, seconds=PROXY_DEAD_PAUSE_SEC, hold=True, kind="proxy")
+            return
+        # healthy again
+        if self._proxy_unhealthy or (
+            self.refill_paused and ("内嵌代理" in (self.refill_pause_reason or ""))
+        ):
+            self._proxy_unhealthy = False
+            # only auto-resume if pause was proxy-related (not circuit hold still needed)
+            if self.circuit_open:
+                # keep paused for circuit timer; just clear proxy flag
+                if "内嵌代理" in (self.refill_pause_reason or ""):
+                    # replace reason to circuit if still open
+                    fails, total, rate = self._recent_fail_rate()
+                    self.refill_pause_reason = (
+                        f"近窗失败熔断：最近 {total} 单失败率 {rate:.0%}（失败 {fails}）"
+                    )
+                return
+            if self.refill_paused:
+                self._clear_refill_pause(resume_log=True, clear_circuit=False)
+
     def _refill_pause_active(self) -> bool:
+        # Always re-check proxy health on a cadence while running.
+        self._evaluate_proxy_health(force=False)
         if not self.refill_paused:
             return False
         now = time.monotonic()
+        # Hold pauses (proxy dead) do not auto-clear by timer.
+        if self._proxy_unhealthy:
+            if (now - float(self._last_refill_pause_log_at or 0.0)) >= REFILL_PAUSE_LOG_INTERVAL_SEC:
+                self._last_refill_pause_log_at = now
+                self._log(
+                    "SYSTEM",
+                    f"补货仍暂停（等待代理恢复）：{self.refill_pause_reason or '代理不可用'}",
+                )
+            return True
         if now >= float(self.refill_pause_until or 0.0):
-            self._clear_refill_pause(resume_log=True)
+            # timed pause expired
+            if self.circuit_open:
+                # re-evaluate circuit with latest window
+                fails, total, rate = self._recent_fail_rate()
+                if total >= CIRCUIT_WINDOW_SIZE and rate >= CIRCUIT_FAIL_RATE:
+                    # still bad: extend
+                    self._pause_refill(
+                        f"近窗失败熔断延续：最近 {total} 单失败率 {rate:.0%}（失败 {fails}）",
+                        seconds=CIRCUIT_PAUSE_SEC,
+                        hold=False,
+                        kind="circuit",
+                    )
+                    return True
+                self.circuit_open = False
+            self._clear_refill_pause(resume_log=True, clear_circuit=False)
             return False
         # Throttled reminder while still paused.
         if (now - float(self._last_refill_pause_log_at or 0.0)) >= REFILL_PAUSE_LOG_INTERVAL_SEC:
@@ -1900,6 +2071,8 @@ class BatchRunner:
         self._drain_events()
         self._check_processes()
         self._prune_finished_workers()
+        # Keep proxy health / circuit state fresh even when idle slots exist.
+        self._evaluate_proxy_health(force=False)
         # If success target / runtime reached, flip to draining.
         if self.phase == "running" and not self._should_refill():
             self.phase = "draining"
@@ -1958,6 +2131,7 @@ class BatchRunner:
             None if elapsed_sec < 1 else float(succeeded) / (elapsed_sec / 60.0)
         )
         success_rate = None if completed == 0 else float(succeeded) / float(completed)
+        win_fails, win_total, win_rate = self._recent_fail_rate()
 
         # UI only needs active + recent terminals; full history is on disk.
         active_workers = self.active
@@ -1977,6 +2151,9 @@ class BatchRunner:
             "phase": self.phase,
             "refill_paused": bool(self.refill_paused),
             "refill_pause_reason": self.refill_pause_reason or "",
+            "pause_reason": self.refill_pause_reason or "",
+            "circuit_open": bool(self.circuit_open),
+            "proxy_unhealthy": bool(self._proxy_unhealthy),
             "target_mode": getattr(self.plan, "target_mode", TARGET_MODE_COUNT),
             "target_success": int(getattr(self.plan, "target_success", 0) or 0),
             "count": planned_count,
@@ -1995,6 +2172,9 @@ class BatchRunner:
             "elapsed_sec": elapsed_sec,
             "avg_success_per_min": avg_success_per_min,
             "success_rate": success_rate,
+            "recent_fail_count": int(win_fails),
+            "recent_total": int(win_total),
+            "recent_fail_rate": float(win_rate),
             "worker_total": len(shown_workers),
             "workers_truncated": max(0, int(self.started_tasks) - len(shown_workers)),
             "workers": [
