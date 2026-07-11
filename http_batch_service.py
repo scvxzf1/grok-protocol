@@ -759,6 +759,9 @@ class BatchRunner:
         self.account_count = 0
         self.failure_counts: Dict[str, int] = {key: 0 for key in FAILURE_CATEGORIES}
         self._failure_recorded: set[int] = set()
+        self.started_at_wall: Optional[str] = None
+        self.started_at_monotonic: Optional[float] = None
+        self.finished_at_monotonic: Optional[float] = None
 
     @property
     def active(self) -> List[WorkerState]:
@@ -794,6 +797,8 @@ class BatchRunner:
             except OSError:
                 pass
         self.started = True
+        self.started_at_monotonic = time.monotonic()
+        self.started_at_wall = time.strftime("%Y-%m-%dT%H:%M:%S")
         self._log("SYSTEM", "HTTP 协议批量任务已启动（邮箱/OTP/注册走协议；仅 local Turnstile 会临时开浏览器）")
         for warning in self.plan.warnings:
             self._log("SYSTEM", warning)
@@ -1103,6 +1108,8 @@ class BatchRunner:
                 pass
             self.summary_path = summary
             self.account_count = len(lines)
+        if self.finished_at_monotonic is None:
+            self.finished_at_monotonic = time.monotonic()
         self.done = True
         self._write_summary_json()
         self._log(
@@ -1155,14 +1162,28 @@ class BatchRunner:
         self._failure_recorded.add(worker.index)
 
     def snapshot(self) -> Dict[str, object]:
+        if self.started_at_monotonic is None:
+            elapsed_sec = 0
+        elif self.finished_at_monotonic is not None:
+            elapsed_sec = max(0, int(self.finished_at_monotonic - self.started_at_monotonic))
+        else:
+            elapsed_sec = max(0, int(time.monotonic() - self.started_at_monotonic))
+
+        completed = self.completed
+        succeeded = self.succeeded
+        avg_success_per_min = (
+            None if elapsed_sec < 1 else float(succeeded) / (elapsed_sec / 60.0)
+        )
+        success_rate = None if completed == 0 else float(succeeded) / float(completed)
+
         return {
             "run_id": self.run_id,
             "started": self.started,
             "done": self.done,
             "stopping": self.stopping,
             "count": len(self.workers),
-            "completed": self.completed,
-            "succeeded": self.succeeded,
+            "completed": completed,
+            "succeeded": succeeded,
             "failed": self.failed,
             "active": len(self.active),
             "account_count": self.account_count,
@@ -1170,6 +1191,10 @@ class BatchRunner:
             "warnings": list(self.plan.warnings),
             "run_dir": str(self.run_dir),
             "summary_path": str(self.summary_path) if self.summary_path else "",
+            "started_at": self.started_at_wall or "",
+            "elapsed_sec": elapsed_sec,
+            "avg_success_per_min": avg_success_per_min,
+            "success_rate": success_rate,
             "workers": [
                 {
                     "index": worker.index,

@@ -201,5 +201,67 @@ class ProxyPoolTestTests(unittest.TestCase):
             self.assertFalse(data["results"][1]["ok"])
 
 
+
+
+class SnapshotMetricsTests(unittest.TestCase):
+    def _make_runner(self, count: int = 2) -> svc.BatchRunner:
+        plan = svc.RunPlan(
+            config_path=Path("config.json"),
+            run_mode=svc.RUN_MODE_REGISTER_OTP,
+            count=count,
+            workers=1,
+            output_dir=Path("."),
+            provider="capsolver",
+            email_provider="yyds",
+            proxy_mode="none",
+            proxy_args=[],
+            turnstile_headless=False,
+            sso_convert_retries=5,
+            sso_convert_cooldown=3,
+            warnings=[],
+        )
+        return svc.BatchRunner(plan)
+
+    def test_snapshot_metrics_before_start(self):
+        runner = self._make_runner()
+        snap = runner.snapshot()
+        self.assertEqual(snap["elapsed_sec"], 0)
+        self.assertIsNone(snap["avg_success_per_min"])
+        self.assertIsNone(snap["success_rate"])
+        self.assertEqual(snap["started_at"], "")
+
+    def test_snapshot_metrics_running(self):
+        runner = self._make_runner(count=3)
+        runner.started = True
+        runner.started_at_wall = "2026-07-11T12:00:00"
+        runner.started_at_monotonic = 1000.0
+        runner.workers[0].status = "succeeded"
+        runner.workers[1].status = "failed"
+        runner.workers[2].status = "running"
+        with mock.patch.object(svc.time, "monotonic", return_value=1120.0):
+            snap = runner.snapshot()
+        self.assertEqual(snap["elapsed_sec"], 120)
+        self.assertEqual(snap["completed"], 2)
+        self.assertEqual(snap["succeeded"], 1)
+        self.assertAlmostEqual(snap["avg_success_per_min"], 0.5)
+        self.assertAlmostEqual(snap["success_rate"], 0.5)
+        self.assertEqual(snap["started_at"], "2026-07-11T12:00:00")
+
+    def test_snapshot_metrics_freeze_after_finalize_time(self):
+        runner = self._make_runner(count=1)
+        runner.started = True
+        runner.started_at_wall = "2026-07-11T12:00:00"
+        runner.started_at_monotonic = 1000.0
+        runner.finished_at_monotonic = 1060.0
+        runner.workers[0].status = "succeeded"
+        with mock.patch.object(svc.time, "monotonic", return_value=9999.0):
+            snap1 = runner.snapshot()
+            snap2 = runner.snapshot()
+        self.assertEqual(snap1["elapsed_sec"], 60)
+        self.assertEqual(snap2["elapsed_sec"], 60)
+        self.assertAlmostEqual(snap1["avg_success_per_min"], 1.0)
+        self.assertAlmostEqual(snap1["success_rate"], 1.0)
+
+
 if __name__ == "__main__":
     unittest.main()
