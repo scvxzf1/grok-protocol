@@ -131,6 +131,7 @@ cp config.example.json config.json
 | --- | --- |
 | `turnstile_provider` | `yescaptcha` \| `capsolver` \| `2captcha` |
 | `turnstile_api_key` | 求解服务 key |
+| `local_turnstile_max_workers` | 本地浏览器 Turnstile 并发上限（默认 3，范围 1~6666；仅 `turnstile_provider=local` 生效） |
 | `XAI_TURNSTILE_PROVIDER` | 环境变量覆盖 provider |
 | `XAI_TURNSTILE_API_KEY` | 环境变量覆盖 key |
 | `CAPSOLVER_API_KEY` | `turnstile_provider=capsolver` 时的专用 key |
