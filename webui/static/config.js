@@ -241,8 +241,12 @@ $("btnImportSub").onclick = async () => {
 
     const usable = data.usable_http_count || 0;
     const total = data.node_count || 0;
+    const vlessCount = data.vless_count || (data.scheme_counts && data.scheme_counts.vless) || 0;
+    const embeddedOn = !!(form.elements.namedItem("embedded_proxy_enabled") || {}).checked;
     if (usable > 0) {
       setMsg(`订阅导入完成：可用 HTTP ${usable}/${total}`);
+    } else if (embeddedOn && (data.vless_for_embedded || vlessCount > 0)) {
+      setMsg(`已识别 ${vlessCount || total} 个 VLESS 节点。请到下方“内嵌代理内核”点启动/重载，再预检`, true);
     } else if (data.applied_local_http) {
       setMsg(`订阅无 HTTP 节点，已回退本地入口（节点 ${total}）`, true);
     } else {

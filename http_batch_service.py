@@ -2399,13 +2399,31 @@ class BatchService:
         result = import_proxy_subscription(sub_url, timeout=timeout)
         data = result.to_dict()
         cfg["proxy_subscription_url"] = sub_url
+        # 若启用内嵌 mihomo 且主要是 VLESS，弱化“只能走 Clash”的通用警告。
+        if _as_bool(cfg.get("embedded_proxy_enabled")):
+            vless_n = int((data.get("scheme_counts") or {}).get("vless") or 0)
+            if vless_n > 0 and not result.usable_pool_lines:
+                filtered = []
+                for w in list(data.get("warnings") or []):
+                    if "需要先导入本地 Clash" in str(w) or "没有可直接用于注册机的 HTTP" in str(w):
+                        continue
+                    filtered.append(w)
+                data["warnings"] = filtered
 
         local_http = str(local_http or cfg.get("proxy_subscription_local_http") or "").strip()
         if local_http:
             cfg["proxy_subscription_local_http"] = local_http
         pool_text_lines = list(result.pool_lines)
         applied_local = False
-        if use_local_http_if_empty and not result.usable_pool_lines and local_http:
+        embedded_enabled = _as_bool(cfg.get("embedded_proxy_enabled"))
+        vless_count = int((data.get("scheme_counts") or {}).get("vless") or 0)
+        # 内嵌 mihomo 开启时，VLESS 订阅走内嵌池，不应再强行回退本地 Clash 口。
+        if (
+            use_local_http_if_empty
+            and not result.usable_pool_lines
+            and local_http
+            and not (embedded_enabled and vless_count > 0)
+        ):
             pool_text_lines.append(local_http)
             applied_local = True
             data.setdefault("warnings", []).append(
@@ -2414,6 +2432,13 @@ class BatchService:
             self.settings.proxy_mode = "direct"
             self.settings.no_proxy = False
             cfg["proxy"] = local_http
+        elif not result.usable_pool_lines and embedded_enabled and vless_count > 0:
+            data.setdefault("warnings", []).append(
+                f"订阅含 {vless_count} 个 VLESS 节点。HTTP 代理池不可直接使用它们；"
+                "请到“内嵌代理内核”点击启动/重载与预检。"
+            )
+            data["vless_for_embedded"] = True
+            data["vless_count"] = vless_count
         elif result.usable_pool_lines:
             # HTTP/SOCKS 可入池时，默认切到代理池模式，避免用户还要手动改开关。
             self.settings.proxy_mode = "pool"
