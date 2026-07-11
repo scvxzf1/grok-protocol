@@ -1139,6 +1139,16 @@ class BatchRunner:
         command.extend(["--turnstile-workers", str(self.plan.turnstile_workers)])
         command.extend(["--turnstile-queue-size", str(self.plan.turnstile_queue_size)])
         command.extend(["--submit-workers", str(self.plan.submit_workers)])
+        # Turnstile per-try timeout + retries (defaults: 30s x 3)
+        cfg = {}
+        try:
+            cfg = _read_config(self.plan.config_path)
+        except Exception:
+            cfg = {}
+        solve_timeout = max(5, int(cfg.get("turnstile_solve_timeout") or 30))
+        solve_retries = max(1, int(cfg.get("turnstile_solve_retries") or 3))
+        command.extend(["--turnstile-solve-timeout", str(solve_timeout)])
+        command.extend(["--turnstile-solve-retries", str(solve_retries)])
         if self.plan.turnstile_broker_url:
             command.extend(["--turnstile-broker-url", self.plan.turnstile_broker_url])
         # 模式1：仓库内 PKCE OAuth。
@@ -2333,6 +2343,22 @@ class BatchService:
                 strict=True,
             )
 
+        if "turnstile_solve_timeout" in fields:
+            cfg["turnstile_solve_timeout"] = _bounded_int(
+                fields.get("turnstile_solve_timeout"),
+                "Turnstile单次超时",
+                minimum=5,
+                maximum=600,
+                default=int(cfg.get("turnstile_solve_timeout") or 30),
+            )
+        if "turnstile_solve_retries" in fields:
+            cfg["turnstile_solve_retries"] = _bounded_int(
+                fields.get("turnstile_solve_retries"),
+                "Turnstile重试次数",
+                minimum=1,
+                maximum=10,
+                default=int(cfg.get("turnstile_solve_retries") or 3),
+            )
         if "submit_workers" in fields:
             self.settings.submit_workers = _positive_int(
                 fields.get("submit_workers"),

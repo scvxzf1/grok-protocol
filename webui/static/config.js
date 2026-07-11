@@ -52,6 +52,14 @@ function fill(data) {
     "submit_workers",
     f.submit_workers == null ? 4 : f.submit_workers
   );
+  set(
+    "turnstile_solve_timeout",
+    f.turnstile_solve_timeout == null ? 30 : f.turnstile_solve_timeout
+  );
+  set(
+    "turnstile_solve_retries",
+    f.turnstile_solve_retries == null ? 3 : f.turnstile_solve_retries
+  );
   set("cloudflare_api_base", f.cloudflare_api_base || "");
   set("cloudflare_api_key", f.cloudflare_api_key || "");
   set("duckmail_api_key", f.duckmail_api_key || "");
@@ -106,6 +114,8 @@ function collectFields() {
     turnstile_headless: g("turnstile_headless", true),
     local_turnstile_max_workers: Number(g("local_turnstile_max_workers") || 3),
     submit_workers: Number(g("submit_workers") || 4),
+    turnstile_solve_timeout: Number(g("turnstile_solve_timeout") || 30),
+    turnstile_solve_retries: Number(g("turnstile_solve_retries") || 3),
     cloudflare_api_base: g("cloudflare_api_base"),
     cloudflare_api_key: g("cloudflare_api_key"),
     duckmail_api_key: g("duckmail_api_key"),

@@ -818,7 +818,7 @@ class BrowserWorker:
             or self.config.parent_proxy
             or ""
         ).strip()
-        timeout = max(30, int(request.timeout_sec or self.config.browser_timeout_sec))
+        timeout = max(5, int(request.timeout_sec or self.config.browser_timeout_sec))
         headless = bool(request.headless) or bool(self.config.headless)
         min_len = max(20, int(self.config.token_min_length or 80))
         user_agent = (request.user_agent or self.config.user_agent or "").strip()

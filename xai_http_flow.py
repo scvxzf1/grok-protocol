@@ -1597,7 +1597,7 @@ def solve_turnstile_result(
         proxy=str(proxy or "").strip(),
         action=str(action or "").strip(),
         cdata=str(cdata or "").strip(),
-        timeout_sec=max(30, int(timeout or 180)),
+        timeout_sec=max(5, int(timeout or 30)),
         headless=bool(headless),
         fingerprint=fingerprint or DEFAULT_FINGERPRINT,
         broker_url=str(broker_url or "").strip(),
@@ -3419,7 +3419,8 @@ def run_registration(
     turnstile_token: str = "",
     turnstile_provider: str = "",
     turnstile_api_key: str = "",
-    turnstile_solve_timeout: int = 180,
+    turnstile_solve_timeout: int = 30,
+    turnstile_solve_retries: int = 3,
     turnstile_proxy: str = "",
     turnstile_headless: bool = False,
     turnstile_broker_url: str = "",
@@ -3534,53 +3535,80 @@ def run_registration(
                 use_headless = raw_headless
             else:
                 use_headless = str(raw_headless or "").strip().lower() in {"1", "true", "yes", "on"}
-        _log(
-            client.log_callback,
-            (
-                f"[HTTP] 请求 Turnstile 求解 | provider={provider or 'local'} "
-                f"headless={use_headless} broker={'yes' if effective_broker_url else 'no'} "
-                f"sitekey={(sitekey[:12] + '…') if sitekey else '-'} "
-                f"timeout={int(turnstile_solve_timeout or 180)}s"
-            ),
-        )
-        solve_started = time.monotonic()
-        try:
-            solve_result = solve_turnstile_result(
-                sitekey=sitekey,
-                page_url=client.signup_page_url or SIGNUP_URL,
-                provider=provider,
-                api_key=api_key,
-                proxy=solve_proxy,
-                action=str(turnstile_metadata.get("turnstile_action") or ""),
-                cdata=str(turnstile_metadata.get("turnstile_cdata") or ""),
-                timeout=turnstile_solve_timeout,
-                headless=use_headless,
-                fingerprint=client.fingerprint,
-                broker_url=effective_broker_url,
-                workers=int(turnstile_workers or config.get("turnstile_workers") or 0),
-                queue_size=int(turnstile_queue_size or config.get("turnstile_queue_size") or 64),
-            )
-        except Exception as exc:
-            elapsed_ms = int((time.monotonic() - solve_started) * 1000)
-            _log(
-                client.log_callback,
-                f"[HTTP][error] Turnstile 求解失败 | elapsed_ms={elapsed_ms} err={_safe_error_text(exc)}",
-            )
-            raise
-        else:
-            elapsed_ms = int((time.monotonic() - solve_started) * 1000)
-            token_len = len(str(getattr(solve_result, 'token', '') or '').strip())
-            extras = getattr(solve_result, 'extras', None)
-            lease_id = ''
-            if isinstance(extras, dict):
-                lease_id = str(extras.get('lease_id') or '').strip()
+        max_attempts = max(1, int(turnstile_solve_retries or 1))
+        per_try_timeout = max(5, int(turnstile_solve_timeout or 30))
+        last_exc: Optional[Exception] = None
+        solve_result = None
+        for attempt in range(1, max_attempts + 1):
             _log(
                 client.log_callback,
                 (
-                    f"[HTTP] Turnstile 求解返回 | elapsed_ms={elapsed_ms} "
-                    f"token_len={token_len} lease={'yes' if lease_id else 'no'}"
+                    f"[HTTP] 请求 Turnstile 求解 | provider={provider or 'local'} "
+                    f"headless={use_headless} broker={'yes' if effective_broker_url else 'no'} "
+                    f"sitekey={(sitekey[:12] + '…') if sitekey else '-'} "
+                    f"timeout={per_try_timeout}s attempt={attempt}/{max_attempts}"
                 ),
             )
+            solve_started = time.monotonic()
+            try:
+                solve_result = solve_turnstile_result(
+                    sitekey=sitekey,
+                    page_url=client.signup_page_url or SIGNUP_URL,
+                    provider=provider,
+                    api_key=api_key,
+                    proxy=solve_proxy,
+                    action=str(turnstile_metadata.get("turnstile_action") or ""),
+                    cdata=str(turnstile_metadata.get("turnstile_cdata") or ""),
+                    timeout=per_try_timeout,
+                    headless=use_headless,
+                    fingerprint=client.fingerprint,
+                    broker_url=effective_broker_url,
+                    workers=int(turnstile_workers or config.get("turnstile_workers") or 0),
+                    queue_size=int(turnstile_queue_size or config.get("turnstile_queue_size") or 64),
+                )
+                elapsed_ms = int((time.monotonic() - solve_started) * 1000)
+                token_len = len(str(getattr(solve_result, "token", "") or "").strip())
+                extras = getattr(solve_result, "extras", None)
+                lease_id = ""
+                if isinstance(extras, dict):
+                    lease_id = str(extras.get("lease_id") or "").strip()
+                _log(
+                    client.log_callback,
+                    (
+                        f"[HTTP] Turnstile 求解返回 | elapsed_ms={elapsed_ms} "
+                        f"token_len={token_len} lease={'yes' if lease_id else 'no'} "
+                        f"attempt={attempt}/{max_attempts}"
+                    ),
+                )
+                if token_len > 0:
+                    last_exc = None
+                    break
+                last_exc = VerificationRequiredError(
+                    f"Turnstile 返回空 token (len={token_len})"
+                )
+                _log(
+                    client.log_callback,
+                    f"[HTTP][warn] Turnstile 空 token，准备重试 | attempt={attempt}/{max_attempts}",
+                )
+            except Exception as exc:
+                elapsed_ms = int((time.monotonic() - solve_started) * 1000)
+                last_exc = exc
+                _log(
+                    client.log_callback,
+                    (
+                        f"[HTTP][error] Turnstile 求解失败 | elapsed_ms={elapsed_ms} "
+                        f"attempt={attempt}/{max_attempts} err={_safe_error_text(exc)}"
+                    ),
+                )
+                if attempt >= max_attempts:
+                    raise
+                continue
+            if attempt >= max_attempts and last_exc is not None:
+                raise last_exc
+        if solve_result is None:
+            if last_exc is not None:
+                raise last_exc
+            raise VerificationRequiredError("Turnstile 求解失败：无结果")
     if solve_result is None:
         solve_result = SolveResult(
             token=turnstile_token,
@@ -3680,8 +3708,14 @@ def _add_token_options(parser: argparse.ArgumentParser, *, registration: bool = 
     parser.add_argument(
         "--turnstile-solve-timeout",
         type=int,
-        default=180,
-        help="Turnstile 求解等待秒数（默认 180）",
+        default=30,
+        help="单次 Turnstile 求解等待秒数（默认 30）",
+    )
+    parser.add_argument(
+        "--turnstile-solve-retries",
+        type=int,
+        default=3,
+        help="Turnstile 求解失败重试次数（默认 3，含首次）",
     )
     parser.add_argument("--turnstile-broker-url", default="", help="共享 Turnstile broker 地址")
     parser.add_argument("--turnstile-workers", type=int, default=0, help="独立 Turnstile 并发槽")
@@ -5417,7 +5451,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         proxy=captcha_proxy,
                         action=str(metadata.get("turnstile_action") or ""),
                         cdata=str(metadata.get("turnstile_cdata") or ""),
-                        timeout=int(getattr(args, "turnstile_solve_timeout", 0) or 180),
+                        timeout=int(getattr(args, "turnstile_solve_timeout", 0) or 30),
                         headless=bool(getattr(args, "turnstile_headless", False)),
                         log_callback=logger,
                     )
@@ -5453,7 +5487,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             turnstile_token=turnstile,
             turnstile_provider=getattr(args, "turnstile_provider", "") or "",
             turnstile_api_key=getattr(args, "turnstile_api_key", "") or "",
-            turnstile_solve_timeout=int(getattr(args, "turnstile_solve_timeout", 0) or 180),
+            turnstile_solve_timeout=int(getattr(args, "turnstile_solve_timeout", 0) or 30),
+            turnstile_solve_retries=int(getattr(args, "turnstile_solve_retries", 0) or 3),
             turnstile_proxy=captcha_proxy,
             turnstile_headless=bool(getattr(args, "turnstile_headless", False)),
             turnstile_broker_url=getattr(args, "turnstile_broker_url", "") or "",
