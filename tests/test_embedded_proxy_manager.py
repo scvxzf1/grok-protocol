@@ -112,7 +112,10 @@ class LifecycleTests(unittest.TestCase):
             def read(self, n=-1):
                 return b"ok"
 
-        with mock.patch("embedded_proxy_manager.urllib.request.urlopen", return_value=_Resp()):
+        with mock.patch("embedded_proxy_manager.urllib.request.build_opener") as build_opener:
+            opener = mock.Mock()
+            opener.open.return_value = _Resp()
+            build_opener.return_value = opener
             result = m.probe_one("n0")
 
         self.assertTrue(result.get("healthy"))

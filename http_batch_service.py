@@ -1019,25 +1019,28 @@ class BatchRunner:
             )
         finally:
             log_handle.close()
-        deadline = time.monotonic() + 30.0
+        deadline = time.monotonic() + 45.0
         last_error = ""
+        # Always hit loopback directly; never inherit a process-global proxy opener.
+        health_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         while time.monotonic() < deadline:
             return_code = process.poll()
             if return_code is not None:
                 last_error = f"进程提前退出，退出码 {return_code}"
                 break
             try:
-                with urllib.request.urlopen(url + "/health", timeout=1.0) as response:
-                    if 200 <= int(getattr(response, "status", 0) or 0) < 300:
+                with health_opener.open(url + "/health", timeout=1.5) as response:
+                    status = int(getattr(response, "status", 0) or response.getcode() or 0)
+                    if 200 <= status < 300:
                         self.broker_process = process
                         self.owns_broker = True
                         self.plan.turnstile_broker_url = url
                         self._log("SYSTEM", f"共享 Turnstile broker 已就绪: {url}")
                         self._log("SYSTEM", f"broker 日志: {log_path}")
                         return
-            except (OSError, urllib.error.URLError) as exc:
+            except (OSError, urllib.error.URLError, urllib.error.HTTPError) as exc:
                 last_error = str(exc)
-            time.sleep(0.1)
+            time.sleep(0.15)
         try:
             process.terminate()
             process.wait(timeout=3)

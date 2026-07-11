@@ -527,12 +527,12 @@ class EmbeddedProxyManager:
             return {"id": node_id, "healthy": False, "error": err}
 
         url = f"https://{host}/" if int(port) == 443 else f"https://{host}:{port}/"
+        # Use a local opener only. Never install_opener globally — that can poison
+        # later localhost health checks (e.g. Turnstile broker /health).
         proxy_handler = urllib.request.ProxyHandler(
             {"http": local_http, "https": local_http}
         )
         opener = urllib.request.build_opener(proxy_handler)
-        prev_opener = getattr(urllib.request, "_opener", None)
-        urllib.request.install_opener(opener)
         req = urllib.request.Request(
             url,
             method="GET",
@@ -543,20 +543,15 @@ class EmbeddedProxyManager:
         healthy = False
         err = ""
         try:
-            try:
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    _ = resp.read(64)
-                healthy = True
-            except urllib.error.HTTPError:
-                healthy = True
-            except Exception as exc:
-                err = str(exc) or repr(exc)
-                healthy = False
-        finally:
-            if prev_opener is not None:
-                urllib.request.install_opener(prev_opener)
-            else:
-                urllib.request._opener = None  # type: ignore[attr-defined]
+            with opener.open(req, timeout=timeout) as resp:
+                _ = resp.read(64)
+            healthy = True
+        except urllib.error.HTTPError:
+            # Any HTTP response means the proxy path reached the target.
+            healthy = True
+        except Exception as exc:
+            err = str(exc) or repr(exc)
+            healthy = False
 
         latency_ms = (time.time() - started) * 1000.0
         with self._lock:
