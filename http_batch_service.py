@@ -330,11 +330,19 @@ PROXY_FAILURE_MARKERS = (
     "Connection refused",
     "curl: (56)",
     "curl: (7)",
+    "curl: (35)",
+    "TLS connect error",
+    "OPENSSL_internal",
+    "Tunnel connection failed",
+    "407 Proxy Authentication Required",
+    "未捕获到可用 Turnstile token",
+    "Turnstile broker 求解失败",
+    "Read timed out",
 )
 
 
 def _looks_like_proxy_failure(text: str) -> bool:
-    """Conservative heuristics for embedded-proxy node failures."""
+    """Heuristics for embedded-proxy node failures / bad egress."""
     blob = str(text or "")
     if not blob:
         return False
@@ -342,6 +350,11 @@ def _looks_like_proxy_failure(text: str) -> bool:
     for marker in PROXY_FAILURE_MARKERS:
         if marker.lower() in lower:
             return True
+    # Broad but still useful under embedded mode.
+    if "turnstile" in lower and ("timeout" in lower or "超时" in blob or "token" in lower and "0" in blob):
+        return True
+    if "tls" in lower and ("error" in lower or "connect" in lower):
+        return True
     return False
 
 
@@ -895,6 +908,8 @@ FAILURE_CATEGORIES = (
     "yyds_rate_limit",
     "turnstile_hard_block",
     "turnstile_timeout",
+    "tls_error",
+    "proxy_error",
     "browser_launch_failed",
     "sso_convert_failed",
     "register_failed",
@@ -910,7 +925,22 @@ def classify_failure_text(text: str) -> str:
         return "yyds_rate_limit"
     if "cloudflare_hard_block" in t or "hard_block" in t or "硬拦截" in raw:
         return "turnstile_hard_block"
-    if "turnstile" in t and ("timeout" in t or "超时" in raw):
+    if (
+        "curl: (35)" in t
+        or "tls connect error" in t
+        or "openssl_internal" in t
+        or "invalid library" in t
+    ):
+        return "tls_error"
+    if (
+        "curl: (56)" in t
+        or "curl: (7)" in t
+        or "proxyerror" in t
+        or "407" in t
+        or "connect tunnel failed" in t
+    ):
+        return "proxy_error"
+    if "turnstile" in t and ("timeout" in t or "超时" in raw or "未捕获到可用" in raw):
         return "turnstile_timeout"
     if (
         "无法启动浏览器" in raw
@@ -1146,7 +1176,7 @@ class BatchRunner:
         except Exception:
             cfg = {}
         solve_timeout = max(5, int(cfg.get("turnstile_solve_timeout") or 90))
-        solve_retries = max(1, int(cfg.get("turnstile_solve_retries") or 3))
+        solve_retries = max(1, int(cfg.get("turnstile_solve_retries") or 1))
         command.extend(["--turnstile-solve-timeout", str(solve_timeout)])
         command.extend(["--turnstile-solve-retries", str(solve_retries)])
         if self.plan.turnstile_broker_url:
@@ -2061,7 +2091,7 @@ def build_config_center(settings: Settings) -> Dict[str, object]:
                 "Turnstile重试次数",
                 minimum=1,
                 maximum=10,
-                default=3,
+                default=1,
             ),
             "duckmail_api_key": str(raw.get("duckmail_api_key") or ""),
             "cloudflare_api_base": str(raw.get("cloudflare_api_base") or ""),
@@ -2380,7 +2410,7 @@ class BatchService:
                 "Turnstile重试次数",
                 minimum=1,
                 maximum=10,
-                default=int(cfg.get("turnstile_solve_retries") or 3),
+                default=int(cfg.get("turnstile_solve_retries") or 1),
             )
         if "submit_workers" in fields:
             self.settings.submit_workers = _positive_int(

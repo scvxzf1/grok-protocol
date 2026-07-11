@@ -328,10 +328,16 @@ class EmbeddedProxyManager:
                 return None
 
             def sort_key(node: NodeSlot):
+                # Prefer historically good, lightly loaded, low-latency nodes.
                 latency = node.last_latency_ms
-                # None latency sorts last
                 latency_key = (latency is None, latency if latency is not None else 0.0)
-                return (node.ref_count, latency_key)
+                return (
+                    -int(getattr(node, "success_count", 0) or 0),
+                    int(getattr(node, "fail_count", 0) or 0),
+                    int(node.ref_count or 0),
+                    latency_key,
+                    str(node.id),
+                )
 
             selected = sorted(candidates, key=sort_key)[0]
             selected.ref_count += 1
@@ -347,9 +353,12 @@ class EmbeddedProxyManager:
                 node.fail_count += 1
                 node.healthy = False
                 cooldown = getattr(self, "config", None)
-                seconds = 30.0
+                base = 30.0
                 if cooldown is not None and hasattr(cooldown, "fail_cooldown_sec"):
-                    seconds = float(cooldown.fail_cooldown_sec or 30.0)
+                    base = float(cooldown.fail_cooldown_sec or 30.0)
+                # Progressive cooldown: 1st fail ~base, then 2x/3x/4x (cap).
+                mult = max(1, min(int(node.fail_count or 1), 4))
+                seconds = base * mult
                 node.cooldown_until = time.time() + seconds
 
     def status(self) -> dict:
@@ -364,6 +373,7 @@ class EmbeddedProxyManager:
                     "healthy": n.healthy,
                     "ref_count": n.ref_count,
                     "fail_count": n.fail_count,
+                    "success_count": n.success_count,
                     "last_latency_ms": n.last_latency_ms,
                     "cooldown_until": n.cooldown_until,
                     "local_http": n.local_http,

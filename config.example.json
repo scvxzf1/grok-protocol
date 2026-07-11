@@ -35,14 +35,14 @@
   "proxy_rotate_session": true,
   "proxy_parent": "",
   "proxy_file": "proxies.txt",
-  "concurrent_workers": 1,
+  "concurrent_workers": 16,
   "tui_run_mode": "register_otp",
   "tui_proxy_mode": "auto",
   "tui_sso_convert_retries": 5,
   "tui_sso_convert_cooldown": 3,
   "turnstile_headless": false,
-  "local_turnstile_max_workers": 3,
-  "submit_workers": 4,
+  "local_turnstile_max_workers": 8,
+  "submit_workers": 8,
   "proxy_subscription_url": "",
   "proxy_subscription_local_http": "",
   "embedded_proxy_enabled": false,
@@ -53,7 +53,7 @@
   "embedded_proxy_probe_host": "accounts.x.ai",
   "embedded_proxy_probe_port": 443,
   "embedded_proxy_probe_timeout_sec": 5,
-  "embedded_proxy_max_node_retries": 3,
+  "embedded_proxy_max_node_retries": 2,
   "turnstile_solve_timeout": 90,
-  "turnstile_solve_retries": 3
+  "turnstile_solve_retries": 1
 }

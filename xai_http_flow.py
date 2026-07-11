@@ -3428,7 +3428,7 @@ def run_registration(
     turnstile_provider: str = "",
     turnstile_api_key: str = "",
     turnstile_solve_timeout: int = 90,
-    turnstile_solve_retries: int = 3,
+    turnstile_solve_retries: int = 1,
     turnstile_proxy: str = "",
     turnstile_headless: bool = False,
     turnstile_broker_url: str = "",
@@ -3741,8 +3741,8 @@ def _add_token_options(parser: argparse.ArgumentParser, *, registration: bool = 
     parser.add_argument(
         "--turnstile-solve-retries",
         type=int,
-        default=3,
-        help="Turnstile 求解失败重试次数（默认 3，含首次）",
+        default=1,
+        help="Turnstile 求解失败重试次数（默认 1，含首次）",
     )
     parser.add_argument("--turnstile-broker-url", default="", help="共享 Turnstile broker 地址")
     parser.add_argument("--turnstile-workers", type=int, default=0, help="独立 Turnstile 并发槽")
@@ -5515,7 +5515,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             turnstile_provider=getattr(args, "turnstile_provider", "") or "",
             turnstile_api_key=getattr(args, "turnstile_api_key", "") or "",
             turnstile_solve_timeout=int(getattr(args, "turnstile_solve_timeout", 0) or 90),
-            turnstile_solve_retries=int(getattr(args, "turnstile_solve_retries", 0) or 3),
+            turnstile_solve_retries=int(getattr(args, "turnstile_solve_retries", 0) or 1),
             turnstile_proxy=captcha_proxy,
             turnstile_headless=bool(getattr(args, "turnstile_headless", False)),
             turnstile_broker_url=getattr(args, "turnstile_broker_url", "") or "",

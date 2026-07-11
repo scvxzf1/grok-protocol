@@ -115,7 +115,7 @@
             本地 Turnstile 并发上限
             <button type="button" class="help-tip" aria-label="说明" data-tip="仅 local 生效；总并发仍受运行台与 32 上限约束">?</button>
           </span>
-          <input name="local_turnstile_max_workers" type="number" min="1" max="6666" value="3" />
+          <input name="local_turnstile_max_workers" type="number" min="1" max="6666" value="8" />
         </label>
         <label>
           <span class="field-title">
@@ -127,9 +127,9 @@
         <label>
           <span class="field-title">
             Turnstile 重试次数
-            <button type="button" class="help-tip" aria-label="说明" data-tip="含首次，默认 3。例如 90s×3≈最多约 270s">?</button>
+            <button type="button" class="help-tip" aria-label="说明" data-tip="含首次，默认 1。失败会结束该任务；需要捞单时可调到 2">?</button>
           </span>
-          <input name="turnstile_solve_retries" type="number" min="1" max="10" value="3" />
+          <input name="turnstile_solve_retries" type="number" min="1" max="10" value="1" />
         </label>
         <label>
           <span class="field-title">

@@ -46,11 +46,11 @@ function fill(data) {
   set("turnstile_headless", !!f.turnstile_headless, true);
   set(
     "local_turnstile_max_workers",
-    f.local_turnstile_max_workers == null ? 3 : f.local_turnstile_max_workers
+    f.local_turnstile_max_workers == null ? 8 : f.local_turnstile_max_workers
   );
   set(
     "submit_workers",
-    f.submit_workers == null ? 4 : f.submit_workers
+    f.submit_workers == null ? 8 : f.submit_workers
   );
   set(
     "turnstile_solve_timeout",
@@ -58,7 +58,7 @@ function fill(data) {
   );
   set(
     "turnstile_solve_retries",
-    f.turnstile_solve_retries == null ? 3 : f.turnstile_solve_retries
+    f.turnstile_solve_retries == null ? 1 : f.turnstile_solve_retries
   );
   set("cloudflare_api_base", f.cloudflare_api_base || "");
   set("cloudflare_api_key", f.cloudflare_api_key || "");
@@ -112,10 +112,10 @@ function collectFields() {
     turnstile_provider: g("turnstile_provider"),
     turnstile_api_key: g("turnstile_api_key"),
     turnstile_headless: g("turnstile_headless", true),
-    local_turnstile_max_workers: Number(g("local_turnstile_max_workers") || 3),
-    submit_workers: Number(g("submit_workers") || 4),
+    local_turnstile_max_workers: Number(g("local_turnstile_max_workers") || 8),
+    submit_workers: Number(g("submit_workers") || 8),
     turnstile_solve_timeout: Number(g("turnstile_solve_timeout") || 90),
-    turnstile_solve_retries: Number(g("turnstile_solve_retries") || 3),
+    turnstile_solve_retries: Number(g("turnstile_solve_retries") || 1),
     cloudflare_api_base: g("cloudflare_api_base"),
     cloudflare_api_key: g("cloudflare_api_key"),
     duckmail_api_key: g("duckmail_api_key"),
