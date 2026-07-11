@@ -255,6 +255,8 @@ class RunPlan:
     sso_convert_retries: int = DEFAULT_SSO_CONVERT_RETRIES
     sso_convert_cooldown: int = DEFAULT_SSO_CONVERT_COOLDOWN
     warnings: List[str] = field(default_factory=list)
+    embedded_proxy_enabled: bool = False
+    embedded_proxy_max_node_retries: int = 3
 
 
 @dataclass
@@ -267,6 +269,11 @@ class WorkerState:
     accounts_path: Optional[Path] = None
     last_log: str = "等待空闲槽位"
     return_code: Optional[int] = None
+    proxy_node_id: Optional[str] = None
+    proxy_node_name: str = ""
+    proxy_local_http: str = ""
+    tried_node_ids: List[str] = field(default_factory=list)
+    proxy_attempt: int = 0
 
 
 def _char_width(char: str) -> int:
@@ -315,6 +322,28 @@ def _status_label(status: str) -> str:
 
 def _proxy_mode_label(mode: str) -> str:
     return PROXY_MODE_LABELS.get(mode, mode)
+
+
+PROXY_FAILURE_MARKERS = (
+    "CONNECT tunnel failed",
+    "ProxyError",
+    "Connection refused",
+    "curl: (56)",
+    "curl: (7)",
+)
+
+
+def _looks_like_proxy_failure(text: str) -> bool:
+    """Conservative heuristics for embedded-proxy node failures."""
+    blob = str(text or "")
+    if not blob:
+        return False
+    lower = blob.lower()
+    for marker in PROXY_FAILURE_MARKERS:
+        if marker.lower() in lower:
+            return True
+    return False
+
 
 
 def _normalize_turnstile_provider(value: object) -> str:
@@ -798,6 +827,14 @@ def build_plan(settings: Settings) -> RunPlan:
             "模式2：注册成功后用 sso_to_auth_json 转换；"
             f"失败最多重试 {sso_convert_retries} 次，冷却 {sso_convert_cooldown}s。"
         )
+    embedded_proxy_enabled = _as_bool(config.get("embedded_proxy_enabled"))
+    embedded_proxy_max_node_retries = _bounded_int(
+        config.get("embedded_proxy_max_node_retries"),
+        "内嵌代理节点重试次数",
+        minimum=1,
+        maximum=20,
+        default=3,
+    )
     return RunPlan(
         config_path=settings.config_path,
         run_mode=run_mode,
@@ -817,6 +854,8 @@ def build_plan(settings: Settings) -> RunPlan:
         sso_convert_retries=sso_convert_retries,
         sso_convert_cooldown=sso_convert_cooldown,
         warnings=warnings,
+        embedded_proxy_enabled=embedded_proxy_enabled,
+        embedded_proxy_max_node_retries=embedded_proxy_max_node_retries,
     )
 
 
@@ -910,6 +949,7 @@ class BatchRunner:
         self.finished_at_monotonic: Optional[float] = None
         self.broker_process: Optional[subprocess.Popen[str]] = None
         self.owns_broker = False
+        self.embedded_proxy_manager = None
 
     @staticmethod
     def _free_loopback_port() -> int:
@@ -1104,7 +1144,10 @@ class BatchRunner:
             command.extend(["--output-dir", str(self.plan.output_dir)])
         else:
             command.extend(["--output-dir", ""])
-        command.extend(self.plan.proxy_args)
+        if self.plan.embedded_proxy_enabled and worker.proxy_local_http:
+            command.extend(["--proxy", worker.proxy_local_http])
+        else:
+            command.extend(self.plan.proxy_args)
         return command
 
     def _append_worker_log(self, worker: WorkerState, message: str) -> None:
@@ -1269,9 +1312,110 @@ class BatchRunner:
         )
         worker.convert_thread.start()
 
-    def _spawn_one(self, worker: WorkerState) -> None:
+    def _acquire_embedded_proxy(self, worker: WorkerState) -> bool:
+        """Lease a node for this worker. Returns False if none available."""
+        if not self.plan.embedded_proxy_enabled:
+            return True
+        manager = self.embedded_proxy_manager
+        if manager is None:
+            worker.last_log = "内嵌代理已启用但管理器未就绪"
+            self._log(f"W{worker.index:02d}", worker.last_log)
+            return False
+        exclude = set(worker.tried_node_ids or [])
+        node = manager.acquire(exclude_ids=exclude)
+        if node is None:
+            worker.last_log = "没有可用的内嵌代理节点"
+            self._log(f"W{worker.index:02d}", worker.last_log)
+            return False
+        worker.proxy_node_id = str(node.id)
+        worker.proxy_node_name = str(getattr(node, "name", "") or "")
+        worker.proxy_local_http = str(getattr(node, "local_http", "") or "")
+        worker.proxy_attempt = int(worker.proxy_attempt or 0) + 1
+        lease = int(getattr(node, "ref_count", 0) or 0)
+        self._log(
+            f"W{worker.index:02d}",
+            f"[Proxy] 分配节点 #{worker.proxy_node_id} {worker.proxy_node_name} "
+            f"-> {worker.proxy_local_http} (lease={lease})",
+        )
+        return True
+
+    def _release_embedded_proxy(self, worker: WorkerState, *, failed: bool = False) -> None:
+        if not worker.proxy_node_id:
+            return
+        manager = self.embedded_proxy_manager
+        node_id = worker.proxy_node_id
+        if manager is not None:
+            try:
+                manager.release(node_id, failed=failed)
+            except Exception as exc:  # pragma: no cover - defensive
+                self._log(f"W{worker.index:02d}", f"[Proxy] 释放节点失败: {exc}")
+        worker.proxy_node_id = None
+        worker.proxy_node_name = ""
+        worker.proxy_local_http = ""
+
+    def _worker_proxy_failure_blob(self, worker: WorkerState, reason_text: str = "") -> str:
+        parts = [reason_text, worker.last_log]
+        if worker.log_path and worker.log_path.is_file():
+            try:
+                parts.append(worker.log_path.read_text(encoding="utf-8", errors="replace")[-4000:])
+            except OSError:
+                pass
+        return "\n".join(str(p) for p in parts if p)
+
+    def _maybe_retry_proxy_node(self, worker: WorkerState, reason_text: str = "") -> bool:
+        """If failure looks proxy-related and retries remain, switch node and respawn."""
+        if not self.plan.embedded_proxy_enabled or self.stopping:
+            return False
+        max_retries = max(1, int(self.plan.embedded_proxy_max_node_retries or 3))
+        blob = self._worker_proxy_failure_blob(worker, reason_text)
+        if not _looks_like_proxy_failure(blob):
+            return False
+        current_id = worker.proxy_node_id
+        if current_id and current_id not in worker.tried_node_ids:
+            worker.tried_node_ids.append(current_id)
+        self._release_embedded_proxy(worker, failed=True)
+        attempt = len(worker.tried_node_ids)
+        if attempt >= max_retries:
+            worker.last_log = (
+                f"[Proxy] 节点失败已达上限 ({attempt}/{max_retries})，放弃重试"
+            )
+            self._log(f"W{worker.index:02d}", worker.last_log)
+            return False
+        next_attempt = attempt + 1
+        self._log(
+            f"W{worker.index:02d}",
+            f"[Proxy] 节点失败，切换 ... ({next_attempt}/{max_retries})",
+        )
+        # Respawn same logical task with a fresh node.
+        worker.status = "queued"
+        worker.process = None
+        worker.return_code = None
+        if not self._acquire_embedded_proxy(worker):
+            worker.status = "failed"
+            worker.last_log = worker.last_log or "没有可用的内嵌代理节点"
+            self._record_failure(worker, worker.last_log)
+            return True  # handled (terminal)
+        self._spawn_one(worker, acquire_proxy=False)
+        return True
+
+    def _release_all_embedded_proxies(self) -> None:
+        if not self.plan.embedded_proxy_enabled:
+            return
+        for worker in self.workers:
+            if worker.proxy_node_id:
+                self._release_embedded_proxy(worker, failed=False)
+
+    def _spawn_one(self, worker: WorkerState, *, acquire_proxy: bool = True) -> None:
         worker.accounts_path = self.run_dir / f"accounts_{worker.index:03d}.txt"
         worker.log_path = self.run_dir / f"worker_{worker.index:03d}.log"
+        if acquire_proxy and self.plan.embedded_proxy_enabled:
+            if not self._acquire_embedded_proxy(worker):
+                worker.status = "failed"
+                if not worker.last_log:
+                    worker.last_log = "没有可用的内嵌代理节点"
+                self._record_failure(worker, worker.last_log)
+                self._log(f"W{worker.index:02d}", worker.last_log)
+                return
         command = self._command_for(worker)
         try:
             log_handle = worker.log_path.open("w", encoding="utf-8", buffering=1)
@@ -1288,6 +1432,7 @@ class BatchRunner:
         except OSError as exc:
             worker.status = "failed"
             worker.last_log = f"无法启动进程: {exc}"
+            self._release_embedded_proxy(worker, failed=True)
             self._log(f"W{worker.index:02d}", worker.last_log)
             try:
                 log_handle.close()
@@ -1363,8 +1508,10 @@ class BatchRunner:
             if self.stopping:
                 worker.status = "stopped"
                 worker.last_log = "已被操作者停止"
+                self._release_embedded_proxy(worker, failed=False)
                 self._log(f"W{worker.index:02d}", worker.last_log)
             elif return_code == 0:
+                self._release_embedded_proxy(worker, failed=False)
                 if self.plan.run_mode == RUN_MODE_REGISTER_SSO:
                     self._start_sso_convert(worker)
                 else:
@@ -1372,8 +1519,16 @@ class BatchRunner:
                     worker.last_log = "协议任务已完成"
                     self._log(f"W{worker.index:02d}", worker.last_log)
             else:
+                reason = f"协议任务退出，退出码 {return_code}"
+                worker.last_log = reason
+                if self._maybe_retry_proxy_node(worker, reason):
+                    # either respawned (running) or terminal without node
+                    if worker.status == "running":
+                        continue
+                    self._log(f"W{worker.index:02d}", worker.last_log)
+                    continue
                 worker.status = "failed"
-                worker.last_log = f"协议任务退出，退出码 {return_code}"
+                self._release_embedded_proxy(worker, failed=False)
                 self._record_failure(worker, worker.last_log)
                 self._log(f"W{worker.index:02d}", worker.last_log)
 
@@ -1410,6 +1565,7 @@ class BatchRunner:
                 f"批量完成: 成功={self.succeeded}, 失败={self.failed}, 账号数={self.account_count}",
             )
         finally:
+            self._release_all_embedded_proxies()
             self._stop_shared_broker()
             self.done = True
 
@@ -1432,6 +1588,7 @@ class BatchRunner:
             if worker.status == "queued":
                 worker.status = "stopped"
                 worker.last_log = "因批次被停止而未启动"
+                self._release_embedded_proxy(worker, failed=False)
                 self._log(f"W{worker.index:02d}", worker.last_log)
         for worker in self.workers:
             if worker.status == "running" and worker.process is not None:
@@ -1442,6 +1599,7 @@ class BatchRunner:
             elif worker.status == "converting":
                 worker.last_log = "停止中：等待当前 SSO 转换收尾"
                 self._log(f"W{worker.index:02d}", worker.last_log)
+        self._release_all_embedded_proxies()
         self._stop_shared_broker()
 
     def _record_failure(self, worker: WorkerState, reason_text: str = "") -> None:
@@ -2478,7 +2636,11 @@ class BatchService:
             if overrides:
                 self.update_settings_from_mapping(overrides, persist=False)
             plan = build_plan(self.settings)
+            if plan.embedded_proxy_enabled:
+                self.ensure_embedded_proxy()
             runner = BatchRunner(plan)
+            if plan.embedded_proxy_enabled:
+                runner.embedded_proxy_manager = self._embedded_proxy_manager
             self._runner = runner
             self._log_cursor = 0
             runner.start()

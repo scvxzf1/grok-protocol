@@ -724,5 +724,202 @@ class EmbeddedProxyBatchServiceTests(unittest.TestCase):
 
 
 
+
+class EmbeddedProxyAssignmentTests(unittest.TestCase):
+    """Task 5: per-worker embedded mihomo proxy assignment."""
+
+    def _make_plan(self, *, embedded=True, proxy_args=None, max_retries=3, count=1):
+        return svc.RunPlan(
+            config_path=Path("config.json"),
+            run_mode=svc.RUN_MODE_REGISTER_OTP,
+            count=count,
+            workers=1,
+            output_dir=Path("."),
+            provider="capsolver",
+            email_provider="yyds",
+            proxy_mode="pool",
+            proxy_args=proxy_args or ["--proxy-file", "proxies.txt", "--proxy-random"],
+            turnstile_headless=False,
+            sso_convert_retries=5,
+            sso_convert_cooldown=3,
+            warnings=[],
+            embedded_proxy_enabled=embedded,
+            embedded_proxy_max_node_retries=max_retries,
+        )
+
+    def _node(self, node_id: str, name: str, port: int):
+        from embedded_proxy_manager import NodeSlot
+
+        return NodeSlot(
+            id=node_id,
+            name=name,
+            server=f"{name}.example",
+            port=443,
+            protocol="vless",
+            local_http=f"http://127.0.0.1:{port}",
+            healthy=True,
+            ref_count=1,
+        )
+
+    def test_command_for_uses_acquired_embedded_proxy(self):
+        plan = self._make_plan(embedded=True)
+        runner = svc.BatchRunner(plan)
+        manager = mock.Mock()
+        manager.acquire.return_value = self._node("12", "jp", 28005)
+        runner.embedded_proxy_manager = manager
+
+        worker = runner.workers[0]
+        worker.accounts_path = Path("accounts_001.txt")
+        assigned = runner._acquire_embedded_proxy(worker)
+        self.assertTrue(assigned)
+        command = runner._command_for(worker)
+
+        self.assertIn("--proxy", command)
+        self.assertIn("http://127.0.0.1:28005", command)
+        self.assertNotIn("--proxy-file", command)
+        manager.acquire.assert_called()
+        call_kwargs = manager.acquire.call_args.kwargs if manager.acquire.call_args else {}
+        # exclude tried ids (empty first time)
+        if "exclude_ids" in call_kwargs:
+            self.assertEqual(set(call_kwargs["exclude_ids"] or set()), set())
+
+    def test_command_for_keeps_proxy_args_when_embedded_disabled(self):
+        plan = self._make_plan(embedded=False, proxy_args=["--proxy-file", "proxies.txt"])
+        runner = svc.BatchRunner(plan)
+        worker = runner.workers[0]
+        worker.accounts_path = Path("accounts_001.txt")
+        command = runner._command_for(worker)
+        self.assertIn("--proxy-file", command)
+        self.assertIn("proxies.txt", command)
+
+    def test_looks_like_proxy_failure_heuristics(self):
+        self.assertTrue(svc._looks_like_proxy_failure("CONNECT tunnel failed: 403"))
+        self.assertTrue(svc._looks_like_proxy_failure("ProxyError: refused"))
+        self.assertTrue(svc._looks_like_proxy_failure("Connection refused by peer"))
+        self.assertTrue(svc._looks_like_proxy_failure("curl: (56) Failure"))
+        self.assertTrue(svc._looks_like_proxy_failure("curl: (7) Failed to connect"))
+        self.assertFalse(svc._looks_like_proxy_failure("turnstile timeout"))
+        self.assertFalse(svc._looks_like_proxy_failure(""))
+
+    def test_worker_proxy_failure_retries_up_to_three_nodes(self):
+        plan = self._make_plan(embedded=True, max_retries=3, count=1)
+        runner = svc.BatchRunner(plan)
+        manager = mock.Mock()
+        nodes = [
+            self._node("n1", "jp", 28001),
+            self._node("n2", "sg", 28002),
+            self._node("n3", "us", 28003),
+        ]
+        manager.acquire.side_effect = list(nodes)
+        runner.embedded_proxy_manager = manager
+
+        worker = runner.workers[0]
+        worker.accounts_path = Path("accounts_001.txt")
+        worker.log_path = Path("worker_001.log")
+
+        def fake_spawn(w, *, acquire_proxy=True):
+            # Keep the leased node sticky and mark running without real Popen.
+            if acquire_proxy and runner.plan.embedded_proxy_enabled and not w.proxy_node_id:
+                assert runner._acquire_embedded_proxy(w)
+            w.status = "running"
+            w.process = mock.Mock()
+            w.process.poll.return_value = None
+
+        # Attempt 1
+        self.assertTrue(runner._acquire_embedded_proxy(worker))
+        self.assertEqual(worker.proxy_node_id, "n1")
+        worker.status = "running"
+        worker.process = mock.Mock()
+        worker.process.poll.return_value = 1
+        worker.last_log = "CONNECT tunnel failed"
+        with mock.patch.object(Path, "is_file", return_value=True), mock.patch.object(
+            Path, "read_text", return_value="CONNECT tunnel failed\n"
+        ), mock.patch.object(runner, "_spawn_one", side_effect=fake_spawn):
+            runner._check_processes()
+
+        self.assertEqual(manager.release.call_count, 1)
+        rel_kwargs = manager.release.call_args.kwargs
+        self.assertTrue(rel_kwargs.get("failed"))
+        self.assertIn("n1", worker.tried_node_ids)
+        self.assertEqual(manager.acquire.call_count, 2)
+        self.assertEqual(worker.proxy_node_id, "n2")
+        self.assertEqual(worker.status, "running")
+
+        # Attempt 2
+        worker.process = mock.Mock()
+        worker.process.poll.return_value = 1
+        worker.last_log = "ProxyError boom"
+        with mock.patch.object(Path, "is_file", return_value=True), mock.patch.object(
+            Path, "read_text", return_value="ProxyError\n"
+        ), mock.patch.object(runner, "_spawn_one", side_effect=fake_spawn):
+            runner._check_processes()
+        self.assertEqual(manager.release.call_count, 2)
+        self.assertEqual(manager.acquire.call_count, 3)
+        self.assertEqual(worker.proxy_node_id, "n3")
+        self.assertEqual(worker.status, "running")
+
+        # Attempt 3 exhausts retries (tried=3 after release) -> final failed
+        worker.process = mock.Mock()
+        worker.process.poll.return_value = 1
+        worker.last_log = "curl: (56) recv failure"
+        with mock.patch.object(Path, "is_file", return_value=True), mock.patch.object(
+            Path, "read_text", return_value="curl: (56)\n"
+        ), mock.patch.object(runner, "_spawn_one", side_effect=fake_spawn) as spawn_mock:
+            runner._check_processes()
+        self.assertEqual(manager.release.call_count, 3)
+        self.assertEqual(worker.status, "failed")
+        self.assertEqual(manager.acquire.call_count, 3)
+        spawn_mock.assert_not_called()
+
+    def test_release_embedded_proxy_on_success(self):
+        plan = self._make_plan(embedded=True)
+        runner = svc.BatchRunner(plan)
+        manager = mock.Mock()
+        manager.acquire.return_value = self._node("n1", "jp", 28001)
+        runner.embedded_proxy_manager = manager
+        worker = runner.workers[0]
+        worker.accounts_path = Path("a.txt")
+        self.assertTrue(runner._acquire_embedded_proxy(worker))
+        worker.status = "running"
+        worker.process = mock.Mock()
+        worker.process.poll.return_value = 0
+        runner._check_processes()
+        manager.release.assert_called_with("n1", failed=False)
+        self.assertEqual(worker.status, "succeeded")
+
+    def test_start_run_ensures_embedded_proxy(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            cfg = root / "config.json"
+            cfg.write_text(
+                json.dumps(
+                    {
+                        "email_provider": "yyds",
+                        "yyds_api_key": "k",
+                        "turnstile_provider": "capsolver",
+                        "turnstile_api_key": "CAP",
+                        "register_count": 1,
+                        "concurrent_workers": 1,
+                        "embedded_proxy_enabled": True,
+                        "proxy_subscription_url": "https://example.test/sub",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            service = svc.BatchService(config_path=cfg, root_dir=root)
+            ensure = mock.Mock(return_value={"enabled": True, "running": True, "healthy": 1})
+            service.ensure_embedded_proxy = ensure
+            manager = mock.Mock()
+            manager.acquire.return_value = self._node("n9", "hk", 28009)
+            service._embedded_proxy_manager = manager
+
+            with mock.patch.object(svc.BatchRunner, "start", lambda self: setattr(self, "started", True) or setattr(self, "done", False)), \
+                 mock.patch.object(svc.BatchRunner, "snapshot", return_value={"run_id": "x"}):
+                service.start_run()
+            ensure.assert_called()
+            self.assertIs(service._runner.embedded_proxy_manager, manager)
+
+
+
 if __name__ == "__main__":
     unittest.main()
