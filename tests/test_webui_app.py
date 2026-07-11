@@ -81,5 +81,37 @@ class WebUIAppTests(unittest.TestCase):
                 self.assertIn(bad.status_code, {403, 404, 400})
 
 
+
+    def test_config_center_page_and_api(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            service = self._service(root)
+            (root / "proxies.txt").write_text("9.9.9.9:1:u:p\n", encoding="utf-8")
+            # reload after file create via config path already set
+            service.settings.config["proxy_file"] = "proxies.txt"
+            app = webui_app.create_app(service=service)
+            client = TestClient(app)
+            page = client.get("/config")
+            self.assertEqual(page.status_code, 200)
+            self.assertIn("配置中心", page.text)
+            self.assertIn("运行台", page.text)
+            data = client.get("/api/config-center")
+            self.assertEqual(data.status_code, 200)
+            body = data.json()
+            self.assertIn("proxy_pool", body)
+            put = client.put(
+                "/api/config-center",
+                json={
+                    "fields": {"proxy_mode": "pool", "turnstile_api_key": "***"},
+                    "proxy_pool_text": "8.8.8.8:80:a:b\n",
+                },
+            )
+            self.assertEqual(put.status_code, 200)
+            self.assertEqual(put.json()["fields"]["proxy_mode"], "pool")
+            pool = client.get("/api/proxy-pool")
+            self.assertEqual(pool.status_code, 200)
+            self.assertGreaterEqual(pool.json()["line_count"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

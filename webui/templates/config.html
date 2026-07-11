@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>配置中心 · xAI HTTP</title>
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+  <header class="top">
+    <div class="top-main">
+      <div>
+        <h1>配置中心</h1>
+        <p class="muted">本机 {{ host }}:{{ port }} · 管理 API Key、代理开关与代理池内容</p>
+      </div>
+      <nav class="nav">
+        <a href="/" class="{% if active == 'run' %}active{% endif %}">运行台</a>
+        <a href="/config" class="{% if active == 'config' %}active{% endif %}">配置中心</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="grid">
+    <section class="panel wide">
+      <div class="actions" style="margin-top:0">
+        <button type="button" id="btnReloadCfg">重载</button>
+        <button type="button" id="btnSaveCfg" class="primary">保存配置</button>
+        <button type="button" id="btnSavePool">仅保存代理池</button>
+      </div>
+      <p id="cfgMsg" class="msg"></p>
+    </section>
+
+    <section class="panel">
+      <h2>邮箱 / Turnstile</h2>
+      <form id="cfgCenterForm" class="form">
+        <label>邮箱源
+          <select name="email_provider">
+            <option value="yyds">yyds</option>
+            <option value="cloudflare">cloudflare</option>
+            <option value="duckmail">duckmail</option>
+            <option value="msgraph">msgraph/outlook</option>
+          </select>
+        </label>
+        <label>YYDS API Base <input name="yyds_api_base" type="text" /></label>
+        <label>YYDS API Key
+          <div class="secret-row">
+            <input name="yyds_api_key" type="password" placeholder="未设置或保持不变" autocomplete="off" />
+          </div>
+          <span class="flag" data-flag="yyds_api_key"></span>
+        </label>
+        <label>YYDS JWT
+          <div class="secret-row">
+            <input name="yyds_jwt" type="password" placeholder="未设置或保持不变" autocomplete="off" />
+          </div>
+          <span class="flag" data-flag="yyds_jwt"></span>
+        </label>
+        <label>Turnstile 提供商
+          <select name="turnstile_provider">
+            <option value="local">local</option>
+            <option value="capsolver">capsolver</option>
+            <option value="2captcha">2captcha</option>
+            <option value="yescaptcha">yescaptcha</option>
+          </select>
+        </label>
+        <label>Turnstile API Key
+          <div class="secret-row">
+            <input name="turnstile_api_key" type="password" placeholder="未设置或保持不变" autocomplete="off" />
+          </div>
+          <span class="flag" data-flag="turnstile_api_key"></span>
+        </label>
+        <label class="check"><input type="checkbox" name="turnstile_headless" /> Turnstile 无头</label>
+        <label>Cloudflare API Base <input name="cloudflare_api_base" type="text" /></label>
+        <label>Cloudflare API Key
+          <div class="secret-row">
+            <input name="cloudflare_api_key" type="password" placeholder="未设置或保持不变" autocomplete="off" />
+          </div>
+          <span class="flag" data-flag="cloudflare_api_key"></span>
+        </label>
+        <label>DuckMail API Key
+          <div class="secret-row">
+            <input name="duckmail_api_key" type="password" placeholder="未设置或保持不变" autocomplete="off" />
+          </div>
+          <span class="flag" data-flag="duckmail_api_key"></span>
+        </label>
+        <label>MS 邮箱文件 <input name="ms_mail_file" type="text" /></label>
+      </form>
+    </section>
+
+    <section class="panel">
+      <h2>代理开关</h2>
+      <div class="form" id="proxyForm">
+        <label>代理模式
+          <select name="proxy_mode" form="cfgCenterForm">
+            <option value="auto">自动</option>
+            <option value="none">关闭（不使用）</option>
+            <option value="direct">直连代理</option>
+            <option value="pool">代理池</option>
+          </select>
+        </label>
+        <label>直连代理 URL <input name="proxy" form="cfgCenterForm" type="text" placeholder="http://user:pass@host:port" /></label>
+        <label>代理池文件 <input name="proxy_file" form="cfgCenterForm" type="text" placeholder="proxies.txt" /></label>
+        <label>上游父代理 <input name="proxy_parent" form="cfgCenterForm" type="text" /></label>
+        <label>本地转发端口 <input name="local_proxy_port" form="cfgCenterForm" type="number" min="1" max="65535" /></label>
+        <label class="check"><input type="checkbox" name="proxy_random" form="cfgCenterForm" /> 代理池随机</label>
+        <label class="check"><input type="checkbox" name="proxy_rotate_session" form="cfgCenterForm" /> 轮换 session</label>
+        <label>OAuth 输出目录 <input name="xai_oauth_output_dir" form="cfgCenterForm" type="text" /></label>
+        <label>Grok2API Remote Base <input name="grok2api_remote_base" form="cfgCenterForm" type="text" /></label>
+        <label>Grok2API App Key
+          <div class="secret-row">
+            <input name="grok2api_remote_app_key" form="cfgCenterForm" type="password" placeholder="未设置或保持不变" autocomplete="off" />
+          </div>
+          <span class="flag" data-flag="grok2api_remote_app_key"></span>
+        </label>
+        <label>Grok2API Pool Name <input name="grok2api_pool_name" form="cfgCenterForm" type="text" /></label>
+      </div>
+      <p class="muted" id="poolMeta">代理池: -</p>
+    </section>
+
+    <section class="panel wide">
+      <h2>代理池内容</h2>
+      <p class="muted">一行一个代理。支持 host:port:user:pass 或 http://user:pass@host:port。# 开头为注释。</p>
+      <textarea id="proxyPoolText" class="pool" spellcheck="false"></textarea>
+    </section>
+  </main>
+  <script src="/static/config.js"></script>
+</body>
+</html>

@@ -3,21 +3,27 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>xAI HTTP 协议控制台</title>
+  <title>运行台 · xAI HTTP</title>
   <link rel="stylesheet" href="/static/app.css" />
 </head>
 <body>
   <header class="top">
-    <div>
-      <h1>xAI HTTP 协议控制台</h1>
-      <p class="muted">本机 {{ host }}:{{ port }} · 同时仅 1 个批次 · 浏览器只解 Turnstile</p>
+    <div class="top-main">
+      <div>
+        <h1>xAI HTTP 协议控制台</h1>
+        <p class="muted">本机 {{ host }}:{{ port }} · 同时仅 1 个批次 · 浏览器只解 Turnstile</p>
+      </div>
+      <nav class="nav">
+        <a href="/" class="{% if active == 'run' %}active{% endif %}">运行台</a>
+        <a href="/config" class="{% if active == 'config' %}active{% endif %}">配置中心</a>
+      </nav>
     </div>
     <div id="busyBadge" class="badge">空闲</div>
   </header>
 
   <main class="grid">
     <section class="panel">
-      <h2>运行配置</h2>
+      <h2>运行参数</h2>
       <form id="cfgForm" class="form">
         <label>模式
           <select name="run_mode">
@@ -48,10 +54,11 @@
         <label>SSO 重试 <input type="number" name="sso_convert_retries" min="1" max="20" value="5" /></label>
         <label>SSO 冷却秒 <input type="number" name="sso_convert_cooldown" min="0" max="120" value="3" /></label>
         <p class="muted" id="emailProvider">邮箱: -</p>
+        <p class="muted">API Key / 代理池正文请到「配置中心」管理。</p>
       </form>
       <div class="actions">
         <button type="button" id="btnReload">重载配置</button>
-        <button type="button" id="btnSave">保存配置</button>
+        <button type="button" id="btnSave">保存运行参数</button>
         <button type="button" id="btnStart" class="primary">开始</button>
         <button type="button" id="btnStop">停止</button>
         <button type="button" id="btnBrowser">浏览器状态</button>

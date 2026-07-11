@@ -102,5 +102,55 @@ class RunHistoryTests(unittest.TestCase):
                 svc.resolve_run_file(rid, "../secret.txt", runs_dir=runs)
 
 
+
+class ConfigCenterTests(unittest.TestCase):
+    def test_config_center_masks_and_updates_proxy_pool(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            cfg = root / "config.json"
+            pool = root / "proxies.txt"
+            pool.write_text("1.1.1.1:80:u:p\n", encoding="utf-8")
+            cfg.write_text(
+                json.dumps(
+                    {
+                        "email_provider": "yyds",
+                        "yyds_api_key": "secret-yyds",
+                        "turnstile_provider": "capsolver",
+                        "turnstile_api_key": "CAP-SECRET",
+                        "tui_proxy_mode": "none",
+                        "proxy_file": "proxies.txt",
+                        "register_count": 1,
+                        "concurrent_workers": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            service = svc.BatchService(config_path=cfg, root_dir=root)
+            data = service.get_config_center()
+            self.assertTrue(data["secret_flags"]["yyds_api_key"])
+            self.assertEqual(data["fields"]["yyds_api_key"], "***")
+            self.assertEqual(data["fields"]["proxy_mode"], "none")
+            self.assertEqual(data["proxy_pool"]["line_count"], 1)
+
+            updated = service.update_config_center(
+                {
+                    "fields": {
+                        "proxy_mode": "pool",
+                        "proxy_file": "proxies.txt",
+                        "yyds_api_key": "***",  # keep
+                        "turnstile_api_key": "CAP-NEW",
+                    },
+                    "proxy_pool_text": "2.2.2.2:8080:user:pass\n# comment\n",
+                }
+            )
+            self.assertEqual(updated["fields"]["proxy_mode"], "pool")
+            self.assertEqual(updated["proxy_pool"]["line_count"], 1)
+            disk = json.loads(cfg.read_text(encoding="utf-8"))
+            self.assertEqual(disk["yyds_api_key"], "secret-yyds")
+            self.assertEqual(disk["turnstile_api_key"], "CAP-NEW")
+            self.assertEqual(disk["tui_proxy_mode"], "pool")
+            self.assertIn("2.2.2.2:8080:user:pass", pool.read_text(encoding="utf-8"))
+
+
 if __name__ == "__main__":
     unittest.main()

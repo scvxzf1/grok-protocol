@@ -80,17 +80,24 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
     def _err(exc: Exception, status: int = 400) -> HTTPException:
         return HTTPException(status_code=status, detail=str(exc))
 
-    @app.get("/", response_class=HTMLResponse)
-    def index(request: Request) -> HTMLResponse:
-        # Starlette/Jinja2: pass Request first, then template name, then context.
+    def _page(request: Request, name: str, active: str) -> HTMLResponse:
         return templates.TemplateResponse(
             request,
-            "index.html",
+            name,
             {
                 "host": DEFAULT_WEBUI_HOST,
                 "port": DEFAULT_WEBUI_PORT,
+                "active": active,
             },
         )
+
+    @app.get("/", response_class=HTMLResponse)
+    def index(request: Request) -> HTMLResponse:
+        return _page(request, "index.html", "run")
+
+    @app.get("/config", response_class=HTMLResponse)
+    def config_page(request: Request) -> HTMLResponse:
+        return _page(request, "config.html", "config")
 
     @app.get("/api/health")
     def health() -> Dict[str, Any]:
@@ -120,6 +127,37 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
     def settings_reload() -> Dict[str, Any]:
         get_service().reload_settings()
         return get_service().public_settings()
+
+    @app.get("/api/config-center")
+    def config_center_get() -> Dict[str, Any]:
+        try:
+            return get_service().get_config_center()
+        except TuiConfigError as exc:
+            raise _err(exc, 400) from exc
+
+    @app.put("/api/config-center")
+    def config_center_put(payload: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            return get_service().update_config_center(payload or {})
+        except TuiConfigError as exc:
+            raise _err(exc, 400) from exc
+
+    @app.get("/api/proxy-pool")
+    def proxy_pool_get() -> Dict[str, Any]:
+        try:
+            return get_service().get_proxy_pool()
+        except TuiConfigError as exc:
+            raise _err(exc, 400) from exc
+
+    @app.put("/api/proxy-pool")
+    def proxy_pool_put(payload: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            text_value = ""
+            if isinstance(payload, dict):
+                text_value = str(payload.get("text") if "text" in payload else payload.get("proxy_pool_text") or "")
+            return get_service().set_proxy_pool(text_value)
+        except TuiConfigError as exc:
+            raise _err(exc, 400) from exc
 
     @app.get("/api/browser/health")
     def browser_health() -> Dict[str, Any]:

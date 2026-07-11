@@ -1268,19 +1268,26 @@ def resolve_run_file(run_id: str, rel_path: str, runs_dir: Optional[Path] = None
     return candidate
 
 
+SENSITIVE_CONFIG_KEYS = (
+    "turnstile_api_key",
+    "yyds_api_key",
+    "yyds_jwt",
+    "duckmail_api_key",
+    "cloudflare_api_key",
+    "grok2api_remote_app_key",
+)
+
+
+def _mask_config_dict(config: Dict[str, object]) -> Dict[str, object]:
+    masked = dict(config or {})
+    for key in SENSITIVE_CONFIG_KEYS:
+        if key in masked and str(masked.get(key) or "").strip():
+            masked[key] = "***"
+    return masked
+
+
 def _settings_to_public_dict(settings: Settings) -> Dict[str, object]:
-    config = dict(settings.config or {})
-    sensitive = {
-        "turnstile_api_key",
-        "yyds_api_key",
-        "yyds_jwt",
-        "duckmail_api_key",
-        "cloudflare_api_key",
-        "grok2api_remote_app_key",
-    }
-    for key in sensitive:
-        if key in config and str(config.get(key) or "").strip():
-            config[key] = "***"
+    config = _mask_config_dict(dict(settings.config or {}))
     return {
         "config_path": str(settings.config_path),
         "count": settings.count,
@@ -1295,6 +1302,102 @@ def _settings_to_public_dict(settings: Settings) -> Dict[str, object]:
         "sso_convert_cooldown": settings.sso_convert_cooldown,
         "email_provider": str(config.get("email_provider") or ""),
         "config": config,
+    }
+
+
+def _proxy_file_path(settings: Settings) -> Path:
+    raw = str((settings.config or {}).get("proxy_file") or "proxies.txt").strip() or "proxies.txt"
+    return _absolute_path(raw, settings.config_path.parent)
+
+
+def read_proxy_pool_text(settings: Settings) -> Dict[str, object]:
+    path = _proxy_file_path(settings)
+    text_value = ""
+    exists = path.is_file()
+    if exists:
+        try:
+            text_value = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            raise TuiConfigError(f"读取代理池文件失败: {exc}") from exc
+    lines = [ln.strip() for ln in text_value.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    return {
+        "path": str(path),
+        "exists": exists,
+        "line_count": len(lines),
+        "text": text_value,
+    }
+
+
+def write_proxy_pool_text(settings: Settings, text_value: str, *, sync_proxies_array: bool = True) -> Dict[str, object]:
+    path = _proxy_file_path(settings)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    content = str(text_value or "")
+    if content and not content.endswith("\n"):
+        content += "\n"
+    try:
+        path.write_text(content, encoding="utf-8")
+    except OSError as exc:
+        raise TuiConfigError(f"写入代理池文件失败: {exc}") from exc
+    lines = [ln.strip() for ln in content.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    if sync_proxies_array:
+        cfg = dict(settings.config or {})
+        cfg["proxies"] = lines
+        cfg["proxy_file"] = _config_path_value(path, settings.config_path.parent)
+        settings.config = cfg
+        # keep proxy_file path relative-friendly in config
+        persist_settings(settings)
+    return {
+        "path": str(path),
+        "exists": True,
+        "line_count": len(lines),
+        "text": content,
+    }
+
+
+def build_config_center(settings: Settings) -> Dict[str, object]:
+    raw = dict(settings.config or {})
+    secret_flags = {
+        key: bool(str(raw.get(key) or "").strip()) for key in SENSITIVE_CONFIG_KEYS
+    }
+    public = _settings_to_public_dict(settings)
+    pool = read_proxy_pool_text(settings)
+    # Do not dump full proxy text into config blob twice; keep top-level pool.
+    return {
+        **public,
+        "secret_flags": secret_flags,
+        "proxy_pool": {
+            "path": pool["path"],
+            "exists": pool["exists"],
+            "line_count": pool["line_count"],
+            "text": pool["text"],
+        },
+        "fields": {
+            "email_provider": str(raw.get("email_provider") or ""),
+            "yyds_api_base": str(raw.get("yyds_api_base") or ""),
+            "yyds_api_key": "***" if secret_flags.get("yyds_api_key") else "",
+            "yyds_jwt": "***" if secret_flags.get("yyds_jwt") else "",
+            "turnstile_provider": settings.turnstile_provider,
+            "turnstile_api_key": "***" if secret_flags.get("turnstile_api_key") else "",
+            "turnstile_headless": bool(settings.turnstile_headless),
+            "duckmail_api_key": "***" if secret_flags.get("duckmail_api_key") else "",
+            "cloudflare_api_base": str(raw.get("cloudflare_api_base") or ""),
+            "cloudflare_api_key": "***" if secret_flags.get("cloudflare_api_key") else "",
+            "cloudflare_auth_mode": str(raw.get("cloudflare_auth_mode") or "none"),
+            "ms_mail_file": str(raw.get("ms_mail_file") or ""),
+            "proxy_mode": "none" if settings.no_proxy else str(settings.proxy_mode or "auto"),
+            "proxy": str(raw.get("proxy") or ""),
+            "proxy_file": str(raw.get("proxy_file") or "proxies.txt"),
+            "proxy_parent": str(raw.get("proxy_parent") or ""),
+            "proxy_random": _as_bool(raw.get("proxy_random")),
+            "proxy_rotate_session": _as_bool(raw.get("proxy_rotate_session")),
+            "local_proxy_port": int(raw.get("local_proxy_port") or 17890),
+            "xai_oauth_output_dir": str(settings.output_dir),
+            "grok2api_remote_base": str(raw.get("grok2api_remote_base") or ""),
+            "grok2api_remote_app_key": "***" if secret_flags.get("grok2api_remote_app_key") else "",
+            "grok2api_pool_name": str(raw.get("grok2api_pool_name") or ""),
+            "grok2api_auto_add_local": _as_bool(raw.get("grok2api_auto_add_local")),
+            "grok2api_auto_add_remote": _as_bool(raw.get("grok2api_auto_add_remote")),
+        },
     }
 
 
@@ -1324,7 +1427,7 @@ class BatchService:
             output_dir=_absolute_path(str(config.get("xai_oauth_output_dir") or DEFAULT_OUTPUT_DIR), self.root_dir),
             run_mode=_normalize_run_mode(config.get("tui_run_mode") or DEFAULT_RUN_MODE),
             proxy_mode=str(config.get("tui_proxy_mode") or "auto"),
-            no_proxy=False,
+            no_proxy=str(config.get("tui_proxy_mode") or "auto").strip().lower() == "none",
             turnstile_provider=_normalize_turnstile_provider(config.get("turnstile_provider") or "capsolver"),
             turnstile_headless=_as_bool(config.get("turnstile_headless")),
             sso_convert_retries=_bounded_int(
@@ -1366,7 +1469,9 @@ class BatchService:
         if "run_mode" in data:
             self.settings.run_mode = _normalize_run_mode(data.get("run_mode"))
         if "proxy_mode" in data:
-            self.settings.proxy_mode = str(data.get("proxy_mode") or "auto")
+            mode = str(data.get("proxy_mode") or "auto").strip().lower()
+            self.settings.proxy_mode = mode
+            self.settings.no_proxy = mode == "none"
         if "turnstile_provider" in data:
             self.settings.turnstile_provider = _normalize_turnstile_provider(data.get("turnstile_provider"))
         if "turnstile_headless" in data:
@@ -1401,6 +1506,108 @@ class BatchService:
             # re-read to keep memory aligned with disk
             self.settings.config = _read_config(self.settings.config_path)
         return self.settings
+
+
+    def get_config_center(self) -> Dict[str, object]:
+        return build_config_center(self.settings)
+
+    def update_config_center(self, data: Dict[str, object]) -> Dict[str, object]:
+        """Update runtime + secret-capable config fields from the config-center page."""
+        data = dict(data or {})
+        fields = data.get("fields") if isinstance(data.get("fields"), dict) else data
+        fields = dict(fields or {})
+
+        # Runtime-facing fields.
+        if "proxy_mode" in fields:
+            mode = str(fields.get("proxy_mode") or "auto").strip().lower()
+            if mode not in PROXY_MODE_LABELS:
+                raise TuiConfigError("代理模式无效，可选: auto/none/direct/pool")
+            self.settings.proxy_mode = mode
+            self.settings.no_proxy = mode == "none"
+        if "turnstile_provider" in fields:
+            self.settings.turnstile_provider = _normalize_turnstile_provider(fields.get("turnstile_provider"))
+        if "turnstile_headless" in fields:
+            self.settings.turnstile_headless = _as_bool(fields.get("turnstile_headless"))
+        if "xai_oauth_output_dir" in fields and str(fields.get("xai_oauth_output_dir") or "").strip():
+            self.settings.output_dir = _absolute_path(str(fields.get("xai_oauth_output_dir")), self.root_dir)
+
+        cfg = dict(self.settings.config or {})
+        plain_keys = [
+            "email_provider",
+            "yyds_api_base",
+            "cloudflare_api_base",
+            "cloudflare_auth_mode",
+            "ms_mail_file",
+            "proxy",
+            "proxy_file",
+            "proxy_parent",
+            "grok2api_remote_base",
+            "grok2api_pool_name",
+            "grok2api_local_token_file",
+            "defaultDomains",
+            "user_agent",
+        ]
+        for key in plain_keys:
+            if key in fields:
+                cfg[key] = str(fields.get(key) or "").strip()
+
+        bool_keys = [
+            "proxy_random",
+            "proxy_rotate_session",
+            "grok2api_auto_add_local",
+            "grok2api_auto_add_remote",
+            "enable_nsfw",
+            "xai_oauth_auto",
+        ]
+        for key in bool_keys:
+            if key in fields:
+                cfg[key] = _as_bool(fields.get(key))
+
+        if "local_proxy_port" in fields:
+            cfg["local_proxy_port"] = _bounded_int(
+                fields.get("local_proxy_port"),
+                "本地代理端口",
+                minimum=1,
+                maximum=65535,
+                default=int(cfg.get("local_proxy_port") or 17890),
+            )
+
+        # Secrets: keep existing when UI sends *** or omit-empty keep.
+        for key in SENSITIVE_CONFIG_KEYS:
+            if key not in fields:
+                continue
+            value = fields.get(key)
+            if value is None:
+                continue
+            text_value = str(value)
+            if text_value.strip() in {"", "***"}:
+                # empty means clear only if explicit clear_secrets contains key
+                clear_list = data.get("clear_secrets") or fields.get("clear_secrets") or []
+                if isinstance(clear_list, list) and key in clear_list:
+                    cfg[key] = ""
+                continue
+            cfg[key] = text_value.strip()
+
+        self.settings.config = cfg
+        persist_settings(self.settings)
+        self.settings.config = _read_config(self.settings.config_path)
+        _load_runtime_fields(self.settings)
+
+        # Optional proxy pool text write in same request.
+        if "proxy_pool_text" in data:
+            write_proxy_pool_text(self.settings, str(data.get("proxy_pool_text") or ""), sync_proxies_array=True)
+            self.settings.config = _read_config(self.settings.config_path)
+            _load_runtime_fields(self.settings)
+        return self.get_config_center()
+
+    def get_proxy_pool(self) -> Dict[str, object]:
+        return read_proxy_pool_text(self.settings)
+
+    def set_proxy_pool(self, text_value: str) -> Dict[str, object]:
+        result = write_proxy_pool_text(self.settings, text_value, sync_proxies_array=True)
+        self.settings.config = _read_config(self.settings.config_path)
+        _load_runtime_fields(self.settings)
+        return result
 
     def attach_log_listener(self, callback: Callable[[str], None]) -> None:
         self._listeners.append(callback)
