@@ -1149,6 +1149,19 @@ class BatchRunner:
                 continue
             last_error = "未知错误"
             success = False
+            # Always keep a single-account SSO sidecar next to credentials.
+            try:
+                from sso_to_auth_json import sso_file_name, write_sso_file
+
+                sso_path = self.plan.output_dir / sso_file_name(email)
+                write_sso_file(sso_path, sso)
+                self._append_worker_log(
+                    worker,
+                    f"SSO 已单独保存 | email={email} | {sso_path.name}",
+                )
+            except Exception as exc:
+                self._append_worker_log(worker, f"SSO 单文件保存失败: {exc}")
+
             for attempt in range(1, retries + 1):
                 if self.stopping:
                     last_error = "批次停止，跳过"
@@ -1873,6 +1886,41 @@ def build_config_center(settings: Settings) -> Dict[str, object]:
             "proxy_mode": "none" if settings.no_proxy else str(settings.proxy_mode or "auto"),
             "proxy": str(raw.get("proxy") or ""),
             "proxy_file": str(raw.get("proxy_file") or "proxies.txt"),
+            "proxy_subscription_url": str(raw.get("proxy_subscription_url") or ""),
+            "proxy_subscription_local_http": str(raw.get("proxy_subscription_local_http") or ""),
+            "embedded_proxy_enabled": _as_bool(raw.get("embedded_proxy_enabled")),
+            "embedded_proxy_binary": str(raw.get("embedded_proxy_binary") or ""),
+            "embedded_proxy_listen_host": str(raw.get("embedded_proxy_listen_host") or "127.0.0.1") or "127.0.0.1",
+            "embedded_proxy_base_port": _bounded_int(
+                raw.get("embedded_proxy_base_port"),
+                "内嵌代理起始端口",
+                minimum=1024,
+                maximum=65000,
+                default=28000,
+            ),
+            "embedded_proxy_max_nodes": _bounded_int(
+                raw.get("embedded_proxy_max_nodes"),
+                "内嵌代理最大节点数",
+                minimum=1,
+                maximum=500,
+                default=50,
+            ),
+            "embedded_proxy_probe_host": str(raw.get("embedded_proxy_probe_host") or "accounts.x.ai") or "accounts.x.ai",
+            "embedded_proxy_probe_port": _bounded_int(
+                raw.get("embedded_proxy_probe_port"),
+                "内嵌代理探测端口",
+                minimum=1,
+                maximum=65535,
+                default=443,
+            ),
+            "embedded_proxy_probe_timeout_sec": float(raw.get("embedded_proxy_probe_timeout_sec") or 5),
+            "embedded_proxy_max_node_retries": _bounded_int(
+                raw.get("embedded_proxy_max_node_retries"),
+                "内嵌代理节点重试次数",
+                minimum=0,
+                maximum=20,
+                default=3,
+            ),
             "proxy_parent": str(raw.get("proxy_parent") or ""),
             "proxy_random": _as_bool(raw.get("proxy_random")),
             "proxy_rotate_session": _as_bool(raw.get("proxy_rotate_session")),
@@ -1903,6 +1951,8 @@ class BatchService:
         self._listeners: List[Callable[[str], None]] = []
         self._log_cursor = 0
         self._lock = threading.Lock()
+        self._embedded_proxy_manager = None
+        self._embedded_proxy_last: Dict[str, object] = {"enabled": False}
 
     def _load_settings(self) -> Settings:
         config = _read_config(self.config_path) if self.config_path.is_file() else {}
@@ -2037,6 +2087,11 @@ class BatchService:
             "ms_mail_file",
             "proxy",
             "proxy_file",
+            "proxy_subscription_url",
+            "proxy_subscription_local_http",
+            "embedded_proxy_binary",
+            "embedded_proxy_listen_host",
+            "embedded_proxy_probe_host",
             "proxy_parent",
             "grok2api_remote_base",
             "grok2api_pool_name",
@@ -2055,6 +2110,7 @@ class BatchService:
             "grok2api_auto_add_remote",
             "enable_nsfw",
             "xai_oauth_auto",
+            "embedded_proxy_enabled",
         ]
         for key in bool_keys:
             if key in fields:
@@ -2067,6 +2123,47 @@ class BatchService:
                 minimum=1,
                 maximum=65535,
                 default=int(cfg.get("local_proxy_port") or 17890),
+            )
+
+        if "embedded_proxy_base_port" in fields:
+            cfg["embedded_proxy_base_port"] = _bounded_int(
+                fields.get("embedded_proxy_base_port"),
+                "内嵌代理起始端口",
+                minimum=1024,
+                maximum=65000,
+                default=int(cfg.get("embedded_proxy_base_port") or 28000),
+            )
+        if "embedded_proxy_max_nodes" in fields:
+            cfg["embedded_proxy_max_nodes"] = _bounded_int(
+                fields.get("embedded_proxy_max_nodes"),
+                "内嵌代理最大节点数",
+                minimum=1,
+                maximum=500,
+                default=int(cfg.get("embedded_proxy_max_nodes") or 50),
+            )
+        if "embedded_proxy_probe_port" in fields:
+            cfg["embedded_proxy_probe_port"] = _bounded_int(
+                fields.get("embedded_proxy_probe_port"),
+                "内嵌代理探测端口",
+                minimum=1,
+                maximum=65535,
+                default=int(cfg.get("embedded_proxy_probe_port") or 443),
+            )
+        if "embedded_proxy_probe_timeout_sec" in fields:
+            try:
+                timeout_sec = float(fields.get("embedded_proxy_probe_timeout_sec"))
+            except (TypeError, ValueError) as exc:
+                raise TuiConfigError("内嵌代理探测超时必须是数字（秒）") from exc
+            if timeout_sec <= 0 or timeout_sec > 120:
+                raise TuiConfigError("内嵌代理探测超时必须介于 0 到 120 秒之间（不含 0）")
+            cfg["embedded_proxy_probe_timeout_sec"] = timeout_sec
+        if "embedded_proxy_max_node_retries" in fields:
+            cfg["embedded_proxy_max_node_retries"] = _bounded_int(
+                fields.get("embedded_proxy_max_node_retries"),
+                "内嵌代理节点重试次数",
+                minimum=0,
+                maximum=20,
+                default=int(cfg.get("embedded_proxy_max_node_retries") or 3),
             )
 
         if "local_turnstile_max_workers" in fields:
@@ -2124,6 +2221,221 @@ class BatchService:
         self.settings.config = _read_config(self.settings.config_path)
         _load_runtime_fields(self.settings)
         return result
+
+    def import_proxy_subscription(
+        self,
+        *,
+        url: str = "",
+        write_pool: bool = True,
+        timeout: float = 20.0,
+        use_local_http_if_empty: bool = True,
+        local_http: str = "",
+    ) -> Dict[str, object]:
+        """Fetch a subscription URL and import usable HTTP proxies into the pool file."""
+        from proxy_subscription import import_proxy_subscription
+
+        cfg = dict(self.settings.config or {})
+        sub_url = str(url or cfg.get("proxy_subscription_url") or "").strip()
+        if not sub_url:
+            raise TuiConfigError("请先填写 proxy_subscription_url 订阅链接")
+        result = import_proxy_subscription(sub_url, timeout=timeout)
+        data = result.to_dict()
+        cfg["proxy_subscription_url"] = sub_url
+
+        local_http = str(local_http or cfg.get("proxy_subscription_local_http") or "").strip()
+        if local_http:
+            cfg["proxy_subscription_local_http"] = local_http
+        pool_text_lines = list(result.pool_lines)
+        applied_local = False
+        if use_local_http_if_empty and not result.usable_pool_lines and local_http:
+            pool_text_lines.append(local_http)
+            applied_local = True
+            data.setdefault("warnings", []).append(
+                f"订阅无直连 HTTP 节点，已写入本地客户端入口: {local_http}"
+            )
+            self.settings.proxy_mode = "direct"
+            self.settings.no_proxy = False
+            cfg["proxy"] = local_http
+        elif result.usable_pool_lines:
+            # HTTP/SOCKS 可入池时，默认切到代理池模式，避免用户还要手动改开关。
+            self.settings.proxy_mode = "pool"
+            self.settings.no_proxy = False
+
+        if write_pool:
+            content = chr(10).join(pool_text_lines) + chr(10)
+            written = write_proxy_pool_text(
+                self.settings,
+                content,
+                sync_proxies_array=True,
+            )
+            cfg = dict(self.settings.config or {})
+            cfg["proxy_subscription_url"] = sub_url
+            if local_http:
+                cfg["proxy_subscription_local_http"] = local_http
+            if applied_local:
+                cfg["proxy"] = local_http
+                cfg["tui_proxy_mode"] = "direct"
+            elif result.usable_pool_lines:
+                cfg["tui_proxy_mode"] = "pool"
+            self.settings.config = cfg
+            persist_settings(self.settings)
+            self.settings.config = _read_config(self.settings.config_path)
+            _load_runtime_fields(self.settings)
+            data["proxy_pool"] = {
+                "path": written.get("path"),
+                "line_count": written.get("line_count"),
+                "exists": written.get("exists"),
+            }
+            data["text"] = written.get("text")
+        else:
+            self.settings.config = cfg
+            persist_settings(self.settings)
+            self.settings.config = _read_config(self.settings.config_path)
+            _load_runtime_fields(self.settings)
+
+        data["applied_local_http"] = applied_local
+        data["proxy_mode"] = (
+            "none"
+            if self.settings.no_proxy
+            else str(self.settings.proxy_mode or "auto")
+        )
+        data["proxy"] = str((self.settings.config or {}).get("proxy") or "")
+        return data
+
+    def _embedded_proxy_cfg_from_settings(self):
+        from embedded_proxy_manager import EmbeddedProxyConfig
+
+        raw = dict(self.settings.config or {})
+        return EmbeddedProxyConfig(
+            binary_path=str(raw.get("embedded_proxy_binary") or ""),
+            listen_host=str(raw.get("embedded_proxy_listen_host") or "127.0.0.1") or "127.0.0.1",
+            base_port=int(raw.get("embedded_proxy_base_port") or 28000),
+            max_nodes=int(raw.get("embedded_proxy_max_nodes") or 50),
+            probe_host=str(raw.get("embedded_proxy_probe_host") or "accounts.x.ai") or "accounts.x.ai",
+            probe_port=int(raw.get("embedded_proxy_probe_port") or 443),
+            probe_timeout_sec=float(raw.get("embedded_proxy_probe_timeout_sec") or 5),
+            max_node_retries=int(raw.get("embedded_proxy_max_node_retries") or 3),
+        )
+
+    def _load_vless_nodes_from_subscription(self, *, timeout: float = 20.0):
+        from proxy_subscription import import_proxy_subscription
+        from embedded_proxy_manager import NodeSlot, parse_vless_node
+
+        raw = dict(self.settings.config or {})
+        sub_url = str(raw.get("proxy_subscription_url") or "").strip()
+        if not sub_url:
+            raise TuiConfigError("请先填写 proxy_subscription_url 订阅链接")
+        result = import_proxy_subscription(sub_url, timeout=timeout)
+        max_nodes = int(raw.get("embedded_proxy_max_nodes") or 50)
+        slots = []
+        for idx, node in enumerate(result.nodes or []):
+            scheme = str(getattr(node, "scheme", "") or "").lower()
+            if scheme != "vless":
+                continue
+            parsed = parse_vless_node(getattr(node, "raw", "") or "")
+            if not parsed:
+                continue
+            slots.append(
+                NodeSlot(
+                    id=f"vless-{idx}-{parsed['server']}:{parsed['port']}",
+                    name=str(parsed.get("name") or f"vless-{idx}"),
+                    server=str(parsed["server"]),
+                    port=int(parsed["port"]),
+                    protocol="vless",
+                    local_http="",
+                    raw=str(parsed.get("raw") or ""),
+                    params=dict(parsed.get("params") or {}),
+                    uuid=str(parsed.get("uuid") or ""),
+                    healthy=False,
+                )
+            )
+            if max_nodes > 0 and len(slots) >= max_nodes:
+                break
+        if not slots:
+            raise TuiConfigError("订阅中没有可用的 VLESS 节点，无法启动内嵌 mihomo 池")
+        return slots, result
+
+    def ensure_embedded_proxy(self, force_reload: bool = False) -> dict:
+        """Load subscription VLESS nodes into embedded mihomo pool and probe them."""
+        raw = dict(self.settings.config or {})
+        enabled = _as_bool(raw.get("embedded_proxy_enabled"))
+        if not enabled:
+            out = {"enabled": False}
+            self._embedded_proxy_last = out
+            return out
+
+        manager = self._embedded_proxy_manager
+        already_running = bool(manager is not None and getattr(manager, "_running", False))
+        if already_running and not force_reload:
+            status = dict(manager.status() or {})
+            status["enabled"] = True
+            status["node_count"] = int(status.get("total") or 0)
+            self._embedded_proxy_last = status
+            return status
+
+        from embedded_proxy_manager import EmbeddedProxyManager
+
+        nodes, _result = self._load_vless_nodes_from_subscription()
+        cfg = self._embedded_proxy_cfg_from_settings()
+        if manager is None:
+            manager = EmbeddedProxyManager(cfg)
+            self._embedded_proxy_manager = manager
+        try:
+            start_info = manager.start(nodes, cfg)
+        except Exception as exc:
+            raise TuiConfigError(f"启动内嵌 mihomo 失败: {exc}") from exc
+        try:
+            probe_info = manager.probe_all()
+        except Exception as exc:
+            raise TuiConfigError(f"内嵌节点预检失败: {exc}") from exc
+        healthy = int(probe_info.get("healthy") or 0)
+        if healthy <= 0:
+            raise TuiConfigError("内嵌节点预检全失败，请检查订阅节点或探测目标 accounts.x.ai")
+        status = dict(manager.status() or {})
+        out = {
+            "enabled": True,
+            "running": bool(status.get("running") or start_info.get("running")),
+            "total": int(status.get("total") or start_info.get("total") or len(nodes)),
+            "healthy": healthy,
+            "leases": int(status.get("leases") or 0),
+            "node_count": int(status.get("total") or len(nodes)),
+            "probe": probe_info,
+            "start": start_info,
+            "nodes": status.get("nodes") or [],
+        }
+        self._embedded_proxy_last = out
+        return out
+
+    def get_embedded_proxy_status(self) -> dict:
+        raw = dict(self.settings.config or {})
+        enabled = _as_bool(raw.get("embedded_proxy_enabled"))
+        if not enabled:
+            return {"enabled": False}
+        manager = self._embedded_proxy_manager
+        if manager is None:
+            last = dict(self._embedded_proxy_last or {})
+            last.setdefault("enabled", True)
+            last.setdefault("running", False)
+            last.setdefault("total", 0)
+            last.setdefault("healthy", 0)
+            return last
+        status = dict(manager.status() or {})
+        status["enabled"] = True
+        status["node_count"] = int(status.get("total") or 0)
+        return status
+
+    def probe_embedded_proxy(self) -> dict:
+        raw = dict(self.settings.config or {})
+        enabled = _as_bool(raw.get("embedded_proxy_enabled"))
+        if not enabled:
+            return {"enabled": False, "total": 0, "healthy": 0, "results": []}
+        manager = self._embedded_proxy_manager
+        if manager is None or not getattr(manager, "_running", False):
+            raise TuiConfigError("内嵌代理尚未启动，请先调用 ensure_embedded_proxy")
+        probe_info = dict(manager.probe_all() or {})
+        probe_info["enabled"] = True
+        return probe_info
+
 
 
     def test_proxy_pool(self, *, count: int = 5, text_value: Optional[str] = None, timeout: float = 12.0) -> Dict[str, object]:

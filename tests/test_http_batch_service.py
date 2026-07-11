@@ -541,5 +541,188 @@ class SnapshotMetricsTests(unittest.TestCase):
         self.assertAlmostEqual(snap1["success_rate"], 1.0)
 
 
+
+class EmbeddedProxyBatchServiceTests(unittest.TestCase):
+    def _service(self, root: Path, extra=None):
+        cfg = root / "config.json"
+        data = {
+            "email_provider": "yyds",
+            "yyds_api_key": "k",
+            "turnstile_provider": "capsolver",
+            "turnstile_api_key": "CAP",
+            "register_count": 1,
+            "concurrent_workers": 1,
+            "proxy_subscription_url": "https://example.test/sub",
+            "embedded_proxy_enabled": True,
+            "embedded_proxy_binary": "/usr/bin/verge-mihomo",
+            "embedded_proxy_listen_host": "127.0.0.1",
+            "embedded_proxy_base_port": 28000,
+            "embedded_proxy_max_nodes": 10,
+            "embedded_proxy_probe_host": "accounts.x.ai",
+            "embedded_proxy_probe_port": 443,
+            "embedded_proxy_probe_timeout_sec": 2,
+            "embedded_proxy_max_node_retries": 3,
+        }
+        if extra:
+            data.update(extra)
+        cfg.write_text(json.dumps(data), encoding="utf-8")
+        return svc.BatchService(config_path=cfg, root_dir=root)
+
+    def test_ensure_embedded_proxy_disabled(self):
+        with tempfile.TemporaryDirectory() as d:
+            service = self._service(Path(d), {"embedded_proxy_enabled": False})
+            out = service.ensure_embedded_proxy()
+            self.assertEqual(out.get("enabled"), False)
+
+    def test_ensure_embedded_proxy_loads_vless_and_starts(self):
+        with tempfile.TemporaryDirectory() as d:
+            service = self._service(Path(d))
+            fake_result = mock.Mock()
+            fake_result.nodes = [
+                mock.Mock(
+                    scheme="vless",
+                    raw="vless://11111111-1111-1111-1111-111111111111@jp.example:443?security=tls&sni=jp.example#jp",
+                    host="jp.example",
+                    port=443,
+                    name="jp",
+                ),
+                mock.Mock(
+                    scheme="vless",
+                    raw="vless://22222222-2222-2222-2222-222222222222@sg.example:443?security=tls&sni=sg.example#sg",
+                    host="sg.example",
+                    port=443,
+                    name="sg",
+                ),
+                mock.Mock(scheme="http", raw="http://1.1.1.1:80", host="1.1.1.1", port=80, name=""),
+            ]
+
+            start_info = {
+                "running": True,
+                "total": 2,
+                "listeners": 2,
+                "base_port": 28000,
+            }
+            probe_info = {"total": 2, "healthy": 1, "results": [{"id": "n0", "healthy": True}]}
+            status_info = {
+                "running": True,
+                "total": 2,
+                "healthy": 1,
+                "leases": 0,
+                "nodes": [],
+            }
+
+            manager = mock.Mock()
+            manager.start.return_value = start_info
+            manager.probe_all.return_value = probe_info
+            manager.status.return_value = status_info
+            manager._running = False
+
+            with mock.patch(
+                "proxy_subscription.import_proxy_subscription",
+                return_value=fake_result,
+            ) as import_mock, mock.patch(
+                "embedded_proxy_manager.EmbeddedProxyManager",
+                return_value=manager,
+            ) as mgr_cls:
+                out = service.ensure_embedded_proxy(force_reload=True)
+
+            import_mock.assert_called_once()
+            self.assertTrue(out.get("enabled"))
+            self.assertTrue(out.get("running"))
+            self.assertEqual(out.get("total"), 2)
+            self.assertEqual(out.get("healthy"), 1)
+            self.assertEqual(out.get("node_count"), 2)
+            manager.start.assert_called_once()
+            started_nodes = manager.start.call_args[0][0]
+            self.assertEqual(len(started_nodes), 2)
+            self.assertEqual(started_nodes[0].protocol, "vless")
+            self.assertTrue(started_nodes[0].uuid)
+            manager.probe_all.assert_called_once()
+            mgr_cls.assert_called()
+
+    def test_ensure_embedded_proxy_raises_when_all_unhealthy(self):
+        with tempfile.TemporaryDirectory() as d:
+            service = self._service(Path(d))
+            fake_result = mock.Mock()
+            fake_result.nodes = [
+                mock.Mock(
+                    scheme="vless",
+                    raw="vless://11111111-1111-1111-1111-111111111111@jp.example:443?security=tls#jp",
+                    host="jp.example",
+                    port=443,
+                    name="jp",
+                )
+            ]
+            manager = mock.Mock()
+            manager.start.return_value = {"running": True, "total": 1}
+            manager.probe_all.return_value = {"total": 1, "healthy": 0, "results": []}
+            manager.status.return_value = {"running": True, "total": 1, "healthy": 0}
+            manager._running = False
+            with mock.patch(
+                "proxy_subscription.import_proxy_subscription",
+                return_value=fake_result,
+            ), mock.patch(
+                "embedded_proxy_manager.EmbeddedProxyManager",
+                return_value=manager,
+            ):
+                with self.assertRaises(svc.TuiConfigError) as ctx:
+                    service.ensure_embedded_proxy(force_reload=True)
+            self.assertIn("预检", str(ctx.exception))
+
+    def test_get_and_probe_embedded_proxy_status(self):
+        with tempfile.TemporaryDirectory() as d:
+            service = self._service(Path(d), {"embedded_proxy_enabled": False})
+            st = service.get_embedded_proxy_status()
+            self.assertEqual(st.get("enabled"), False)
+
+            service = self._service(Path(d), {"embedded_proxy_enabled": True})
+            manager = mock.Mock()
+            manager.status.return_value = {
+                "running": True,
+                "total": 1,
+                "healthy": 1,
+                "leases": 0,
+                "nodes": [],
+            }
+            manager.probe_all.return_value = {"total": 1, "healthy": 1, "results": []}
+            service._embedded_proxy_manager = manager
+            st = service.get_embedded_proxy_status()
+            self.assertTrue(st.get("enabled"))
+            self.assertTrue(st.get("running"))
+            pr = service.probe_embedded_proxy()
+            self.assertEqual(pr.get("healthy"), 1)
+            manager.probe_all.assert_called_once()
+
+    def test_config_center_reads_and_writes_embedded_proxy_fields(self):
+        with tempfile.TemporaryDirectory() as d:
+            service = self._service(Path(d))
+            data = service.get_config_center()
+            fields = data["fields"]
+            self.assertTrue(fields["embedded_proxy_enabled"])
+            self.assertEqual(fields["embedded_proxy_binary"], "/usr/bin/verge-mihomo")
+            self.assertEqual(fields["embedded_proxy_base_port"], 28000)
+            self.assertEqual(fields["embedded_proxy_max_nodes"], 10)
+            updated = service.update_config_center(
+                {
+                    "fields": {
+                        "embedded_proxy_enabled": False,
+                        "embedded_proxy_base_port": 29000,
+                        "embedded_proxy_max_nodes": 5,
+                        "embedded_proxy_probe_timeout_sec": 8,
+                        "embedded_proxy_listen_host": "127.0.0.1",
+                    }
+                }
+            )
+            uf = updated["fields"]
+            self.assertFalse(uf["embedded_proxy_enabled"])
+            self.assertEqual(uf["embedded_proxy_base_port"], 29000)
+            self.assertEqual(uf["embedded_proxy_max_nodes"], 5)
+            self.assertEqual(uf["embedded_proxy_probe_timeout_sec"], 8)
+            disk = json.loads((Path(d) / "config.json").read_text(encoding="utf-8"))
+            self.assertFalse(disk["embedded_proxy_enabled"])
+            self.assertEqual(disk["embedded_proxy_base_port"], 29000)
+
+
+
 if __name__ == "__main__":
     unittest.main()
