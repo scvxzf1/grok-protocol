@@ -152,5 +152,54 @@ class ConfigCenterTests(unittest.TestCase):
             self.assertIn("2.2.2.2:8080:user:pass", pool.read_text(encoding="utf-8"))
 
 
+
+class ProxyPoolTestTests(unittest.TestCase):
+    def test_proxy_pool_sample_reports(self):
+        class FakeResp:
+            def __init__(self, code, text):
+                self.status_code = code
+                self.text = text
+            def json(self):
+                import json as _json
+                return _json.loads(self.text)
+
+        calls = {"n": 0}
+
+        def fake_get(url, proxies=None, timeout=None, impersonate=None):
+            calls["n"] += 1
+            # first ok, second fail
+            if calls["n"] == 1:
+                return FakeResp(200, '{"ip":"1.2.3.4"}')
+            raise RuntimeError("connect timeout")
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            cfg = root / "config.json"
+            pool = root / "proxies.txt"
+            pool.write_text("\n".join([
+                "1.1.1.1:80:u:p",
+                "2.2.2.2:80:u:p",
+                "3.3.3.3:80:u:p",
+            ]) + "\n", encoding="utf-8")
+            cfg.write_text(json.dumps({
+                "email_provider": "yyds",
+                "yyds_api_key": "k",
+                "turnstile_provider": "capsolver",
+                "turnstile_api_key": "CAP",
+                "proxy_file": "proxies.txt",
+            }), encoding="utf-8")
+            service = svc.BatchService(config_path=cfg, root_dir=root)
+            with mock.patch.dict("sys.modules", {}), mock.patch("curl_cffi.requests.get", side_effect=fake_get):
+                # force deterministic sample by patching random.sample
+                with mock.patch.object(svc.random, "sample", side_effect=lambda population, k: list(population)[:k]):
+                    data = service.test_proxy_pool(count=2, timeout=3)
+            self.assertEqual(data["tested"], 2)
+            self.assertEqual(data["ok"], 1)
+            self.assertEqual(data["fail"], 1)
+            self.assertEqual(data["results"][0]["exit_ip"], "1.2.3.4")
+            self.assertTrue(data["results"][0]["ok"])
+            self.assertFalse(data["results"][1]["ok"])
+
+
 if __name__ == "__main__":
     unittest.main()

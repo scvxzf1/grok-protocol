@@ -134,3 +134,46 @@ $("btnSavePool").onclick = async () => {
 };
 
 loadAll().catch(e => setMsg(String(e.message || e), true));
+
+
+function renderProxyTest(data) {
+  const lines = [];
+  lines.push(`探测: ${data.probe_url || "-"} | 超时: ${data.timeout_sec || "-"}s`);
+  lines.push(`来源: ${data.source || "-"} ${data.source_path || ""}`.trim());
+  lines.push(`池内可用: ${data.total_available || 0} | 本次测试: ${data.tested || 0} | 成功: ${data.ok || 0} | 失败: ${data.fail || 0}`);
+  lines.push("");
+  (data.results || []).forEach((item) => {
+    const status = item.ok ? "OK" : "FAIL";
+    const latency = item.latency_ms == null ? "-" : `${item.latency_ms}ms`;
+    const ip = item.exit_ip || "-";
+    const err = item.error ? ` | ${item.error}` : "";
+    lines.push(`[${status}] #${item.index} ${item.display || item.proxy || "-"} | ${latency} | ip=${ip}${err}`);
+  });
+  if (!(data.results || []).length) {
+    lines.push("没有可测试的代理行（可能都是注释或为空）。");
+  }
+  $("proxyTestResult").textContent = lines.join("\n");
+}
+
+$("btnTestPool").onclick = async () => {
+  try {
+    setMsg("正在随机测试代理池…");
+    $("proxyTestResult").textContent = "测试中…";
+    $("btnTestPool").disabled = true;
+    const data = await api("/api/proxy-pool/test", {
+      method: "POST",
+      body: JSON.stringify({
+        count: 5,
+        timeout: 12,
+        text: $("proxyPoolText").value,
+      }),
+    });
+    renderProxyTest(data);
+    setMsg(`代理测试完成：成功 ${data.ok || 0} / ${data.tested || 0}`);
+  } catch (e) {
+    setMsg(String(e.message || e), true);
+    $("proxyTestResult").textContent = "测试失败: " + String(e.message || e);
+  } finally {
+    $("btnTestPool").disabled = false;
+  }
+};

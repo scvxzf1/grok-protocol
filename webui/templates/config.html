@@ -26,6 +26,7 @@
         <button type="button" id="btnReloadCfg">重载</button>
         <button type="button" id="btnSaveCfg" class="primary">保存配置</button>
         <button type="button" id="btnSavePool">仅保存代理池</button>
+        <button type="button" id="btnTestPool">随机测试5条</button>
       </div>
       <p id="cfgMsg" class="msg"></p>
     </section>
@@ -120,6 +121,9 @@
       <h2>代理池内容</h2>
       <p class="muted">一行一个代理。支持 host:port:user:pass 或 http://user:pass@host:port。# 开头为注释。</p>
       <textarea id="proxyPoolText" class="pool" spellcheck="false"></textarea>
+      <h3>代理池测试反馈</h3>
+      <p class="muted">从当前编辑框内容随机抽最多 5 条，访问 ipify 探测出口 IP 与延迟（未保存也可测）。</p>
+      <pre id="proxyTestResult" class="box log">尚未测试</pre>
     </section>
   </main>
   <script src="/static/config.js"></script>

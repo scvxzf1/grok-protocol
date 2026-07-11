@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import queue
 import shutil
 import re
@@ -1354,6 +1355,172 @@ def write_proxy_pool_text(settings: Settings, text_value: str, *, sync_proxies_a
     }
 
 
+
+def _proxy_pool_lines_from_text(text_value: str) -> List[str]:
+    lines: List[str] = []
+    for line in str(text_value or "").splitlines():
+        s = str(line or "").strip()
+        if not s or s.startswith("#"):
+            continue
+        if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+            s = s[1:-1].strip()
+        if s:
+            lines.append(s)
+    return lines
+
+
+def _normalize_proxy_url_for_test(raw: str) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    try:
+        from local_proxy_forwarder import normalize_proxy_config, parse_proxy_string
+
+        normalized = normalize_proxy_config(text)
+        if normalized:
+            return normalized
+        parsed = parse_proxy_string(text)
+        if parsed is None:
+            return text
+        auth = ""
+        if parsed.username or parsed.password:
+            from urllib.parse import quote
+
+            auth = f"{quote(parsed.username or '', safe='')}:{quote(parsed.password or '', safe='')}@"
+        return f"http://{auth}{parsed.host}:{parsed.port}"
+    except Exception:
+        # host:port:user:pass fallback
+        if "://" not in text and text.count(":") >= 3:
+            parts = text.split(":")
+            host, port, user = parts[0], parts[1], parts[2]
+            password = ":".join(parts[3:])
+            from urllib.parse import quote
+
+            return f"http://{quote(user, safe='')}:{quote(password, safe='')}@{host}:{port}"
+        if "://" not in text:
+            return "http://" + text
+        return text
+
+
+def _proxy_display_for_test(raw: str) -> str:
+    text = str(raw or "").strip()
+    try:
+        from local_proxy_forwarder import parse_proxy_string
+
+        up = parse_proxy_string(text)
+        if up is None:
+            return text
+        if up.username:
+            return f"{up.host}:{up.port}:{up.username}:***"
+        return f"{up.host}:{up.port}"
+    except Exception:
+        return text
+
+
+def test_proxy_pool_sample(
+    settings: Settings,
+    *,
+    count: int = 5,
+    text_value: Optional[str] = None,
+    timeout: float = 12.0,
+    probe_url: str = "",
+) -> Dict[str, object]:
+    """Randomly sample up to N proxies and probe exit IP connectivity."""
+    if text_value is None:
+        pool_info = read_proxy_pool_text(settings)
+        source_text = str(pool_info.get("text") or "")
+        source = "file"
+        source_path = str(pool_info.get("path") or "")
+    else:
+        source_text = str(text_value)
+        source = "request"
+        source_path = ""
+    lines = _proxy_pool_lines_from_text(source_text)
+    total = len(lines)
+    n = max(0, min(int(count or 5), total, 20))
+    timeout = max(2.0, float(timeout or 12.0))
+    url = str(
+        probe_url
+        or (settings.config or {}).get("proxy_preflight_url")
+        or "https://api.ipify.org?format=json"
+    ).strip()
+    sample = random.sample(lines, n) if n else []
+    results: List[Dict[str, object]] = []
+    ok_count = 0
+    for idx, raw in enumerate(sample, start=1):
+        item: Dict[str, object] = {
+            "index": idx,
+            "proxy": raw,
+            "display": _proxy_display_for_test(raw),
+            "ok": False,
+            "latency_ms": None,
+            "status_code": None,
+            "exit_ip": "",
+            "body_preview": "",
+            "error": "",
+        }
+        proxy_url = _normalize_proxy_url_for_test(raw)
+        if not proxy_url:
+            item["error"] = "无法解析代理"
+            results.append(item)
+            continue
+        started = time.monotonic()
+        try:
+            # Prefer curl_cffi (same stack as registration flow).
+            try:
+                from curl_cffi import requests as curl_requests
+
+                resp = curl_requests.get(
+                    url,
+                    proxies={"http": proxy_url, "https": proxy_url},
+                    timeout=timeout,
+                    impersonate="chrome120",
+                )
+            except Exception:
+                import requests as std_requests
+
+                resp = std_requests.get(
+                    url,
+                    proxies={"http": proxy_url, "https": proxy_url},
+                    timeout=timeout,
+                )
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            item["latency_ms"] = elapsed_ms
+            item["status_code"] = int(getattr(resp, "status_code", 0) or 0)
+            body = str(getattr(resp, "text", "") or "").strip()
+            item["body_preview"] = body[:120]
+            exit_ip = ""
+            try:
+                payload = resp.json()
+                if isinstance(payload, dict):
+                    exit_ip = str(payload.get("ip") or payload.get("origin") or "").strip()
+            except Exception:
+                # plain text IP
+                if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", body):
+                    exit_ip = body
+            item["exit_ip"] = exit_ip
+            if 200 <= int(item["status_code"] or 0) < 300:
+                item["ok"] = True
+                ok_count += 1
+            else:
+                item["error"] = f"HTTP {item['status_code']}"
+        except Exception as exc:
+            item["latency_ms"] = int((time.monotonic() - started) * 1000)
+            item["error"] = str(exc)[:300]
+        results.append(item)
+    return {
+        "source": source,
+        "source_path": source_path,
+        "probe_url": url,
+        "timeout_sec": timeout,
+        "total_available": total,
+        "tested": len(results),
+        "ok": ok_count,
+        "fail": max(0, len(results) - ok_count),
+        "results": results,
+    }
+
+
 def build_config_center(settings: Settings) -> Dict[str, object]:
     raw = dict(settings.config or {})
     secret_flags = {
@@ -1609,6 +1776,15 @@ class BatchService:
         self.settings.config = _read_config(self.settings.config_path)
         _load_runtime_fields(self.settings)
         return result
+
+
+    def test_proxy_pool(self, *, count: int = 5, text_value: Optional[str] = None, timeout: float = 12.0) -> Dict[str, object]:
+        return test_proxy_pool_sample(
+            self.settings,
+            count=count,
+            text_value=text_value,
+            timeout=timeout,
+        )
 
     def attach_log_listener(self, callback: Callable[[str], None]) -> None:
         self._listeners.append(callback)

@@ -117,5 +117,28 @@ class WebUIAppTests(unittest.TestCase):
             self.assertGreaterEqual(pool.json()["line_count"], 1)
 
 
+
+    def test_proxy_pool_test_api(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            service = self._service(root)
+            app = webui_app.create_app(service=service)
+            client = TestClient(app)
+            fake = {
+                "tested": 1,
+                "ok": 1,
+                "fail": 0,
+                "results": [{"index": 1, "ok": True, "display": "h:1:u:***", "latency_ms": 12, "exit_ip": "8.8.8.8"}],
+                "probe_url": "https://api.ipify.org?format=json",
+                "total_available": 3,
+            }
+            with mock.patch.object(service, "test_proxy_pool", return_value=fake):
+                r = client.post("/api/proxy-pool/test", json={"count": 5, "text": "1.1.1.1:80:u:p\n"})
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.json()["ok"], 1)
+            page = client.get("/config")
+            self.assertIn("随机测试5条", page.text)
+
+
 if __name__ == "__main__":
     unittest.main()

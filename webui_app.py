@@ -159,6 +159,24 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
         except TuiConfigError as exc:
             raise _err(exc, 400) from exc
 
+    @app.post("/api/proxy-pool/test")
+    def proxy_pool_test(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        data = dict(payload or {})
+        count = int(data.get("count") or 5)
+        timeout = float(data.get("timeout") or 12)
+        text_value = data.get("text")
+        if text_value is None:
+            text_value = data.get("proxy_pool_text")
+        # None => read file; string => test editor content (may be unsaved)
+        try:
+            return get_service().test_proxy_pool(
+                count=count,
+                text_value=None if text_value is None else str(text_value),
+                timeout=timeout,
+            )
+        except TuiConfigError as exc:
+            raise _err(exc, 400) from exc
+
     @app.get("/api/browser/health")
     def browser_health() -> Dict[str, Any]:
         status = browser_health_status()
