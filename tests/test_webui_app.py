@@ -99,6 +99,7 @@ class WebUIAppTests(unittest.TestCase):
             self.assertEqual(page.status_code, 200)
             self.assertIn("配置中心", page.text)
             self.assertIn("运行台", page.text)
+            self.assertIn('name="local_turnstile_max_workers"', page.text)
             data = client.get("/api/config-center")
             self.assertEqual(data.status_code, 200)
             body = data.json()

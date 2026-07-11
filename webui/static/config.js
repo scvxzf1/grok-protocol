@@ -40,6 +40,10 @@ function fill(data) {
   set("turnstile_provider", f.turnstile_provider || "local");
   set("turnstile_api_key", f.turnstile_api_key || "");
   set("turnstile_headless", !!f.turnstile_headless, true);
+  set(
+    "local_turnstile_max_workers",
+    f.local_turnstile_max_workers == null ? 3 : f.local_turnstile_max_workers
+  );
   set("cloudflare_api_base", f.cloudflare_api_base || "");
   set("cloudflare_api_key", f.cloudflare_api_key || "");
   set("duckmail_api_key", f.duckmail_api_key || "");
@@ -79,6 +83,7 @@ function collectFields() {
     turnstile_provider: g("turnstile_provider"),
     turnstile_api_key: g("turnstile_api_key"),
     turnstile_headless: g("turnstile_headless", true),
+    local_turnstile_max_workers: Number(g("local_turnstile_max_workers") || 3),
     cloudflare_api_base: g("cloudflare_api_base"),
     cloudflare_api_key: g("cloudflare_api_key"),
     duckmail_api_key: g("duckmail_api_key"),

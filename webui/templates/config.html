@@ -70,6 +70,10 @@
           <span class="flag" data-flag="turnstile_api_key"></span>
         </label>
         <label class="check"><input type="checkbox" name="turnstile_headless" /> Turnstile 无头</label>
+        <label>本地 Turnstile 并发上限
+          <input name="local_turnstile_max_workers" type="number" min="1" max="6666" value="3" />
+        </label>
+        <p class="muted">仅 turnstile=local 生效；总并发仍受运行台并发数与 32 上限约束</p>
         <label>Cloudflare API Base <input name="cloudflare_api_base" type="text" /></label>
         <label>Cloudflare API Key
           <div class="secret-row">
