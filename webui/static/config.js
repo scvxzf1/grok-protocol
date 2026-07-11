@@ -54,7 +54,7 @@ function fill(data) {
   );
   set(
     "turnstile_solve_timeout",
-    f.turnstile_solve_timeout == null ? 30 : f.turnstile_solve_timeout
+    f.turnstile_solve_timeout == null ? 90 : f.turnstile_solve_timeout
   );
   set(
     "turnstile_solve_retries",
@@ -114,7 +114,7 @@ function collectFields() {
     turnstile_headless: g("turnstile_headless", true),
     local_turnstile_max_workers: Number(g("local_turnstile_max_workers") || 3),
     submit_workers: Number(g("submit_workers") || 4),
-    turnstile_solve_timeout: Number(g("turnstile_solve_timeout") || 30),
+    turnstile_solve_timeout: Number(g("turnstile_solve_timeout") || 90),
     turnstile_solve_retries: Number(g("turnstile_solve_retries") || 3),
     cloudflare_api_base: g("cloudflare_api_base"),
     cloudflare_api_key: g("cloudflare_api_key"),

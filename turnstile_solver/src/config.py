@@ -87,7 +87,7 @@ class SolverConfig:
     host: str = "127.0.0.1"
     port: int = 8787
     max_concurrency: int = 2
-    browser_timeout_sec: int = 30
+    browser_timeout_sec: int = 90
     token_min_length: int = 80
     signup_url: str = DEFAULT_SIGNUP_URL
     headless: bool = False
@@ -128,7 +128,7 @@ class SolverConfig:
                 int(
                     data.get("browser_timeout_sec")
                     or data.get("turnstile_solve_timeout")
-                    or 30
+                    or 90
                 ),
             ),
             token_min_length=max(20, int(data.get("token_min_length") or 80)),
@@ -156,7 +156,7 @@ class SolverConfig:
                 int(
                     data.get("queue_timeout_sec")
                     or data.get("turnstile_solve_timeout")
-                    or 30
+                    or 90
                 ),
             ),
             strict_fingerprint=bool(data.get("strict_fingerprint", True)),

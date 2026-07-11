@@ -120,14 +120,14 @@
         <label>
           <span class="field-title">
             Turnstile 单次超时(秒)
-            <button type="button" class="help-tip" aria-label="说明" data-tip="单次求解最长等待，默认 30；超时后可按重试次数再试">?</button>
+            <button type="button" class="help-tip" aria-label="说明" data-tip="单次求解最长等待，默认 90；超时后可按重试次数再试">?</button>
           </span>
-          <input name="turnstile_solve_timeout" type="number" min="5" max="600" value="30" />
+          <input name="turnstile_solve_timeout" type="number" min="5" max="600" value="90" />
         </label>
         <label>
           <span class="field-title">
             Turnstile 重试次数
-            <button type="button" class="help-tip" aria-label="说明" data-tip="含首次，默认 3。例如 30s×3≈最多约 90s">?</button>
+            <button type="button" class="help-tip" aria-label="说明" data-tip="含首次，默认 3。例如 90s×3≈最多约 270s">?</button>
           </span>
           <input name="turnstile_solve_retries" type="number" min="1" max="10" value="3" />
         </label>

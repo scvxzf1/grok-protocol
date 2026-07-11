@@ -3427,7 +3427,7 @@ def run_registration(
     turnstile_token: str = "",
     turnstile_provider: str = "",
     turnstile_api_key: str = "",
-    turnstile_solve_timeout: int = 30,
+    turnstile_solve_timeout: int = 90,
     turnstile_solve_retries: int = 3,
     turnstile_proxy: str = "",
     turnstile_headless: bool = False,
@@ -3544,7 +3544,7 @@ def run_registration(
             else:
                 use_headless = str(raw_headless or "").strip().lower() in {"1", "true", "yes", "on"}
         max_attempts = max(1, int(turnstile_solve_retries or 1))
-        per_try_timeout = max(5, int(turnstile_solve_timeout or 30))
+        per_try_timeout = max(5, int(turnstile_solve_timeout or 90))
         last_exc: Optional[Exception] = None
         solve_result = None
         for attempt in range(1, max_attempts + 1):
@@ -3735,8 +3735,8 @@ def _add_token_options(parser: argparse.ArgumentParser, *, registration: bool = 
     parser.add_argument(
         "--turnstile-solve-timeout",
         type=int,
-        default=30,
-        help="单次 Turnstile 求解等待秒数（默认 30）",
+        default=90,
+        help="单次 Turnstile 求解等待秒数（默认 90）",
     )
     parser.add_argument(
         "--turnstile-solve-retries",
@@ -5478,7 +5478,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         proxy=captcha_proxy,
                         action=str(metadata.get("turnstile_action") or ""),
                         cdata=str(metadata.get("turnstile_cdata") or ""),
-                        timeout=int(getattr(args, "turnstile_solve_timeout", 0) or 30),
+                        timeout=int(getattr(args, "turnstile_solve_timeout", 0) or 90),
                         headless=bool(getattr(args, "turnstile_headless", False)),
                         log_callback=logger,
                     )
@@ -5514,7 +5514,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             turnstile_token=turnstile,
             turnstile_provider=getattr(args, "turnstile_provider", "") or "",
             turnstile_api_key=getattr(args, "turnstile_api_key", "") or "",
-            turnstile_solve_timeout=int(getattr(args, "turnstile_solve_timeout", 0) or 30),
+            turnstile_solve_timeout=int(getattr(args, "turnstile_solve_timeout", 0) or 90),
             turnstile_solve_retries=int(getattr(args, "turnstile_solve_retries", 0) or 3),
             turnstile_proxy=captcha_proxy,
             turnstile_headless=bool(getattr(args, "turnstile_headless", False)),

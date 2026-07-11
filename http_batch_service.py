@@ -1145,7 +1145,7 @@ class BatchRunner:
             cfg = _read_config(self.plan.config_path)
         except Exception:
             cfg = {}
-        solve_timeout = max(5, int(cfg.get("turnstile_solve_timeout") or 30))
+        solve_timeout = max(5, int(cfg.get("turnstile_solve_timeout") or 90))
         solve_retries = max(1, int(cfg.get("turnstile_solve_retries") or 3))
         command.extend(["--turnstile-solve-timeout", str(solve_timeout)])
         command.extend(["--turnstile-solve-retries", str(solve_retries)])
@@ -2054,7 +2054,7 @@ def build_config_center(settings: Settings) -> Dict[str, object]:
                 "Turnstile单次超时",
                 minimum=5,
                 maximum=600,
-                default=30,
+                default=90,
             ),
             "turnstile_solve_retries": _bounded_int(
                 raw.get("turnstile_solve_retries"),
@@ -2372,7 +2372,7 @@ class BatchService:
                 "Turnstile单次超时",
                 minimum=5,
                 maximum=600,
-                default=int(cfg.get("turnstile_solve_timeout") or 30),
+                default=int(cfg.get("turnstile_solve_timeout") or 90),
             )
         if "turnstile_solve_retries" in fields:
             cfg["turnstile_solve_retries"] = _bounded_int(
