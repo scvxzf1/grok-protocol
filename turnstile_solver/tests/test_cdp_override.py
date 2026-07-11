@@ -148,5 +148,91 @@ class CdpOverrideTests(unittest.TestCase):
         self.assertIn("window.__xaiTsWidgetId", script)
 
 
+
+    def test_timeout_without_uadata_reports_token_timeout_not_platform_mismatch(self):
+        class EmptyUaDataPage(FakePage):
+            def run_js(self, script):
+                if "cf-turnstile-response" in script:
+                    return ""
+                if "user_agent_data" in script:
+                    return {
+                        "user_agent": "Mozilla/5.0 Chrome/136.0.0.0",
+                        "user_agent_data": {},
+                        "accept_language": "zh-CN, zh",
+                        "navigator_language": "zh-CN",
+                        "navigator_languages": ["zh-CN", "zh"],
+                        "platform": "Linux x86_64",
+                    }
+                return False
+
+            def run_cdp(self, method, **kwargs):
+                self.events.append(("cdp", method, kwargs))
+                if method == "Runtime.evaluate":
+                    raise RuntimeError("navigator.userAgentData unavailable")
+                return {}
+
+        page = EmptyUaDataPage()
+        worker = BrowserWorker(SolverConfig(strict_fingerprint=True))
+        request = SolveRequest(
+            user_agent="Mozilla/5.0 Chrome/136.0.0.0",
+            accept_language="zh-CN,zh;q=0.9",
+            expected_platform="Linux x86_64",
+            expected_client_hint_platform="Linux",
+            expected_browser_major=136,
+            timeout_sec=1,
+        )
+        with patch("src.browser_worker.click_email_signup_entry", return_value=False):
+            result = worker.solve_on_page(
+                page,
+                request,
+                browser_version="136.0.7103.92",
+            )
+        self.assertFalse(result.ok)
+        self.assertIn("未捕获到可用 Turnstile token", result.error or "")
+        self.assertNotIn("UAData platform 不一致", result.error or "")
+        self.assertIn("fingerprint_warning", result.extras)
+
+    def test_success_with_empty_uadata_still_fails_strict_check(self):
+        class EmptyButTokenPage(FakePage):
+            def run_js(self, script):
+                if "cf-turnstile-response" in script:
+                    return "t" * 100
+                if "user_agent_data" in script:
+                    return {
+                        "user_agent": "Mozilla/5.0 Chrome/136.0.0.0",
+                        "user_agent_data": {},
+                        "accept_language": "zh-CN, zh",
+                        "navigator_language": "zh-CN",
+                        "navigator_languages": ["zh-CN", "zh"],
+                        "platform": "Linux x86_64",
+                    }
+                return False
+
+            def run_cdp(self, method, **kwargs):
+                self.events.append(("cdp", method, kwargs))
+                if method == "Runtime.evaluate":
+                    raise RuntimeError("navigator.userAgentData unavailable")
+                return {}
+
+        page = EmptyButTokenPage()
+        worker = BrowserWorker(SolverConfig(strict_fingerprint=True))
+        request = SolveRequest(
+            user_agent="Mozilla/5.0 Chrome/136.0.0.0",
+            accept_language="zh-CN,zh;q=0.9",
+            expected_platform="Linux x86_64",
+            expected_client_hint_platform="Linux",
+            expected_browser_major=136,
+            timeout_sec=5,
+        )
+        with patch("src.browser_worker.click_email_signup_entry", return_value=False):
+            result = worker.solve_on_page(
+                page,
+                request,
+                browser_version="136.0.7103.92",
+            )
+        self.assertFalse(result.ok)
+        self.assertIn("UAData platform 不可用", result.error or "")
+
+
 if __name__ == "__main__":
     unittest.main()

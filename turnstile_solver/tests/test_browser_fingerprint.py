@@ -60,6 +60,7 @@ class BrowserFingerprintTests(unittest.TestCase):
         self.assertEqual(method, "Runtime.evaluate")
         self.assertTrue(kwargs["awaitPromise"])
         self.assertTrue(kwargs["returnByValue"])
+        self.assertIn("'platform'", kwargs["expression"])
         self.assertEqual(fingerprint.user_agent_data["architecture"], "x86")
         brands, full_versions = _client_hint_browser_majors(fingerprint.user_agent_data)
         self.assertEqual(brands, [136])

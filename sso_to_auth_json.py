@@ -91,6 +91,36 @@ def credential_file_name(email: str = "", subject: str = "") -> str:
     return f"xai-{int(time.time() * 1000)}.json"
 
 
+def sso_file_name(email: str = "", subject: str = "") -> str:
+    """Same basename as credential JSON, with .sso extension."""
+    name = credential_file_name(email=email, subject=subject)
+    if name.endswith(".json"):
+        return name[:-5] + ".sso"
+    return name + ".sso"
+
+
+def write_sso_file(path: Path, sso: str) -> Path:
+    """Write a single-account SSO cookie file next to credential JSON."""
+    sso = str(sso or "").strip()
+    if not sso:
+        raise ValueError("empty sso")
+    if "\n" in sso or "\r" in sso:
+        raise ValueError("sso must be a single line")
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".{os.getpid()}.{threading.get_ident()}.tmp")
+    payload = sso + "\n"
+    with _write_lock:
+        tmp.write_text(payload, encoding="utf-8")
+        os.replace(tmp, path)
+    try:
+        if os.name != "nt":
+            os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return path
+
+
 def write_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + f".{os.getpid()}.{threading.get_ident()}.tmp")
@@ -518,10 +548,16 @@ def process_auth_one(idx: int, total: int, sso: str, out_dir: Path, email: str) 
             return False
         doc = build_xai_credential(token, email=email)
         label = str(doc.get("email") or doc.get("sub") or secrets.token_hex(4))
-        path = out_dir / credential_file_name(str(doc.get("email") or ""), str(doc.get("sub") or ""))
+        email_for_name = str(doc.get("email") or email or "")
+        subject_for_name = str(doc.get("sub") or "")
+        path = out_dir / credential_file_name(email_for_name, subject_for_name)
         write_json(path, doc)
-        size = path.stat().st_size
-        log(f"{prefix} ✅ {label} → {path.name} ({size}B)")
+        sso_path = out_dir / sso_file_name(email_for_name, subject_for_name)
+        try:
+            write_sso_file(sso_path, sso)
+            log(f"{prefix} ✅ {label} → {path.name} ({path.stat().st_size}B), {sso_path.name}")
+        except Exception as sso_exc:
+            log(f"{prefix} ✅ {label} → {path.name} ({path.stat().st_size}B); SSO旁路写入失败: {sso_exc}")
         return True
     except Exception as e:
         log(f"{prefix} ❌ 异常: {e}")

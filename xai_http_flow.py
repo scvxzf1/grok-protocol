@@ -180,6 +180,7 @@ class RegistrationResult:
     sso: str
     credential_path: str = ""
     account_path: str = ""
+    sso_path: str = ""
 
 
 def _log(callback: LogFn, message: str) -> None:
@@ -3329,6 +3330,63 @@ def default_profile() -> Tuple[str, str, str]:
     return given, family, password
 
 
+def save_sso_record(
+    output_dir: str,
+    *,
+    email: str = "",
+    sso: str,
+    subject: str = "",
+) -> str:
+    """Save one SSO cookie file next to OAuth credentials.
+
+    Default naming matches credential files:
+      credential: xai-{email}.json
+      sso file  : xai-{email}.sso
+    """
+    output_dir = str(output_dir or "").strip()
+    sso = str(sso or "").strip()
+    if not output_dir or not sso:
+        return ""
+    if "\n" in sso or "\r" in sso:
+        raise XAIHttpFlowError("SSO 输出字段无效")
+    try:
+        from sso_to_auth_json import sso_file_name, write_sso_file
+    except Exception:
+        def _sanitize(value: str) -> str:
+            value = str(value or "").strip()
+            out = []
+            for ch in value:
+                if ch.isalnum() or ch in "@._-":
+                    out.append(ch)
+                else:
+                    out.append("-")
+            return "".join(out).strip("-")
+
+        def sso_file_name(email: str = "", subject: str = "") -> str:  # type: ignore
+            email = _sanitize(email)
+            if email:
+                return f"xai-{email}.sso"
+            subject = _sanitize(subject)
+            if subject:
+                return f"xai-{subject}.sso"
+            return f"xai-{int(time.time() * 1000)}.sso"
+
+        def write_sso_file(path, value: str):  # type: ignore
+            path = Path(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(str(value).strip() + "\n", encoding="utf-8")
+            try:
+                if os.name != "nt":
+                    os.chmod(path, 0o600)
+            except OSError:
+                pass
+            return path
+
+    target = Path(output_dir).expanduser().resolve() / sso_file_name(email, subject)
+    write_sso_file(target, sso)
+    return str(target)
+
+
 def save_account_record(path: str, *, email: str, password: str, sso: str) -> str:
     """Append the legacy-compatible `email----password----sso` account row."""
     path = str(path or "").strip()
@@ -3563,7 +3621,11 @@ def run_registration(
             castle_request_token=castle_register_token,
         )
     credential_path = ""
+    sso_path = ""
     if output_dir:
+        sso_path = save_sso_record(output_dir, email=email, sso=sso)
+        if sso_path:
+            _log(client.log_callback, f"[HTTP] SSO 已单独保存 | email={mask_email(email)} | {sso_path}")
         credential_path = client.obtain_oauth_credential(output_dir=output_dir, email_hint=email)
     account_path = save_account_record(
         accounts_output,
@@ -3577,6 +3639,7 @@ def run_registration(
         sso=sso,
         credential_path=credential_path,
         account_path=account_path,
+        sso_path=sso_path,
     )
 
 

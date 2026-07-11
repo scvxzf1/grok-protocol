@@ -87,7 +87,26 @@ return v;
 FINGERPRINT_READ_JS = """
 const uaData = navigator.userAgentData;
 let uaJson = {};
-try { uaJson = uaData && typeof uaData.toJSON === 'function' ? uaData.toJSON() : {}; } catch (e) {}
+try {
+  if (uaData && typeof uaData.toJSON === 'function') {
+    uaJson = uaData.toJSON() || {};
+  }
+} catch (e) {
+  uaJson = {};
+}
+// toJSON() 在部分上下文会丢字段；低熵属性直接补齐。
+if (uaData) {
+  if (!uaJson || typeof uaJson !== 'object') uaJson = {};
+  if (uaJson.platform == null || uaJson.platform === '') {
+    try { uaJson.platform = String(uaData.platform || ''); } catch (e) {}
+  }
+  if (!Array.isArray(uaJson.brands)) {
+    try { uaJson.brands = Array.isArray(uaData.brands) ? uaData.brands : []; } catch (e) { uaJson.brands = []; }
+  }
+  if (typeof uaJson.mobile !== 'boolean') {
+    try { uaJson.mobile = !!uaData.mobile; } catch (e) { uaJson.mobile = false; }
+  }
+}
 const languages = Array.isArray(navigator.languages) ? navigator.languages.map(String) : [];
 let timezone = '';
 try { timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch (e) {}
@@ -99,6 +118,9 @@ return {
   navigator_languages: languages,
   platform: String(navigator.platform || ''),
   timezone: String(timezone || ''),
+  is_secure_context: typeof window.isSecureContext === 'boolean' ? window.isSecureContext : null,
+  has_user_agent_data: !!uaData,
+  href: String(location.href || ''),
   viewport: {
     inner_width: Number(window.innerWidth || 0),
     inner_height: Number(window.innerHeight || 0),
@@ -116,6 +138,7 @@ UA_HIGH_ENTROPY_CDP_EXPRESSION = """
     return Promise.reject(new Error('navigator.userAgentData.getHighEntropyValues unavailable'));
   }
   return navigator.userAgentData.getHighEntropyValues([
+    'platform',
     'fullVersionList',
     'platformVersion',
     'architecture',
@@ -497,6 +520,93 @@ def read_browser_fingerprint(page: Any) -> FingerprintSnapshot:
     return FingerprintSnapshot.from_dict(data)
 
 
+
+
+def _client_hint_platform(user_agent_data: Dict[str, Any]) -> str:
+    data = user_agent_data if isinstance(user_agent_data, dict) else {}
+    return str(data.get("platform") or "").strip()
+
+
+def _fingerprint_context_note(fingerprint: FingerprintSnapshot) -> str:
+    extras = []
+    ua_data = fingerprint.user_agent_data if isinstance(fingerprint.user_agent_data, dict) else {}
+    high_err = str(ua_data.get("_high_entropy_error") or "").strip()
+    if high_err:
+        extras.append(high_err)
+    # Best-effort context from raw page read fields stored only if present in ua_data/meta.
+    return "; ".join(extras)
+
+
+def validate_strict_fingerprint(
+    fingerprint: FingerprintSnapshot,
+    *,
+    requested_ua: str = "",
+    requested_language: str = "",
+    expected_platform: str = "",
+    expected_client_hint_platform: str = "",
+    expected_browser_major: int = 0,
+) -> None:
+    """Raise RuntimeError when observed browser fingerprint diverges from the request."""
+    if not fingerprint.user_agent:
+        raise RuntimeError("严格指纹模式无法读取浏览器实际 UA")
+    if requested_ua and fingerprint.user_agent != requested_ua:
+        raise RuntimeError(
+            "严格指纹模式 UA 不一致: "
+            f"requested={requested_ua!r}, observed={fingerprint.user_agent!r}"
+        )
+    requested_primary_language = requested_language.split(",", 1)[0].split(";", 1)[0].strip()
+    if (
+        requested_primary_language
+        and fingerprint.navigator_language.lower() != requested_primary_language.lower()
+    ):
+        raise RuntimeError(
+            "严格指纹模式语言不一致: "
+            f"requested={requested_primary_language!r}, "
+            f"observed={fingerprint.navigator_language!r}"
+        )
+    if not expected_platform:
+        raise RuntimeError("严格指纹模式缺少 expected_platform")
+    if not fingerprint.platform or fingerprint.platform != expected_platform:
+        raise RuntimeError(
+            "严格指纹模式 navigator.platform 不一致: "
+            f"expected={expected_platform!r}, observed={fingerprint.platform!r}"
+        )
+    observed_ch_platform = _client_hint_platform(fingerprint.user_agent_data)
+    if not expected_client_hint_platform:
+        raise RuntimeError("严格指纹模式缺少 expected_client_hint_platform")
+    if not observed_ch_platform:
+        note = _fingerprint_context_note(fingerprint)
+        suffix = f" ({note})" if note else ""
+        raise RuntimeError(
+            "严格指纹模式 UAData platform 不可用: "
+            f"expected={expected_client_hint_platform!r}, observed=''"
+            f"{suffix}；通常表示当前页无 navigator.userAgentData（about:blank/错误页/非安全上下文）"
+        )
+    if observed_ch_platform != expected_client_hint_platform:
+        raise RuntimeError(
+            "严格指纹模式 UAData platform 不一致: "
+            f"expected={expected_client_hint_platform!r}, observed={observed_ch_platform!r}"
+        )
+    if expected_browser_major <= 0:
+        raise RuntimeError("严格指纹模式缺少 expected_browser_major")
+    brand_majors, full_version_majors = _client_hint_browser_majors(fingerprint.user_agent_data)
+    if not brand_majors:
+        raise RuntimeError("严格指纹模式 UAData brands 缺少 Chromium 主版本")
+    if not full_version_majors:
+        high_entropy_error = str(
+            fingerprint.user_agent_data.get("_high_entropy_error") or ""
+        ).strip()
+        suffix = f": {high_entropy_error}" if high_entropy_error else ""
+        raise RuntimeError(
+            "严格指纹模式 UAData fullVersionList 缺少 Chromium 主版本" + suffix
+        )
+    if any(major != expected_browser_major for major in brand_majors + full_version_majors):
+        raise RuntimeError(
+            "严格指纹模式浏览器主版本不一致: "
+            f"expected={expected_browser_major}, brands={brand_majors}, "
+            f"fullVersionList={full_version_majors}"
+        )
+
 def _parse_high_entropy_cdp_response(response: Any) -> Dict[str, Any]:
     if not isinstance(response, dict):
         raise ValueError("CDP response is not an object")
@@ -875,61 +985,18 @@ class BrowserWorker:
                     time.sleep(min(1.0, remaining))
 
             fingerprint = read_browser_fingerprint(page)
-            if strict and not fingerprint.user_agent:
-                raise RuntimeError("严格指纹模式无法读取浏览器实际 UA")
-            if strict and requested_ua and fingerprint.user_agent != requested_ua:
-                raise RuntimeError(
-                    "严格指纹模式 UA 不一致: "
-                    f"requested={requested_ua!r}, observed={fingerprint.user_agent!r}"
-                )
-            requested_primary_language = requested_language.split(",", 1)[0].split(";", 1)[0].strip()
-            if (
-                strict
-                and requested_primary_language
-                and fingerprint.navigator_language.lower() != requested_primary_language.lower()
-            ):
-                raise RuntimeError(
-                    "严格指纹模式语言不一致: "
-                    f"requested={requested_primary_language!r}, "
-                    f"observed={fingerprint.navigator_language!r}"
-                )
-            if strict:
-                if not expected_platform:
-                    raise RuntimeError("严格指纹模式缺少 expected_platform")
-                if not fingerprint.platform or fingerprint.platform != expected_platform:
-                    raise RuntimeError(
-                        "严格指纹模式 navigator.platform 不一致: "
-                        f"expected={expected_platform!r}, observed={fingerprint.platform!r}"
+            # 若 Client Hints 读不到，先重放一次 CDP 覆盖再读；about:blank/错误页仍可能为空。
+            if strict and not _client_hint_platform(fingerprint.user_agent_data):
+                try:
+                    cdp_metadata = apply_cdp_fingerprint_override(
+                        page,
+                        request,
+                        browser_version=browser_version,
+                        strict=False,
                     )
-                observed_ch_platform = str(fingerprint.user_agent_data.get("platform") or "").strip()
-                if not expected_ch_platform:
-                    raise RuntimeError("严格指纹模式缺少 expected_client_hint_platform")
-                if not observed_ch_platform or observed_ch_platform != expected_ch_platform:
-                    raise RuntimeError(
-                        "严格指纹模式 UAData platform 不一致: "
-                        f"expected={expected_ch_platform!r}, observed={observed_ch_platform!r}"
-                    )
-                if expected_browser_major <= 0:
-                    raise RuntimeError("严格指纹模式缺少 expected_browser_major")
-                brand_majors, full_version_majors = _client_hint_browser_majors(
-                    fingerprint.user_agent_data
-                )
-                if not brand_majors:
-                    raise RuntimeError("严格指纹模式 UAData brands 缺少 Chromium 主版本")
-                if not full_version_majors:
-                    high_entropy_error = str(
-                        fingerprint.user_agent_data.get("_high_entropy_error") or ""
-                    ).strip()
-                    suffix = f": {high_entropy_error}" if high_entropy_error else ""
-                    raise RuntimeError(
-                        "严格指纹模式 UAData fullVersionList 缺少 Chromium 主版本" + suffix
-                    )
-                if any(major != expected_browser_major for major in brand_majors + full_version_majors):
-                    raise RuntimeError(
-                        "严格指纹模式浏览器主版本不一致: "
-                        f"expected={expected_browser_major}, brands={brand_majors}, "
-                        f"fullVersionList={full_version_majors}"
-                    )
+                    fingerprint = read_browser_fingerprint(page)
+                except Exception as exc:
+                    _log(self.log_callback, f"[Turnstile][warn] 指纹重读失败: {exc}")
 
             elapsed_ms = int((time.monotonic() - started) * 1000)
             extras: Dict[str, Any] = {
@@ -945,6 +1012,19 @@ class BrowserWorker:
                 "browser_version": browser_version,
             }
             if len(token) < min_len:
+                # 超时/空 token 时，空 UAData 往往只是错误页副作用，不要盖住真正原因。
+                if strict:
+                    try:
+                        validate_strict_fingerprint(
+                            fingerprint,
+                            requested_ua=requested_ua,
+                            requested_language=requested_language,
+                            expected_platform=expected_platform,
+                            expected_client_hint_platform=expected_ch_platform,
+                            expected_browser_major=expected_browser_major,
+                        )
+                    except RuntimeError as fp_exc:
+                        extras["fingerprint_warning"] = str(fp_exc)
                 return SolveResult(
                     ok=False,
                     token=token,
@@ -955,6 +1035,15 @@ class BrowserWorker:
                     error=f"在 {timeout}s 内未捕获到可用 Turnstile token (len={len(token)}, min={min_len})",
                     extras=extras,
                     fingerprint=fingerprint,
+                )
+            if strict:
+                validate_strict_fingerprint(
+                    fingerprint,
+                    requested_ua=requested_ua,
+                    requested_language=requested_language,
+                    expected_platform=expected_platform,
+                    expected_client_hint_platform=expected_ch_platform,
+                    expected_browser_major=expected_browser_major,
                 )
             extras["token_len"] = len(token)
             return SolveResult(
