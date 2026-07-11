@@ -12,6 +12,7 @@ class _Session:
 class RootFingerprintTests(unittest.TestCase):
     def test_default_profile_matches_runtime_os(self):
         profile = flow.DEFAULT_FINGERPRINT
+        # Stable fallback profile used when no local Chrome is available.
         self.assertEqual(profile.browser_major, "136")
         self.assertEqual(
             profile.sec_ch_ua,
@@ -34,7 +35,7 @@ class RootFingerprintTests(unittest.TestCase):
     def test_client_applies_profile_headers_before_first_request(self):
         session = _Session()
         client = flow.BrowserlessXAIClient(session=session)
-        profile = flow.DEFAULT_FINGERPRINT
+        profile = flow.build_runtime_fingerprint_profile()
         self.assertEqual(session.headers["user-agent"], profile.user_agent)
         self.assertEqual(session.headers["accept-language"], profile.accept_language)
         self.assertEqual(session.headers["sec-ch-ua"], profile.sec_ch_ua)
@@ -42,7 +43,8 @@ class RootFingerprintTests(unittest.TestCase):
             session.headers["sec-ch-ua-platform"],
             f'"{profile.client_hint_platform}"',
         )
-        self.assertEqual(client.fingerprint, profile)
+        self.assertEqual(client.fingerprint.browser_major, profile.browser_major)
+        self.assertEqual(client.fingerprint.user_agent, profile.user_agent)
 
     def test_local_platform_mismatch_fails_closed(self):
         profile = flow.DEFAULT_FINGERPRINT

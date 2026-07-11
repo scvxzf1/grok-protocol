@@ -10,6 +10,78 @@ from typing import Any, Dict, Optional, Union
 DEFAULT_SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
 
 
+def detect_system_chrome_path() -> str:
+    """Best-effort discovery of a local Chrome/Chromium binary."""
+    env = str(os.environ.get("TURNSTILE_BROWSER_PATH") or "").strip()
+    candidates = []
+    if env:
+        candidates.append(env)
+    # Common Linux/mac locations first; Windows later if present.
+    candidates.extend(
+        [
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/google-chrome",
+            "/opt/google/chrome/chrome",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/chromium",
+            "/snap/bin/chromium",
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        ]
+    )
+    try:
+        import shutil
+
+        for name in (
+            "google-chrome-stable",
+            "google-chrome",
+            "chromium-browser",
+            "chromium",
+            "chrome",
+        ):
+            found = shutil.which(name)
+            if found:
+                candidates.append(found)
+    except Exception:
+        pass
+    seen = set()
+    for raw in candidates:
+        text = str(raw or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        path = Path(text).expanduser()
+        try:
+            if path.is_file() and os.access(str(path), os.X_OK):
+                return str(path.resolve(strict=False))
+        except OSError:
+            continue
+    return ""
+
+
+def detect_chrome_major(browser_path: str = "") -> str:
+    """Read Chrome major version from browser_path --version output."""
+    path = str(browser_path or detect_system_chrome_path() or "").strip()
+    if not path:
+        return ""
+    try:
+        import re
+        import subprocess
+
+        output = subprocess.check_output(
+            [path, "--version"],
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return ""
+    match = re.search(r"(\d+)\.\d+\.\d+\.\d+", str(output or ""))
+    if not match:
+        match = re.search(r"(\d+)\.", str(output or ""))
+    return str(match.group(1)) if match else ""
+
+
+
 @dataclass
 class SolverConfig:
     host: str = "127.0.0.1"
@@ -89,9 +161,12 @@ class SolverConfig:
     def resolved_browser_path(self) -> str:
         raw = str(os.environ.get("TURNSTILE_BROWSER_PATH") or self.browser_path or "").strip()
         if not raw:
+            raw = detect_system_chrome_path()
+        if not raw:
             if self.strict_fingerprint:
                 raise ValueError(
                     "严格指纹模式必须通过 browser_path 或 TURNSTILE_BROWSER_PATH 指定浏览器"
+                    "（也可用本机已安装的 google-chrome / chromium）"
                 )
             return ""
         path = Path(raw).expanduser()

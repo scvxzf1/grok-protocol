@@ -31,8 +31,77 @@ class FingerprintProfile:
     )
 
 
-def build_canonical_fingerprint_profile(platform_name: str = "") -> FingerprintProfile:
-    """Return the one Chrome profile shared by HTTP and local solver paths."""
+def _normalize_browser_major(value: object, *, default: str = "136") -> str:
+    text = str(value or "").strip()
+    if not text:
+        return str(default)
+    if "." in text:
+        text = text.split(".", 1)[0]
+    if not text.isdigit():
+        return str(default)
+    major = int(text)
+    if major <= 0:
+        return str(default)
+    return str(major)
+
+
+def _impersonate_for_browser_major(major: str) -> str:
+    """Pick a curl_cffi impersonate target closest to the real Chrome major."""
+    try:
+        major_i = int(str(major).strip() or "136")
+    except ValueError:
+        major_i = 136
+    # Prefer exact-ish profiles available in modern curl_cffi builds.
+    ordered = (
+        (148, ("chrome148", "chrome142", "chrome136")),
+        (142, ("chrome142", "chrome136", "chrome133a")),
+        (136, ("chrome136", "chrome133a", "chrome131")),
+        (133, ("chrome133a", "chrome131", "chrome124")),
+        (131, ("chrome131", "chrome124", "chrome120")),
+        (124, ("chrome124", "chrome120")),
+        (120, ("chrome120", "chrome116", "chrome")),
+    )
+    # Choose the nearest profile bucket not newer than major when possible.
+    candidates = []
+    for bucket, names in ordered:
+        if bucket <= major_i:
+            candidates.extend(names)
+    if not candidates:
+        candidates = list(ordered[-1][1])
+    # Deduplicate while preserving order.
+    seen = set()
+    uniq = []
+    for name in candidates:
+        if name in seen:
+            continue
+        seen.add(name)
+        uniq.append(name)
+    # Validate against installed curl_cffi if possible; fall back gracefully.
+    try:
+        from curl_cffi.requests import Session
+
+        for name in uniq:
+            try:
+                Session(impersonate=name)
+                return name
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return uniq[0] if uniq else "chrome136"
+
+
+def build_canonical_fingerprint_profile(
+    platform_name: str = "",
+    *,
+    browser_major: object = None,
+) -> FingerprintProfile:
+    """Return the Chrome profile shared by HTTP and local solver paths.
+
+    browser_major: optional major version (e.g. 148). Defaults to 136 for a
+    stable unit-test/default profile. Runtime callers should pass the installed
+    Chrome major so local Turnstile and HTTP session stay aligned.
+    """
 
     runtime = str(platform_name or sys.platform or "").strip().lower()
     if runtime.startswith("linux"):
@@ -52,19 +121,21 @@ def build_canonical_fingerprint_profile(platform_name: str = "") -> FingerprintP
         client_hint_platform = "macOS"
     else:
         raise RuntimeError(f"canonical Chrome fingerprint does not support platform: {runtime!r}")
+    major = _normalize_browser_major(browser_major, default="136")
+    impersonate = _impersonate_for_browser_major(major)
     return FingerprintProfile(
-        profile_id=f"curl-chrome136-{profile_suffix}",
-        impersonate="chrome136",
+        profile_id=f"curl-{impersonate}-{profile_suffix}",
+        impersonate=impersonate,
         user_agent=(
             f"Mozilla/5.0 ({ua_platform}) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/136.0.0.0 Safari/537.36"
+            f"Chrome/{major}.0.0.0 Safari/537.36"
         ),
         accept_language="zh-CN,zh;q=0.9,en;q=0.8",
         navigator_platform=navigator_platform,
         client_hint_platform=client_hint_platform,
-        browser_major="136",
-        sec_ch_ua='"Not.A/Brand";v="99", "Chromium";v="136"',
+        browser_major=major,
+        sec_ch_ua=f'"Not.A/Brand";v="99", "Chromium";v="{major}"',
     )
 
 

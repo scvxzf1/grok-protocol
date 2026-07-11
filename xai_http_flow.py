@@ -69,6 +69,31 @@ SIGNIN_URL = f"{ACCOUNT_ORIGIN}/sign-in"
 API_RPC_URL = f"{ACCOUNT_ORIGIN}/api/rpc"
 DEFAULT_TIMEOUT = 30
 DEFAULT_FINGERPRINT = build_canonical_fingerprint_profile()
+
+
+def build_runtime_fingerprint_profile(
+    *,
+    browser_path: str = "",
+    browser_major: object = None,
+) -> FingerprintProfile:
+    """Build HTTP/local shared fingerprint aligned to installed Chrome when possible."""
+    major = str(browser_major or "").strip()
+    path = str(browser_path or "").strip()
+    if not major:
+        try:
+            from turnstile_solver.src.config import (
+                detect_chrome_major,
+                detect_system_chrome_path,
+            )
+
+            path = path or detect_system_chrome_path()
+            major = detect_chrome_major(path) if path else ""
+        except Exception:
+            major = ""
+    if major:
+        return build_canonical_fingerprint_profile(browser_major=major)
+    return DEFAULT_FINGERPRINT
+
 DEFAULT_ACCEPT_LANGUAGE = DEFAULT_FINGERPRINT.accept_language
 CHROME136_SEC_CH_UA = DEFAULT_FINGERPRINT.sec_ch_ua
 DEFAULT_USER_AGENT = DEFAULT_FINGERPRINT.user_agent
@@ -1713,7 +1738,7 @@ class BrowserlessXAIClient:
         *,
         proxy: str = "",
         timeout: int = DEFAULT_TIMEOUT,
-        user_agent: str = DEFAULT_USER_AGENT,
+        user_agent: str = "",
         fingerprint: Optional[FingerprintProfile] = None,
         session: Any = None,
         log_callback: LogFn = None,
@@ -1722,17 +1747,23 @@ class BrowserlessXAIClient:
         self.proxies = _proxy_dict(self.proxy)
         self.timeout = max(5, int(timeout or DEFAULT_TIMEOUT))
         if fingerprint is None:
-            selected_user_agent = str(user_agent or DEFAULT_USER_AGENT)
-            fingerprint = FingerprintProfile(
-                profile_id=DEFAULT_FINGERPRINT.profile_id,
-                impersonate=DEFAULT_FINGERPRINT.impersonate,
-                user_agent=selected_user_agent,
-                accept_language=DEFAULT_FINGERPRINT.accept_language,
-                navigator_platform=DEFAULT_FINGERPRINT.navigator_platform,
-                client_hint_platform=DEFAULT_FINGERPRINT.client_hint_platform,
-                browser_major=DEFAULT_FINGERPRINT.browser_major,
-                sec_ch_ua=DEFAULT_FINGERPRINT.sec_ch_ua,
-            )
+            runtime = build_runtime_fingerprint_profile()
+            # Empty user_agent means "follow runtime Chrome major".
+            selected_user_agent = str(user_agent or "").strip() or runtime.user_agent
+            if selected_user_agent == runtime.user_agent:
+                fingerprint = runtime
+            else:
+                # Explicit UA override keeps runtime platform/major alignment fields.
+                fingerprint = FingerprintProfile(
+                    profile_id=runtime.profile_id,
+                    impersonate=runtime.impersonate,
+                    user_agent=selected_user_agent,
+                    accept_language=runtime.accept_language,
+                    navigator_platform=runtime.navigator_platform,
+                    client_hint_platform=runtime.client_hint_platform,
+                    browser_major=runtime.browser_major,
+                    sec_ch_ua=runtime.sec_ch_ua,
+                )
         self.fingerprint = fingerprint
         self.user_agent = fingerprint.user_agent
         self.accept_language = fingerprint.accept_language
