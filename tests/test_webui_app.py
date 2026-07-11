@@ -213,6 +213,50 @@ class WebUIAppTests(unittest.TestCase):
             self.assertIn("btnEmbeddedStart", page.text)
             self.assertIn("btnEmbeddedStatus", page.text)
 
+    def test_embedded_proxy_autostart_on_app_boot(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            service = self._service(root)
+            service.settings.config["embedded_proxy_enabled"] = True
+            called = {"n": 0}
+            status_payload = {
+                "enabled": True,
+                "running": False,
+                "phase": "starting",
+                "message": "正在启动/重载内嵌代理…",
+                "healthy": 0,
+                "total": 0,
+                "leases": 0,
+            }
+
+            def fake_auto(force=False):
+                called["n"] += 1
+                return dict(status_payload)
+
+            with mock.patch.object(service, "maybe_autostart_embedded_proxy", side_effect=fake_auto) as auto:
+                with mock.patch.object(service, "get_embedded_proxy_status", return_value=status_payload):
+                    app = webui_app.create_app(service=service)
+                    with TestClient(app) as client:
+                        r = client.get("/api/health")
+            self.assertEqual(r.status_code, 200)
+            body = r.json()
+            self.assertIn("embedded_proxy", body)
+            self.assertEqual(body["embedded_proxy"]["phase"], "starting")
+            auto.assert_called()
+            self.assertGreaterEqual(called["n"], 1)
+
+    def test_run_page_has_embedded_status_widgets(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            service = self._service(root)
+            app = webui_app.create_app(service=service)
+            client = TestClient(app)
+            page = client.get("/")
+            self.assertEqual(page.status_code, 200)
+            self.assertIn("embeddedProxySummaryRun", page.text)
+            self.assertIn("embeddedBadge", page.text)
+
+
 
 if __name__ == "__main__":
     unittest.main()

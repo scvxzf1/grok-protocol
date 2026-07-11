@@ -18,7 +18,10 @@
         <a href="/config" class="{% if active == 'config' %}active{% endif %}">配置中心</a>
       </nav>
     </div>
-    <div id="busyBadge" class="badge">空闲</div>
+    <div class="top-status">
+      <div id="embeddedBadge" class="badge">内嵌代理: 检测中</div>
+      <div id="busyBadge" class="badge">空闲</div>
+    </div>
   </header>
 
   <main class="grid">
@@ -65,6 +68,12 @@
         <button type="button" id="btnCleanup">清理残留</button>
       </div>
       <p id="message" class="msg"></p>
+    </section>
+
+    <section class="panel">
+      <h2>内嵌代理</h2>
+      <p class="muted" id="embeddedProxySummaryRun">状态: 等待启动</p>
+      <pre id="embeddedProxyStatusRun" class="box small">尚未查询</pre>
     </section>
 
     <section class="panel">

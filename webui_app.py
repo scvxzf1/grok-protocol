@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import asyncio
 import json
 import os
@@ -69,7 +70,17 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
     if service is not None:
         _APP_SERVICE = service
 
-    app = FastAPI(title="xAI HTTP WebUI", docs_url=None, redoc_url=None)
+    @contextlib.asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        svc = get_service()
+        # Fire-and-forget autostart so UI can poll phase/status immediately.
+        try:
+            svc.maybe_autostart_embedded_proxy(force=False)
+        except Exception:
+            pass
+        yield
+
+    app = FastAPI(title="xAI HTTP WebUI", docs_url=None, redoc_url=None, lifespan=lifespan)
     static_dir = ROOT_DIR / "webui" / "static"
     templates_dir = ROOT_DIR / "webui" / "templates"
     static_dir.mkdir(parents=True, exist_ok=True)
@@ -103,12 +114,17 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
     def health() -> Dict[str, Any]:
         svc = get_service()
         snap = svc.current_snapshot()
+        try:
+            emb = svc.get_embedded_proxy_status()
+        except Exception as exc:
+            emb = {"enabled": False, "phase": "error", "message": str(exc)}
         return {
             "ok": True,
             "host": DEFAULT_WEBUI_HOST,
             "port": DEFAULT_WEBUI_PORT,
             "busy": svc.is_busy(),
             "run_id": (snap or {}).get("run_id"),
+            "embedded_proxy": emb,
         }
 
     @app.get("/api/settings")

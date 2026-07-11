@@ -2138,6 +2138,15 @@ class BatchService:
         self._lock = threading.Lock()
         self._embedded_proxy_manager = None
         self._embedded_proxy_last: Dict[str, object] = {"enabled": False}
+        self._embedded_proxy_boot: Dict[str, object] = {
+            "phase": "idle",  # idle|starting|ready|error|disabled
+            "message": "",
+            "started_at": 0.0,
+            "finished_at": 0.0,
+            "auto": False,
+        }
+        self._embedded_proxy_boot_lock = threading.Lock()
+        self._embedded_proxy_boot_thread: Optional[threading.Thread] = None
 
     def _load_settings(self) -> Settings:
         config = _read_config(self.config_path) if self.config_path.is_file() else {}
@@ -2581,14 +2590,125 @@ class BatchService:
             raise TuiConfigError("订阅中没有可用的 VLESS 节点，无法启动内嵌 mihomo 池")
         return slots, result
 
+    def _set_embedded_boot(
+        self,
+        *,
+        phase: str,
+        message: str = "",
+        auto: Optional[bool] = None,
+    ) -> None:
+        with self._embedded_proxy_boot_lock:
+            boot = dict(self._embedded_proxy_boot or {})
+            boot["phase"] = str(phase or "idle")
+            boot["message"] = str(message or "")
+            if auto is not None:
+                boot["auto"] = bool(auto)
+            now = time.time()
+            if phase == "starting":
+                boot["started_at"] = now
+                boot["finished_at"] = 0.0
+            elif phase in {"ready", "error", "disabled", "idle"}:
+                boot["finished_at"] = now
+            self._embedded_proxy_boot = boot
+
+    def maybe_autostart_embedded_proxy(self, *, force: bool = False) -> Dict[str, object]:
+        """Start embedded proxy in background when enabled (WebUI boot)."""
+        raw = dict(self.settings.config or {})
+        enabled = _as_bool(raw.get("embedded_proxy_enabled"))
+        if not enabled:
+            self._set_embedded_boot(phase="disabled", message="内嵌代理未启用", auto=True)
+            return self.get_embedded_proxy_status()
+
+        with self._embedded_proxy_boot_lock:
+            thread = self._embedded_proxy_boot_thread
+            phase = str((self._embedded_proxy_boot or {}).get("phase") or "idle")
+            manager = self._embedded_proxy_manager
+            already_running = bool(manager is not None and getattr(manager, "_running", False))
+            if already_running and not force:
+                self._embedded_proxy_boot = {
+                    **dict(self._embedded_proxy_boot or {}),
+                    "phase": "ready",
+                    "message": "内嵌代理已在运行",
+                    "auto": True,
+                    "finished_at": time.time(),
+                }
+                return self.get_embedded_proxy_status()
+            if thread is not None and thread.is_alive() and not force:
+                return self.get_embedded_proxy_status()
+
+            self._embedded_proxy_boot = {
+                "phase": "starting",
+                "message": "正在启动/重载内嵌代理…",
+                "started_at": time.time(),
+                "finished_at": 0.0,
+                "auto": True,
+            }
+
+            def _worker() -> None:
+                try:
+                    self._set_embedded_boot(
+                        phase="starting",
+                        message="正在启动/重载内嵌代理…",
+                        auto=True,
+                    )
+                    out = self.ensure_embedded_proxy(force_reload=bool(force))
+                    healthy = out.get("healthy")
+                    total = out.get("total")
+                    msg = (
+                        f"内嵌代理已就绪：健康 "
+                        f"{healthy if healthy is not None else 0}/"
+                        f"{total if total is not None else 0}"
+                    )
+                    self._set_embedded_boot(
+                        phase="ready" if out.get("running") or out.get("enabled") else "idle",
+                        message=msg,
+                        auto=True,
+                    )
+                    # Keep last snapshot for UI.
+                    merged = dict(out or {})
+                    merged["phase"] = "ready"
+                    merged["message"] = msg
+                    self._embedded_proxy_last = merged
+                except Exception as exc:
+                    err = str(exc)
+                    self._set_embedded_boot(phase="error", message=err, auto=True)
+                    last = dict(self._embedded_proxy_last or {})
+                    last.update(
+                        {
+                            "enabled": True,
+                            "running": False,
+                            "last_error": err,
+                            "phase": "error",
+                            "message": err,
+                        }
+                    )
+                    self._embedded_proxy_last = last
+                finally:
+                    with self._embedded_proxy_boot_lock:
+                        # allow future manual restarts to spawn a new worker
+                        if self._embedded_proxy_boot_thread is threading.current_thread():
+                            self._embedded_proxy_boot_thread = None
+
+            self._embedded_proxy_boot_thread = threading.Thread(
+                target=_worker,
+                name="embedded-proxy-autostart",
+                daemon=True,
+            )
+            self._embedded_proxy_boot_thread.start()
+        return self.get_embedded_proxy_status()
+
     def ensure_embedded_proxy(self, force_reload: bool = False) -> dict:
         """Load subscription VLESS nodes into embedded mihomo pool and probe them."""
         raw = dict(self.settings.config or {})
         enabled = _as_bool(raw.get("embedded_proxy_enabled"))
         if not enabled:
-            out = {"enabled": False}
+            out = {"enabled": False, "phase": "disabled", "message": "内嵌代理未启用"}
             self._embedded_proxy_last = out
+            self._set_embedded_boot(phase="disabled", message="内嵌代理未启用")
             return out
+        # When called synchronously (manual start/reload), surface starting state.
+        if str((self._embedded_proxy_boot or {}).get("phase") or "") != "starting":
+            self._set_embedded_boot(phase="starting", message="正在启动/重载内嵌代理…")
 
         manager = self._embedded_proxy_manager
         already_running = bool(manager is not None and getattr(manager, "_running", False))
@@ -2596,7 +2716,12 @@ class BatchService:
             status = dict(manager.status() or {})
             status["enabled"] = True
             status["node_count"] = int(status.get("total") or 0)
+            status["phase"] = "ready"
+            status["message"] = (
+                f"内嵌代理已就绪：健康 {status.get('healthy', 0)}/{status.get('total', 0)}"
+            )
             self._embedded_proxy_last = status
+            self._set_embedded_boot(phase="ready", message=status["message"])
             return status
 
         from embedded_proxy_manager import EmbeddedProxyManager
@@ -2609,14 +2734,20 @@ class BatchService:
         try:
             start_info = manager.start(nodes, cfg)
         except Exception as exc:
-            raise TuiConfigError(f"启动内嵌 mihomo 失败: {exc}") from exc
+            err = f"启动内嵌 mihomo 失败: {exc}"
+            self._set_embedded_boot(phase="error", message=err)
+            raise TuiConfigError(err) from exc
         try:
             probe_info = manager.probe_all()
         except Exception as exc:
-            raise TuiConfigError(f"内嵌节点预检失败: {exc}") from exc
+            err = f"内嵌节点预检失败: {exc}"
+            self._set_embedded_boot(phase="error", message=err)
+            raise TuiConfigError(err) from exc
         healthy = int(probe_info.get("healthy") or 0)
         if healthy <= 0:
-            raise TuiConfigError("内嵌节点预检全失败，请检查订阅节点或探测目标 accounts.x.ai")
+            err = "内嵌节点预检全失败，请检查订阅节点或探测目标 accounts.x.ai"
+            self._set_embedded_boot(phase="error", message=err)
+            raise TuiConfigError(err)
         status = dict(manager.status() or {})
         out = {
             "enabled": True,
@@ -2629,14 +2760,28 @@ class BatchService:
             "start": start_info,
             "nodes": status.get("nodes") or [],
         }
+        out["phase"] = "ready"
+        out["message"] = f"内嵌代理已就绪：健康 {healthy}/{out.get('total') or 0}"
         self._embedded_proxy_last = out
+        self._set_embedded_boot(phase="ready", message=out["message"])
         return out
 
     def get_embedded_proxy_status(self) -> dict:
         raw = dict(self.settings.config or {})
         enabled = _as_bool(raw.get("embedded_proxy_enabled"))
+        boot = dict(self._embedded_proxy_boot or {})
         if not enabled:
-            return {"enabled": False}
+            out = {
+                "enabled": False,
+                "running": False,
+                "total": 0,
+                "healthy": 0,
+                "leases": 0,
+                "phase": "disabled",
+                "message": "内嵌代理未启用",
+                "boot": boot,
+            }
+            return out
         manager = self._embedded_proxy_manager
         if manager is None:
             last = dict(self._embedded_proxy_last or {})
@@ -2646,6 +2791,9 @@ class BatchService:
             last.setdefault("healthy", 0)
             last.setdefault("leases", 0)
             last.setdefault("last_error", "")
+            last["phase"] = str(boot.get("phase") or ("starting" if last.get("running") else "idle"))
+            last["message"] = str(boot.get("message") or last.get("last_error") or "")
+            last["boot"] = boot
             return last
         status = dict(manager.status() or {})
         status["enabled"] = True
@@ -2653,6 +2801,34 @@ class BatchService:
         status.setdefault("leases", int(status.get("leases") or 0))
         last = dict(self._embedded_proxy_last or {})
         status.setdefault("last_error", last.get("last_error") or "")
+        # Prefer freshest healthy counts from last ensure/probe when manager status is sparse.
+        if last.get("healthy") is not None:
+            try:
+                if status.get("healthy") is None or int(status.get("healthy") or 0) == 0:
+                    if int(last.get("healthy") or 0) > 0:
+                        status["healthy"] = last.get("healthy")
+            except Exception:
+                status["healthy"] = last.get("healthy")
+        if last.get("total") is not None and not status.get("total"):
+            status["total"] = last.get("total")
+
+        boot_phase = str(boot.get("phase") or "idle")
+        if boot_phase == "starting":
+            status["phase"] = "starting"
+            status["message"] = str(boot.get("message") or "正在启动/重载内嵌代理…")
+        elif boot_phase == "error":
+            status["phase"] = "error"
+            status["message"] = str(boot.get("message") or status.get("last_error") or "内嵌代理启动失败")
+        elif status.get("running"):
+            status["phase"] = "ready"
+            status["message"] = (
+                f"运行中 健康 {status.get('healthy', last.get('healthy', 0))}/"
+                f"{status.get('total', 0)}"
+            )
+        else:
+            status["phase"] = boot_phase or "idle"
+            status["message"] = str(boot.get("message") or status.get("last_error") or "")
+        status["boot"] = boot
         return status
 
     def probe_embedded_proxy(self) -> dict:

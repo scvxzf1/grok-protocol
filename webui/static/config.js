@@ -146,6 +146,7 @@ function collectFields() {
 async function loadAll() {
   const data = await api("/api/config-center");
   fill(data);
+  startEmbeddedStatusPolling();
 }
 
 $("btnReloadCfg").onclick = async () => {
@@ -323,16 +324,26 @@ function renderEmbeddedStatus(data) {
   const box = $("embeddedProxyStatus");
   const summary = $("embeddedProxySummary");
   if (!box) return;
+  data = data || {};
   const enabled = !!data.enabled;
   const running = !!data.running;
+  const phase = String(data.phase || (running ? "ready" : enabled ? "idle" : "disabled"));
   const healthy = data.healthy == null ? "-" : data.healthy;
   const total = data.total == null ? "-" : data.total;
   const leases = data.leases == null ? "-" : data.leases;
   const lastError = data.last_error || "";
+  const message = data.message || lastError || "";
+  const phaseText = {
+    starting: "启动中",
+    ready: "就绪",
+    error: "失败",
+    disabled: "未启用",
+    idle: "空闲",
+  }[phase] || phase;
   if (summary) {
     summary.textContent =
-      `状态: ${enabled ? "已启用" : "未启用"} | ${running ? "运行中" : "未运行"} | 健康 ${healthy}/${total} | 租约 ${leases}` +
-      (lastError ? ` | 错误: ${lastError}` : "");
+      `状态: ${enabled ? "已启用" : "未启用"} | ${phaseText} | ${running ? "运行中" : "未运行"} | 健康 ${healthy}/${total} | 租约 ${leases}` +
+      (message ? ` | ${message}` : "");
   }
   try {
     box.textContent = JSON.stringify(data, null, 2);
@@ -345,6 +356,31 @@ async function refreshEmbeddedStatus() {
   const data = await api("/api/embedded-proxy/status");
   renderEmbeddedStatus(data || {});
   return data;
+}
+
+let embeddedStatusTimer = null;
+function startEmbeddedStatusPolling() {
+  if (embeddedStatusTimer) return;
+  const tick = async () => {
+    try {
+      const data = await refreshEmbeddedStatus();
+      const phase = String((data && data.phase) || "");
+      const delay = phase === "starting" ? 1200 : 5000;
+      embeddedStatusTimer = setTimeout(tick, delay);
+    } catch (e) {
+      renderEmbeddedStatus({
+        enabled: false,
+        phase: "error",
+        message: String(e.message || e),
+        running: false,
+        healthy: 0,
+        total: 0,
+        leases: 0,
+      });
+      embeddedStatusTimer = setTimeout(tick, 5000);
+    }
+  };
+  tick();
 }
 
 const btnEmbeddedStart = $("btnEmbeddedStart");

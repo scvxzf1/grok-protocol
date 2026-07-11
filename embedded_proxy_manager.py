@@ -398,6 +398,57 @@ class EmbeddedProxyManager:
                 time.sleep(0.05)
         return False
 
+
+    def _cleanup_stale_project_mihomo(self) -> None:
+        """Best-effort kill leftover project-local mihomo processes."""
+        runtime_dir = str((self._project_root() / ".embedded_mihomo").resolve())
+        marker = runtime_dir
+        try:
+            import signal
+            import os as _os
+            # Scan /proc for matching command lines without shelling out.
+            for pid_name in _os.listdir("/proc"):
+                if not pid_name.isdigit():
+                    continue
+                pid = int(pid_name)
+                if pid == _os.getpid():
+                    continue
+                cmdline_path = f"/proc/{pid}/cmdline"
+                try:
+                    raw = Path(cmdline_path).read_bytes()
+                except OSError:
+                    continue
+                cmd = raw.replace(b"\x00", b" ").decode("utf-8", "ignore")
+                if "verge-mihomo" not in cmd and "/mihomo" not in cmd and " mihomo " not in f" {cmd} ":
+                    # keep narrow: only our binary names
+                    if "mihomo" not in cmd:
+                        continue
+                if marker not in cmd:
+                    continue
+                try:
+                    _os.kill(pid, signal.SIGTERM)
+                except OSError:
+                    continue
+            time.sleep(0.2)
+            for pid_name in _os.listdir("/proc"):
+                if not pid_name.isdigit():
+                    continue
+                pid = int(pid_name)
+                cmdline_path = f"/proc/{pid}/cmdline"
+                try:
+                    raw = Path(cmdline_path).read_bytes()
+                except OSError:
+                    continue
+                cmd = raw.replace(b"\x00", b" ").decode("utf-8", "ignore")
+                if marker in cmd and "mihomo" in cmd:
+                    try:
+                        _os.kill(pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+        except Exception:
+            # Never block start on cleanup failure.
+            logger.exception("stale mihomo cleanup failed")
+
     def start(self, nodes: List[NodeSlot], config: Optional[EmbeddedProxyConfig] = None) -> dict:
         """Write multi-port config, spawn mihomo, wait first listener, store nodes."""
         if config is not None:
@@ -414,6 +465,7 @@ class EmbeddedProxyManager:
 
         if self._running or self._proc is not None:
             self.stop()
+        self._cleanup_stale_project_mihomo()
 
         mihomo_cfg = build_mihomo_config(
             selected,

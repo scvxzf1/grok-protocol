@@ -190,3 +190,8 @@ label.check .field-title {
   margin: 0;
 }
 
+
+.top-status { display:flex; gap:8px; align-items:center; flex-wrap:wrap; justify-content:flex-end; }
+.badge.warn { background: #3a2a12; color: var(--warn); }
+.badge.err { background: #3a1717; color: var(--bad); }
+.badge.good { background: #173528; color: var(--good); }

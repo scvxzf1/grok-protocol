@@ -204,6 +204,85 @@ $("btnCleanup").onclick = async () => {
 $("btnClearLog").onclick = () => { logBox.textContent = ""; };
 $("btnRefreshHistory").onclick = () => refreshHistory().catch(e => setMsg(String(e.message || e), true));
 
+
+function renderEmbeddedProxyStatus(data) {
+  const summary = $("embeddedProxySummaryRun");
+  const box = $("embeddedProxyStatusRun");
+  const badge = $("embeddedBadge");
+  if (!data) data = {};
+  const enabled = !!data.enabled;
+  const running = !!data.running;
+  const phase = String(data.phase || (running ? "ready" : enabled ? "idle" : "disabled"));
+  const healthy = data.healthy == null ? "-" : data.healthy;
+  const total = data.total == null ? "-" : data.total;
+  const leases = data.leases == null ? "-" : data.leases;
+  const message = data.message || data.last_error || "";
+  const phaseText = {
+    starting: "启动中",
+    ready: "就绪",
+    error: "失败",
+    disabled: "未启用",
+    idle: "空闲",
+  }[phase] || phase;
+  if (summary) {
+    summary.textContent =
+      `状态: ${enabled ? "已启用" : "未启用"} | ${phaseText}` +
+      ` | ${running ? "运行中" : "未运行"} | 健康 ${healthy}/${total} | 租约 ${leases}` +
+      (message ? ` | ${message}` : "");
+  }
+  if (box) {
+    try { box.textContent = JSON.stringify(data, null, 2); }
+    catch { box.textContent = String(data); }
+  }
+  if (badge) {
+    let label = `内嵌代理: ${phaseText}`;
+    if (enabled && (healthy !== "-" || total !== "-")) label += ` ${healthy}/${total}`;
+    badge.textContent = label;
+    badge.className = "badge";
+    if (phase === "ready" && running) badge.classList.add("good");
+    else if (phase === "starting") badge.classList.add("warn");
+    else if (phase === "error") badge.classList.add("err");
+    else if (phase === "disabled") badge.classList.add("");
+  }
+}
+
+async function refreshEmbeddedProxyStatus() {
+  try {
+    const data = await api("/api/embedded-proxy/status");
+    renderEmbeddedProxyStatus(data || {});
+    return data;
+  } catch (e) {
+    renderEmbeddedProxyStatus({
+      enabled: false,
+      phase: "error",
+      message: String(e.message || e),
+      running: false,
+      healthy: 0,
+      total: 0,
+      leases: 0,
+    });
+    throw e;
+  }
+}
+
+let embeddedPollTimer = null;
+function startEmbeddedProxyPolling() {
+  if (embeddedPollTimer) return;
+  const tick = async () => {
+    try {
+      const data = await refreshEmbeddedProxyStatus();
+      const phase = String((data && data.phase) || "");
+      // Keep polling while starting; slow down when stable.
+      const delay = phase === "starting" ? 1200 : 5000;
+      embeddedPollTimer = setTimeout(tick, delay);
+    } catch {
+      embeddedPollTimer = setTimeout(tick, 5000);
+    }
+  };
+  tick();
+}
+
+
 (async function init() {
   try {
     await loadSettings();
@@ -215,7 +294,10 @@ $("btnRefreshHistory").onclick = () => refreshHistory().catch(e => setMsg(String
     await refreshHistory();
     const health = await api("/api/health");
     if (health.busy) $("busyBadge").textContent = "运行中";
+    if (health.embedded_proxy) renderEmbeddedProxyStatus(health.embedded_proxy);
+    startEmbeddedProxyPolling();
   } catch (e) {
     setMsg(String(e.message || e), true);
+    startEmbeddedProxyPolling();
   }
 })();
