@@ -31,7 +31,9 @@ DEFAULT_OUTPUT_DIR = ROOT_DIR / "xai_credentials"
 RUNS_DIR = ROOT_DIR / "http_runs"
 MAX_COUNT = 1000
 MAX_WORKERS = 32
-MAX_LOCAL_TURNSTILE_WORKERS = 3
+MAX_LOCAL_TURNSTILE_WORKERS = 3  # default local Turnstile concurrency cap
+MIN_LOCAL_TURNSTILE_WORKERS = 1
+ABS_MAX_LOCAL_TURNSTILE_WORKERS = 6666
 MAX_LOG_LINES = 700
 DEFAULT_SSO_CONVERT_RETRIES = 5
 DEFAULT_SSO_CONVERT_COOLDOWN = 3
@@ -400,6 +402,35 @@ def _config_path_value(path: Path, base: Path) -> str:
         return str(path)
 
 
+def resolve_local_turnstile_max_workers(
+    config: Optional[Dict[str, object]] = None,
+    *,
+    strict: bool = False,
+) -> int:
+    """Return configured local Turnstile worker cap.
+
+    strict=True: invalid values raise TuiConfigError (config-center save path).
+    strict=False: missing/invalid values fall back to MAX_LOCAL_TURNSTILE_WORKERS.
+    """
+    raw = None if not isinstance(config, dict) else config.get("local_turnstile_max_workers")
+    if raw is None or str(raw).strip() == "":
+        return MAX_LOCAL_TURNSTILE_WORKERS
+    try:
+        number = int(str(raw).strip())
+    except (TypeError, ValueError) as exc:
+        if strict:
+            raise TuiConfigError("本地 Turnstile 并发上限必须是整数") from exc
+        return MAX_LOCAL_TURNSTILE_WORKERS
+    if not MIN_LOCAL_TURNSTILE_WORKERS <= number <= ABS_MAX_LOCAL_TURNSTILE_WORKERS:
+        if strict:
+            raise TuiConfigError(
+                "本地 Turnstile 并发上限必须介于 "
+                f"{MIN_LOCAL_TURNSTILE_WORKERS} 到 {ABS_MAX_LOCAL_TURNSTILE_WORKERS} 之间"
+            )
+        return MAX_LOCAL_TURNSTILE_WORKERS
+    return number
+
+
 def _positive_int(value: object, label: str, maximum: int) -> int:
     try:
         number = int(str(value).strip())
@@ -603,6 +634,7 @@ def build_plan(settings: Settings) -> RunPlan:
                 f"缺少 {TURNSTILE_PROVIDER_LABELS[provider]} API 密钥。请设置 config.turnstile_api_key 或对应环境变量。"
             )
     elif provider == "local":
+        local_cap = resolve_local_turnstile_max_workers(config, strict=False)
         warnings.append(
             "主流程仍是 HTTP 协议；仅在 Turnstile 求解阶段临时打开本地浏览器"
             + ("（无头）" if turnstile_headless else "（有界面）")
@@ -612,13 +644,13 @@ def build_plan(settings: Settings) -> RunPlan:
             warnings.append(
                 "本地无头会映射为 virtual-headed（Xvfb）；"
                 "每个 worker 都会起浏览器，建议并发 <= "
-                f"{MAX_LOCAL_TURNSTILE_WORKERS}。"
+                f"{local_cap}（配置 local_turnstile_max_workers）。"
             )
-        if workers > MAX_LOCAL_TURNSTILE_WORKERS:
-            workers = MAX_LOCAL_TURNSTILE_WORKERS
+        if workers > local_cap:
+            workers = local_cap
             warnings.append(
-                f"本地浏览器 Turnstile 已将并发限制为 {MAX_LOCAL_TURNSTILE_WORKERS}，"
-                "避免 YYDS 建邮限流和本机浏览器资源打满。"
+                f"本地浏览器 Turnstile 已将并发限制为 {local_cap}"
+                "（配置 local_turnstile_max_workers），避免本机浏览器资源打满。"
             )
 
     is_graph = email_provider in {"msgraph", "microsoft", "hotmail", "outlook"}

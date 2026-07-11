@@ -30,7 +30,7 @@ class HttpBatchServiceSmokeTests(unittest.TestCase):
                 count=10,
                 workers=10,
                 output_dir=root / "creds",
-                run_mode=svc.RUN_MODE_REGISTER_SSO,
+                run_mode=svc.RUN_MODE_REGISTER_OTP,
                 turnstile_provider="local",
                 turnstile_headless=True,
                 config=svc._read_config(cfg),
@@ -38,6 +38,98 @@ class HttpBatchServiceSmokeTests(unittest.TestCase):
             plan = svc.build_plan(settings)
             self.assertLessEqual(plan.workers, svc.MAX_LOCAL_TURNSTILE_WORKERS)
 
+    def test_build_plan_local_uses_configured_cap(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            cfg = root / "config.json"
+            cfg.write_text(
+                json.dumps(
+                    {
+                        "email_provider": "yyds",
+                        "yyds_api_key": "k",
+                        "turnstile_provider": "local",
+                        "turnstile_headless": True,
+                        "register_count": 10,
+                        "concurrent_workers": 10,
+                        "local_turnstile_max_workers": 8,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            settings = svc.Settings(
+                config_path=cfg,
+                count=10,
+                workers=10,
+                output_dir=root / "creds",
+                run_mode=svc.RUN_MODE_REGISTER_OTP,
+                turnstile_provider="local",
+                turnstile_headless=True,
+                config=svc._read_config(cfg),
+            )
+            plan = svc.build_plan(settings)
+            self.assertEqual(plan.workers, 8)
+            self.assertTrue(any("local_turnstile_max_workers" in w for w in plan.warnings))
+            self.assertTrue(any("YYDS" in w for w in plan.warnings))
+            self.assertFalse(
+                any(("限制为" in w and "YYDS" in w) for w in plan.warnings),
+                msg=f"local cap warning should not mix YYDS: {plan.warnings}",
+            )
+
+    def test_build_plan_non_local_ignores_local_cap(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            cfg = root / "config.json"
+            cfg.write_text(
+                json.dumps(
+                    {
+                        "email_provider": "yyds",
+                        "yyds_api_key": "k",
+                        "turnstile_provider": "capsolver",
+                        "turnstile_api_key": "CAP-test",
+                        "register_count": 5,
+                        "concurrent_workers": 5,
+                        "local_turnstile_max_workers": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            settings = svc.Settings(
+                config_path=cfg,
+                count=5,
+                workers=5,
+                output_dir=root / "creds",
+                run_mode=svc.RUN_MODE_REGISTER_OTP,
+                turnstile_provider="capsolver",
+                turnstile_headless=False,
+                config=svc._read_config(cfg),
+            )
+            plan = svc.build_plan(settings)
+            self.assertEqual(plan.workers, 5)
+
+    def test_resolve_local_turnstile_max_workers_defaults_and_strict(self):
+        self.assertEqual(svc.resolve_local_turnstile_max_workers({}), 3)
+        self.assertEqual(
+            svc.resolve_local_turnstile_max_workers({"local_turnstile_max_workers": 12}),
+            12,
+        )
+        self.assertEqual(
+            svc.resolve_local_turnstile_max_workers({"local_turnstile_max_workers": 0}),
+            3,
+        )
+        self.assertEqual(
+            svc.resolve_local_turnstile_max_workers({"local_turnstile_max_workers": 7000}),
+            3,
+        )
+        with self.assertRaises(svc.TuiConfigError):
+            svc.resolve_local_turnstile_max_workers(
+                {"local_turnstile_max_workers": 0},
+                strict=True,
+            )
+        with self.assertRaises(svc.TuiConfigError):
+            svc.resolve_local_turnstile_max_workers(
+                {"local_turnstile_max_workers": 7000},
+                strict=True,
+            )
 
 
 class FailureClassifyTests(unittest.TestCase):
