@@ -182,3 +182,33 @@ $("btnTestPool").onclick = async () => {
     $("btnTestPool").disabled = false;
   }
 };
+
+
+function setupHelpTips() {
+  const tips = Array.from(document.querySelectorAll(".help-tip"));
+  if (!tips.length) return;
+
+  const closeAll = (except = null) => {
+    tips.forEach((btn) => {
+      if (btn !== except) btn.classList.remove("is-open");
+    });
+  };
+
+  tips.forEach((btn) => {
+    btn.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const willOpen = !btn.classList.contains("is-open");
+      closeAll();
+      if (willOpen) btn.classList.add("is-open");
+    });
+  });
+
+  document.addEventListener("click", () => closeAll());
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") closeAll();
+  });
+}
+
+setupHelpTips();
+

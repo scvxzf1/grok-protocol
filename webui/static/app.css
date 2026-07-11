@@ -127,3 +127,66 @@ textarea.pool {
 @media (max-width: 960px) {
   .config-grid { grid-template-columns: 1fr; }
 }
+
+
+.field-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+}
+
+.help-tip {
+  position: relative;
+  width: 16px;
+  height: 16px;
+  min-width: 16px;
+  padding: 0;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: #121821;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: help;
+}
+
+.help-tip::after {
+  content: attr(data-tip);
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 8px);
+  transform: translateX(-50%);
+  width: max-content;
+  max-width: 220px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: #0c1015;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.35;
+  white-space: normal;
+  text-align: left;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+  opacity: 0;
+  pointer-events: none;
+  visibility: hidden;
+  transition: opacity 0.12s ease;
+  z-index: 20;
+}
+
+.help-tip:hover::after,
+.help-tip:focus-visible::after,
+.help-tip.is-open::after {
+  opacity: 1;
+  visibility: visible;
+}
+
+label.check .field-title {
+  margin: 0;
+}
+

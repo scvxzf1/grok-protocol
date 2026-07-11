@@ -34,7 +34,11 @@
     <section class="panel">
       <h2>邮箱 / Turnstile</h2>
       <form id="cfgCenterForm" class="form">
-        <label>邮箱源
+        <label>
+          <span class="field-title">
+            邮箱源
+            <button type="button" class="help-tip" aria-label="说明" data-tip="选临时邮箱服务商，决定用哪套邮箱配置">?</button>
+          </span>
           <select name="email_provider">
             <option value="yyds">yyds</option>
             <option value="cloudflare">cloudflare</option>
@@ -42,20 +46,38 @@
             <option value="msgraph">msgraph/outlook</option>
           </select>
         </label>
-        <label>YYDS API Base <input name="yyds_api_base" type="text" /></label>
-        <label>YYDS API Key
+        <label>
+          <span class="field-title">
+            YYDS API Base
+            <button type="button" class="help-tip" aria-label="说明" data-tip="YYDS 接口地址，一般不用改默认值">?</button>
+          </span>
+          <input name="yyds_api_base" type="text" />
+        </label>
+        <label>
+          <span class="field-title">
+            YYDS API Key
+            <button type="button" class="help-tip" aria-label="说明" data-tip="YYDS 密钥；空=未配置，清空保存=删除">?</button>
+          </span>
           <div class="secret-row">
             <input name="yyds_api_key" type="text" placeholder="空=未配置" autocomplete="off" />
           </div>
           <span class="flag" data-flag="yyds_api_key"></span>
         </label>
-        <label>YYDS JWT
+        <label>
+          <span class="field-title">
+            YYDS JWT
+            <button type="button" class="help-tip" aria-label="说明" data-tip="YYDS 登录令牌；可与 API Key 二选一">?</button>
+          </span>
           <div class="secret-row">
             <input name="yyds_jwt" type="text" placeholder="空=未配置" autocomplete="off" />
           </div>
           <span class="flag" data-flag="yyds_jwt"></span>
         </label>
-        <label>Turnstile 提供商
+        <label>
+          <span class="field-title">
+            Turnstile 提供商
+            <button type="button" class="help-tip" aria-label="说明" data-tip="验证码求解方式：本地浏览器或第三方">?</button>
+          </span>
           <select name="turnstile_provider">
             <option value="local">local</option>
             <option value="capsolver">capsolver</option>
@@ -63,38 +85,75 @@
             <option value="yescaptcha">yescaptcha</option>
           </select>
         </label>
-        <label>Turnstile API Key
+        <label>
+          <span class="field-title">
+            Turnstile API Key
+            <button type="button" class="help-tip" aria-label="说明" data-tip="第三方求解服务的 Key；local 可留空">?</button>
+          </span>
           <div class="secret-row">
             <input name="turnstile_api_key" type="text" placeholder="空=未配置" autocomplete="off" />
           </div>
           <span class="flag" data-flag="turnstile_api_key"></span>
         </label>
-        <label class="check"><input type="checkbox" name="turnstile_headless" /> Turnstile 无头</label>
-        <label>本地 Turnstile 并发上限
+        <label class="check">
+          <input type="checkbox" name="turnstile_headless" />
+          <span class="field-title">
+            Turnstile 无头
+            <button type="button" class="help-tip" aria-label="说明" data-tip="本地求解时尽量不弹窗（需 Xvfb 环境）">?</button>
+          </span>
+        </label>
+        <label>
+          <span class="field-title">
+            本地 Turnstile 并发上限
+            <button type="button" class="help-tip" aria-label="说明" data-tip="仅 local 生效；总并发仍受运行台与 32 上限约束">?</button>
+          </span>
           <input name="local_turnstile_max_workers" type="number" min="1" max="6666" value="3" />
         </label>
-        <p class="muted">仅 turnstile=local 生效；总并发仍受运行台并发数与 32 上限约束</p>
-        <label>Cloudflare API Base <input name="cloudflare_api_base" type="text" /></label>
-        <label>Cloudflare API Key
+        <label>
+          <span class="field-title">
+            Cloudflare API Base
+            <button type="button" class="help-tip" aria-label="说明" data-tip="Cloudflare 临时邮箱 Worker 的 API 根地址">?</button>
+          </span>
+          <input name="cloudflare_api_base" type="text" />
+        </label>
+        <label>
+          <span class="field-title">
+            Cloudflare API Key
+            <button type="button" class="help-tip" aria-label="说明" data-tip="匿名模式留空；admin 模式填管理密码">?</button>
+          </span>
           <div class="secret-row">
             <input name="cloudflare_api_key" type="text" placeholder="空=未配置" autocomplete="off" />
           </div>
           <span class="flag" data-flag="cloudflare_api_key"></span>
         </label>
-        <label>DuckMail API Key
+        <label>
+          <span class="field-title">
+            DuckMail API Key
+            <button type="button" class="help-tip" aria-label="说明" data-tip="DuckMail 服务密钥；选 duckmail 时必填">?</button>
+          </span>
           <div class="secret-row">
             <input name="duckmail_api_key" type="text" placeholder="空=未配置" autocomplete="off" />
           </div>
           <span class="flag" data-flag="duckmail_api_key"></span>
         </label>
-        <label>MS 邮箱文件 <input name="ms_mail_file" type="text" /></label>
+        <label>
+          <span class="field-title">
+            MS 邮箱文件
+            <button type="button" class="help-tip" aria-label="说明" data-tip="Outlook 四段账号文件路径（msgraph 用）">?</button>
+          </span>
+          <input name="ms_mail_file" type="text" />
+        </label>
       </form>
     </section>
 
     <section class="panel">
       <h2>代理开关</h2>
       <div class="form" id="proxyForm">
-        <label>代理模式
+        <label>
+          <span class="field-title">
+            代理模式
+            <button type="button" class="help-tip" aria-label="说明" data-tip="auto/直连/代理池/关闭，控制出口怎么走">?</button>
+          </span>
           <select name="proxy_mode" form="cfgCenterForm">
             <option value="auto">自动</option>
             <option value="none">关闭（不使用）</option>
@@ -102,21 +161,79 @@
             <option value="pool">代理池</option>
           </select>
         </label>
-        <label>直连代理 URL <input name="proxy" form="cfgCenterForm" type="text" placeholder="http://user:pass@host:port" /></label>
-        <label>代理池文件 <input name="proxy_file" form="cfgCenterForm" type="text" placeholder="proxies.txt" /></label>
-        <label>上游父代理 <input name="proxy_parent" form="cfgCenterForm" type="text" /></label>
-        <label>本地转发端口 <input name="local_proxy_port" form="cfgCenterForm" type="number" min="1" max="65535" /></label>
-        <label class="check"><input type="checkbox" name="proxy_random" form="cfgCenterForm" /> 代理池随机</label>
-        <label class="check"><input type="checkbox" name="proxy_rotate_session" form="cfgCenterForm" /> 轮换 session</label>
-        <label>OAuth 输出目录 <input name="xai_oauth_output_dir" form="cfgCenterForm" type="text" /></label>
-        <label>Grok2API Remote Base <input name="grok2api_remote_base" form="cfgCenterForm" type="text" /></label>
-        <label>Grok2API App Key
+        <label>
+          <span class="field-title">
+            直连代理 URL
+            <button type="button" class="help-tip" aria-label="说明" data-tip="单个代理地址，格式如 http://user:pass@host:port">?</button>
+          </span>
+          <input name="proxy" form="cfgCenterForm" type="text" placeholder="http://user:pass@host:port" />
+        </label>
+        <label>
+          <span class="field-title">
+            代理池文件
+            <button type="button" class="help-tip" aria-label="说明" data-tip="代理列表文件路径，默认 proxies.txt">?</button>
+          </span>
+          <input name="proxy_file" form="cfgCenterForm" type="text" placeholder="proxies.txt" />
+        </label>
+        <label>
+          <span class="field-title">
+            上游父代理
+            <button type="button" class="help-tip" aria-label="说明" data-tip="先经本地 Clash 等再上认证代理（可选）">?</button>
+          </span>
+          <input name="proxy_parent" form="cfgCenterForm" type="text" />
+        </label>
+        <label>
+          <span class="field-title">
+            本地转发端口
+            <button type="button" class="help-tip" aria-label="说明" data-tip="本机无认证转发端口，浏览器流常用">?</button>
+          </span>
+          <input name="local_proxy_port" form="cfgCenterForm" type="number" min="1" max="65535" />
+        </label>
+        <label class="check">
+          <input type="checkbox" name="proxy_random" form="cfgCenterForm" />
+          <span class="field-title">
+            代理池随机
+            <button type="button" class="help-tip" aria-label="说明" data-tip="从代理池随机挑，而不是固定顺序">?</button>
+          </span>
+        </label>
+        <label class="check">
+          <input type="checkbox" name="proxy_rotate_session" form="cfgCenterForm" />
+          <span class="field-title">
+            轮换 session
+            <button type="button" class="help-tip" aria-label="说明" data-tip="尽量换会话出口，降低同 IP 连打风险">?</button>
+          </span>
+        </label>
+        <label>
+          <span class="field-title">
+            OAuth 输出目录
+            <button type="button" class="help-tip" aria-label="说明" data-tip="SSO/凭证 JSON 写出目录">?</button>
+          </span>
+          <input name="xai_oauth_output_dir" form="cfgCenterForm" type="text" />
+        </label>
+        <label>
+          <span class="field-title">
+            Grok2API Remote Base
+            <button type="button" class="help-tip" aria-label="说明" data-tip="远端 grok2api 站点或管理 API 地址">?</button>
+          </span>
+          <input name="grok2api_remote_base" form="cfgCenterForm" type="text" />
+        </label>
+        <label>
+          <span class="field-title">
+            Grok2API App Key
+            <button type="button" class="help-tip" aria-label="说明" data-tip="远端 grok2api 的 app key">?</button>
+          </span>
           <div class="secret-row">
             <input name="grok2api_remote_app_key" form="cfgCenterForm" type="text" placeholder="空=未配置" autocomplete="off" />
           </div>
           <span class="flag" data-flag="grok2api_remote_app_key"></span>
         </label>
-        <label>Grok2API Pool Name <input name="grok2api_pool_name" form="cfgCenterForm" type="text" /></label>
+        <label>
+          <span class="field-title">
+            Grok2API Pool Name
+            <button type="button" class="help-tip" aria-label="说明" data-tip="写入远端时使用的 token 池名称">?</button>
+          </span>
+          <input name="grok2api_pool_name" form="cfgCenterForm" type="text" />
+        </label>
       </div>
       <p class="muted" id="poolMeta">代理池: -</p>
     </section>
