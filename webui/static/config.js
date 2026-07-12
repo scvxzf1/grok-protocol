@@ -237,7 +237,7 @@ $("btnImportSub").onclick = async () => {
       body: JSON.stringify({
         fields: collectFields(),
         proxy_pool_text: $("proxyPoolText").value,
-      turnstile_proxy_pool_text: ($("turnstileProxyPoolText") && $("turnstileProxyPoolText").value) || "",
+        turnstile_proxy_pool_text: ($("turnstileProxyPoolText") && $("turnstileProxyPoolText").value) || "",
       }),
     });
     fill(saved);
@@ -293,43 +293,95 @@ $("btnImportSub").onclick = async () => {
 loadAll().catch(e => setMsg(String(e.message || e), true));
 
 
-function renderProxyTest(data) {
+function renderProxyTestTo(el, data, title) {
+  if (!el) return;
   const lines = [];
-  lines.push(`探测: ${data.probe_url || "-"} | 超时: ${data.timeout_sec || "-"}s`);
+  lines.push(`${title || "代理池测试"}`);
+  lines.push(`探测: ${data.probe_url || data.url || "-"} | 超时: ${data.timeout_sec || data.timeout || "-"}s`);
   lines.push(`来源: ${data.source || "-"} ${data.source_path || ""}`.trim());
-  lines.push(`池内可用: ${data.total_available || 0} | 本次测试: ${data.tested || 0} | 成功: ${data.ok || 0} | 失败: ${data.fail || 0}`);
+  const total = data.total_available != null ? data.total_available : (data.total || 0);
+  const tested = data.tested != null ? data.tested : ((data.results || []).length);
+  const ok = data.ok != null ? data.ok : (data.success || 0);
+  const fail = data.fail != null ? data.fail : (data.failed != null ? data.failed : Math.max(0, tested - ok));
+  lines.push(`池内可用: ${total} | 本次测试: ${tested} | 成功: ${ok} | 失败: ${fail}`);
   lines.push("");
   (data.results || []).forEach((item) => {
     const status = item.ok ? "OK" : "FAIL";
     const latency = item.latency_ms == null ? "-" : `${item.latency_ms}ms`;
-    const ip = item.exit_ip || "-";
+    const ip = item.exit_ip || item.ip || "-";
     const err = item.error ? ` | ${item.error}` : "";
     lines.push(`[${status}] #${item.index} ${item.display || item.proxy || "-"} | ${latency} | ip=${ip}${err}`);
   });
   if (!(data.results || []).length) {
     lines.push("没有可测试的代理行（可能都是注释或为空）。");
   }
-  $("proxyTestResult").textContent = lines.join("\n");
+  el.textContent = lines.join("\n");
+}
+
+function summarizePoolTest(data) {
+  if (!data || data.error) return { tested: 0, ok: 0, fail: 0, error: (data && data.error) || "unknown" };
+  const tested = data.tested != null ? data.tested : ((data.results || []).length);
+  const ok = data.ok != null ? data.ok : (data.success || 0);
+  const fail = data.fail != null ? data.fail : (data.failed != null ? data.failed : Math.max(0, tested - ok));
+  return { tested, ok, fail, error: "" };
 }
 
 $("btnTestPool").onclick = async () => {
+  const regBox = $("proxyTestResult");
+  const tsBox = $("turnstileProxyTestResult");
   try {
-    setMsg("正在随机测试代理池…");
-    $("proxyTestResult").textContent = "测试中…";
+    setMsg("正在同步测试：注册代理池 + 求解代理池…");
+    if (regBox) regBox.textContent = "注册代理池测试中…";
+    if (tsBox) tsBox.textContent = "求解代理池测试中…";
     $("btnTestPool").disabled = true;
-    const data = await api("/api/proxy-pool/test", {
-      method: "POST",
-      body: JSON.stringify({
-        count: 5,
-        timeout: 12,
-        text: $("proxyPoolText").value,
-      }),
-    });
-    renderProxyTest(data);
-    setMsg(`代理测试完成：成功 ${data.ok || 0} / ${data.tested || 0}`);
+
+    const bodyReg = {
+      count: 5,
+      timeout: 12,
+      text: ($("proxyPoolText") && $("proxyPoolText").value) || "",
+    };
+    const bodyTs = {
+      count: 5,
+      timeout: 12,
+      text: ($("turnstileProxyPoolText") && $("turnstileProxyPoolText").value) || "",
+    };
+
+    const [regRes, tsRes] = await Promise.allSettled([
+      api("/api/proxy-pool/test", { method: "POST", body: JSON.stringify(bodyReg) }),
+      api("/api/turnstile-proxy-pool/test", { method: "POST", body: JSON.stringify(bodyTs) }),
+    ]);
+
+    let regData = null;
+    let tsData = null;
+    if (regRes.status === "fulfilled") {
+      regData = regRes.value || {};
+      renderProxyTestTo(regBox, regData, "【注册代理池】");
+    } else {
+      const err = String((regRes.reason && regRes.reason.message) || regRes.reason || "测试失败");
+      if (regBox) regBox.textContent = "【注册代理池】\n测试失败: " + err;
+      regData = { error: err, tested: 0, ok: 0, fail: 0 };
+    }
+    if (tsRes.status === "fulfilled") {
+      tsData = tsRes.value || {};
+      renderProxyTestTo(tsBox, tsData, "【求解代理池】");
+    } else {
+      const err = String((tsRes.reason && tsRes.reason.message) || tsRes.reason || "测试失败");
+      if (tsBox) tsBox.textContent = "【求解代理池】\n测试失败: " + err;
+      tsData = { error: err, tested: 0, ok: 0, fail: 0 };
+    }
+
+    const a = summarizePoolTest(regData);
+    const b = summarizePoolTest(tsData);
+    const parts = [
+      `注册池 ${a.ok}/${a.tested}`,
+      `求解池 ${b.ok}/${b.tested}`,
+    ];
+    const hardFail = !!(a.error || b.error);
+    setMsg(`双池测试完成：${parts.join(" | ")}` + (hardFail ? "（有一侧失败，见下方反馈）" : ""), hardFail && (a.tested + b.tested) === 0);
   } catch (e) {
     setMsg(String(e.message || e), true);
-    $("proxyTestResult").textContent = "测试失败: " + String(e.message || e);
+    if (regBox) regBox.textContent = "测试失败: " + String(e.message || e);
+    if (tsBox) tsBox.textContent = "测试失败: " + String(e.message || e);
   } finally {
     $("btnTestPool").disabled = false;
   }
@@ -520,38 +572,6 @@ if ($("btnSaveTurnstilePool")) {
       }
       setMsg(`求解代理池已保存：${data.line_count || 0} 条`);
     } catch (e) {
-      setMsg(String(e.message || e), true);
-    }
-  };
-}
-
-if ($("btnTestTurnstilePool")) {
-  $("btnTestTurnstilePool").onclick = async () => {
-    try {
-      if ($("turnstileProxyTestResult")) $("turnstileProxyTestResult").textContent = "测试中…";
-      const data = await api("/api/turnstile-proxy-pool/test", {
-        method: "POST",
-        body: JSON.stringify({
-          count: 5,
-          timeout: 12,
-          text: ($("turnstileProxyPoolText") && $("turnstileProxyPoolText").value) || "",
-        }),
-      });
-      const lines = [];
-      lines.push(`探测: ${data.probe_url || data.url || "-"} | 超时: ${data.timeout || "-"}s`);
-      lines.push(`来源: ${data.source || "-"}`);
-      lines.push(`池内可用: ${data.total || 0} | 本次测试: ${(data.results || []).length} | 成功: ${data.success || 0} | 失败: ${data.failed || 0}`);
-      lines.push("");
-      for (const item of (data.results || [])) {
-        const status = item.ok ? "OK" : "FAIL";
-        const latency = item.latency_ms != null ? `${item.latency_ms}ms` : "-";
-        const ip = item.ip || "-";
-        const err = item.error ? ` | ${item.error}` : "";
-        lines.push(`[${status}] #${item.index} ${item.display || item.proxy || "-"} | ${latency} | ip=${ip}${err}`);
-      }
-      if ($("turnstileProxyTestResult")) $("turnstileProxyTestResult").textContent = lines.join("\n");
-    } catch (e) {
-      if ($("turnstileProxyTestResult")) $("turnstileProxyTestResult").textContent = "测试失败: " + String(e.message || e);
       setMsg(String(e.message || e), true);
     }
   };

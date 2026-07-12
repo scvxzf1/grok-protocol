@@ -28,7 +28,7 @@
         <button type="button" id="btnSaveCfg" class="primary">保存配置</button>
         <button type="button" id="btnSavePool">仅保存代理池</button>
         <button type="button" id="btnImportSub" class="btn">拉取订阅</button>
-        <button type="button" id="btnTestPool">随机测试5条</button>
+        <button type="button" id="btnTestPool" title="同步测试注册代理池与求解代理池，各随机 5 条">随机测试5条</button>
       </div>
       <p id="cfgMsg" class="msg"></p>
     </section>
@@ -401,8 +401,8 @@
           <h2>代理池内容</h2>
           <p class="muted">注册侧 HTTP 代理池。一行一个代理。支持 host:port:user:pass 或 http://user:pass@host:port。</p>
           <textarea id="proxyPoolText" class="pool" spellcheck="false"></textarea>
-          <h3>代理池测试反馈</h3>
-          <p class="muted">随机抽 5 条，探测出口 IP / 连通性。</p>
+          <h3>注册代理池 · 测试反馈</h3>
+          <p class="muted">由顶部「随机测试5条」触发；本池随机抽 5 条探测出口 IP。</p>
           <pre id="proxyTestResult" class="box log">尚未测试</pre>
         </section>
 
@@ -412,9 +412,9 @@
           <textarea id="turnstileProxyPoolText" class="pool" spellcheck="false"></textarea>
           <div class="actions">
             <button type="button" id="btnSaveTurnstilePool">仅保存求解代理池</button>
-            <button type="button" id="btnTestTurnstilePool">随机测试求解池5条</button>
           </div>
-          <h3>求解代理池测试反馈</h3>
+          <h3>求解代理池 · 测试反馈</h3>
+          <p class="muted">由顶部「随机测试5条」同步触发；本池随机抽 5 条探测出口 IP。</p>
           <pre id="turnstileProxyTestResult" class="box log">尚未测试</pre>
         </section>
       </div>
