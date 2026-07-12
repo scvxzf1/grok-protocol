@@ -1368,7 +1368,10 @@ class BatchRunner:
             command.extend(self.plan.proxy_args)
         # Independent Turnstile solve proxy (optional).
         try:
-            ts_proxy = pick_turnstile_proxy(cfg if isinstance(cfg, dict) else {})
+            ts_proxy = pick_turnstile_proxy(
+                cfg if isinstance(cfg, dict) else {},
+                base_dir=self.plan.config_path.parent,
+            )
         except Exception:
             ts_proxy = ""
         if ts_proxy:
@@ -2723,8 +2726,11 @@ def write_turnstile_proxy_pool_text(settings: Settings, text_value: str) -> Dict
     }
 
 
-def pick_turnstile_proxy(config: Dict[str, object]) -> str:
-    """Pick an independent Turnstile solve proxy if enabled; else empty."""
+def pick_turnstile_proxy(config: Dict[str, object], *, base_dir: Optional[Path] = None) -> str:
+    """Pick an independent Turnstile solve proxy if enabled; else empty.
+
+    Relative pool files resolve against base_dir (preferred), then ROOT_DIR.
+    """
     cfg = dict(config or {})
     if not _as_bool(cfg.get("turnstile_proxy_enabled")):
         return ""
@@ -2735,12 +2741,25 @@ def pick_turnstile_proxy(config: Dict[str, object]) -> str:
         return str(cfg.get("turnstile_proxy") or "").strip()
     # pool mode
     file_raw = str(cfg.get("turnstile_proxy_file") or "turnstile_proxies.txt").strip() or "turnstile_proxies.txt"
-    # resolve relative to config.json when possible
     try:
-        # best effort absolute against ROOT_DIR / config parent
-        path = Path(file_raw)
+        path = Path(file_raw).expanduser()
         if not path.is_absolute():
-            path = (ROOT_DIR / path).resolve()
+            bases = []
+            if base_dir is not None:
+                bases.append(Path(base_dir))
+            bases.append(ROOT_DIR)
+            # Keep first existing candidate; otherwise fall back to preferred base.
+            resolved = None
+            for base in bases:
+                candidate = (Path(base) / path).resolve()
+                if candidate.is_file():
+                    resolved = candidate
+                    break
+                if resolved is None:
+                    resolved = candidate
+            path = resolved if resolved is not None else (ROOT_DIR / path).resolve()
+        else:
+            path = path.resolve()
     except Exception:
         path = ROOT_DIR / "turnstile_proxies.txt"
     lines: List[str] = []
@@ -3366,7 +3385,23 @@ class BatchService:
             self.settings.config = _read_config(self.settings.config_path)
             _load_runtime_fields(self.settings)
         if "turnstile_proxy_pool_text" in data:
+            # Always materialize the dedicated solve-proxy pool file when the
+            # config-center payload includes the field (even if empty).
             write_turnstile_proxy_pool_text(self.settings, str(data.get("turnstile_proxy_pool_text") or ""))
+            self.settings.config = _read_config(self.settings.config_path)
+            _load_runtime_fields(self.settings)
+        # Ensure default turnstile proxy file path exists in config once enabled/configured.
+        cfg_now = dict(self.settings.config or {})
+        if any(k in cfg_now for k in (
+            "turnstile_proxy_enabled",
+            "turnstile_proxy_mode",
+            "turnstile_proxy",
+            "turnstile_proxy_file",
+            "turnstile_proxy_random",
+        )) and not str(cfg_now.get("turnstile_proxy_file") or "").strip():
+            cfg_now["turnstile_proxy_file"] = "turnstile_proxies.txt"
+            self.settings.config = cfg_now
+            persist_settings(self.settings)
             self.settings.config = _read_config(self.settings.config_path)
             _load_runtime_fields(self.settings)
         return self.get_config_center()

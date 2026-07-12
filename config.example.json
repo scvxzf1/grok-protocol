@@ -55,5 +55,10 @@
   "embedded_proxy_probe_timeout_sec": 5,
   "embedded_proxy_max_node_retries": 2,
   "turnstile_solve_timeout": 90,
-  "turnstile_solve_retries": 1
+  "turnstile_solve_retries": 1,
+  "turnstile_proxy_enabled": false,
+  "turnstile_proxy_mode": "pool",
+  "turnstile_proxy": "",
+  "turnstile_proxy_file": "turnstile_proxies.txt",
+  "turnstile_proxy_random": true
 }

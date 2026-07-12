@@ -192,6 +192,28 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
     static_dir.mkdir(parents=True, exist_ok=True)
     templates_dir.mkdir(parents=True, exist_ok=True)
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
+    class NoCacheStaticMiddleware:
+        """Avoid sticky browser caches for local config-center JS/CSS during iteration."""
+
+        def __init__(self, app):
+            self.app = app
+
+        async def __call__(self, scope, receive, send):
+            if scope.get("type") == "http" and str(scope.get("path") or "").startswith("/static/"):
+                async def send_wrapper(message):
+                    if message.get("type") == "http.response.start":
+                        headers = list(message.get("headers") or [])
+                        headers = [h for h in headers if h[0].lower() not in {b"cache-control", b"pragma", b"expires"}]
+                        headers.append((b"cache-control", b"no-store, max-age=0"))
+                        headers.append((b"pragma", b"no-cache"))
+                        message = {**message, "headers": headers}
+                    await send(message)
+                await self.app(scope, receive, send_wrapper)
+                return
+            await self.app(scope, receive, send)
+
+    app.add_middleware(NoCacheStaticMiddleware)
     templates = Jinja2Templates(directory=str(templates_dir))
 
     def _err(exc: Exception, status: int = 400) -> HTTPException:

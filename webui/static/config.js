@@ -2,6 +2,23 @@ const $ = (id) => document.getElementById(id);
 const form = $("cfgCenterForm");
 const msg = $("cfgMsg");
 
+function fieldEl(name) {
+  // Prefer form-associated controls (including form="cfgCenterForm" outside <form>),
+  // then fall back to document-wide lookup. This keeps config-center saves stable
+  // even when fields live in nested panels.
+  if (form) {
+    const byForm = form.elements.namedItem(name);
+    if (byForm) {
+      // namedItem may return a RadioNodeList; take the first concrete control.
+      if (typeof byForm.length === "number" && byForm.length && !byForm.tagName) {
+        return byForm[0] || null;
+      }
+      return byForm;
+    }
+  }
+  return document.querySelector(`[name="${CSS && CSS.escape ? CSS.escape(name) : name}"]`) || document.getElementsByName(name)[0] || null;
+}
+
 function setMsg(text, isError=false) {
   msg.textContent = text || "";
   msg.style.color = isError ? "#ff6b6b" : "#f0b429";
@@ -28,7 +45,7 @@ function fill(data) {
   const f = data.fields || {};
   const flags = data.secret_flags || {};
   const set = (name, value, isCheck=false) => {
-    const el = form.elements.namedItem(name) || document.getElementsByName(name)[0];
+    const el = fieldEl(name);
     if (!el) return;
     if (isCheck) el.checked = !!value;
     else el.value = value == null ? "" : value;
@@ -107,11 +124,15 @@ function fill(data) {
 }
 
 function collectFields() {
-  const g = (name, isCheck=false) => {
-    const el = form.elements.namedItem(name) || document.getElementsByName(name)[0];
-    if (!el) return undefined;
+  const g = (name, isCheck=false, fallback=undefined) => {
+    const el = fieldEl(name);
+    if (!el) return fallback;
     if (isCheck) return !!el.checked;
-    return el.value;
+    const value = el.value;
+    if (value == null || value === "") {
+      return fallback === undefined ? "" : fallback;
+    }
+    return value;
   };
   return {
     email_provider: g("email_provider"),
@@ -146,11 +167,12 @@ function collectFields() {
     local_proxy_port: Number(g("local_proxy_port") || 17890),
     proxy_random: g("proxy_random", true),
     proxy_rotate_session: g("proxy_rotate_session", true),
-    turnstile_proxy_enabled: g("turnstile_proxy_enabled", true),
-    turnstile_proxy_mode: g("turnstile_proxy_mode"),
-    turnstile_proxy: g("turnstile_proxy"),
-    turnstile_proxy_file: g("turnstile_proxy_file"),
-    turnstile_proxy_random: g("turnstile_proxy_random", true),
+    // Always emit concrete turnstile-proxy values so JSON.stringify never drops keys.
+    turnstile_proxy_enabled: g("turnstile_proxy_enabled", true, false),
+    turnstile_proxy_mode: g("turnstile_proxy_mode", false, "pool") || "pool",
+    turnstile_proxy: g("turnstile_proxy", false, "") || "",
+    turnstile_proxy_file: g("turnstile_proxy_file", false, "turnstile_proxies.txt") || "turnstile_proxies.txt",
+    turnstile_proxy_random: g("turnstile_proxy_random", true, true),
     xai_oauth_output_dir: g("xai_oauth_output_dir"),
     grok2api_remote_base: g("grok2api_remote_base"),
     grok2api_remote_app_key: g("grok2api_remote_app_key"),
@@ -172,16 +194,26 @@ $("btnReloadCfg").onclick = async () => {
   } catch (e) { setMsg(String(e.message || e), true); }
 };
 
+function buildConfigCenterPayload() {
+  return {
+    fields: collectFields(),
+    proxy_pool_text: ($("proxyPoolText") && $("proxyPoolText").value) || "",
+    turnstile_proxy_pool_text: ($("turnstileProxyPoolText") && $("turnstileProxyPoolText").value) || "",
+  };
+}
+
 $("btnSaveCfg").onclick = async () => {
   try {
-    const payload = {
-      fields: collectFields(),
-      proxy_pool_text: $("proxyPoolText").value,
-      turnstile_proxy_pool_text: ($("turnstileProxyPoolText") && $("turnstileProxyPoolText").value) || "",
-    };
+    const payload = buildConfigCenterPayload();
     const data = await api("/api/config-center", { method: "PUT", body: JSON.stringify(payload) });
     fill(data);
-    setMsg("配置已保存（含代理池）");
+    const ts = (data && data.fields) || {};
+    const pool = (data && data.turnstile_proxy_pool) || {};
+    setMsg(
+      `配置已保存 | 求解代理=${ts.turnstile_proxy_enabled ? "开" : "关"}` +
+      `/${ts.turnstile_proxy_mode || "pool"}` +
+      ` | 求解池=${pool.line_count || 0}条`
+    );
   } catch (e) { setMsg(String(e.message || e), true); }
 };
 
@@ -242,8 +274,8 @@ $("btnImportSub").onclick = async () => {
     });
     fill(saved);
 
-    const subUrl = (form.elements.namedItem("proxy_subscription_url") || {}).value || "";
-    const localHttp = (form.elements.namedItem("proxy_subscription_local_http") || {}).value || "";
+    const subUrl = (fieldEl("proxy_subscription_url") || {}).value || "";
+    const localHttp = (fieldEl("proxy_subscription_local_http") || {}).value || "";
     const data = await api("/api/proxy-pool/import-subscription", {
       method: "POST",
       body: JSON.stringify({
@@ -270,7 +302,7 @@ $("btnImportSub").onclick = async () => {
     const usable = data.usable_http_count || 0;
     const total = data.node_count || 0;
     const vlessCount = data.vless_count || (data.scheme_counts && data.scheme_counts.vless) || 0;
-    const embeddedOn = !!(form.elements.namedItem("embedded_proxy_enabled") || {}).checked;
+    const embeddedOn = !!(fieldEl("embedded_proxy_enabled") || {}).checked;
     if (usable > 0) {
       setMsg(`订阅导入完成：可用 HTTP ${usable}/${total}`);
     } else if (embeddedOn && (data.vless_for_embedded || vlessCount > 0)) {
@@ -462,11 +494,7 @@ if (btnEmbeddedStart) {
       // 先保存当前表单，避免用旧配置启动
       const saved = await api("/api/config-center", {
         method: "PUT",
-        body: JSON.stringify({
-          fields: collectFields(),
-          proxy_pool_text: $("proxyPoolText").value,
-          turnstile_proxy_pool_text: ($("turnstileProxyPoolText") && $("turnstileProxyPoolText").value) || "",
-        }),
+        body: JSON.stringify(buildConfigCenterPayload()),
       });
       fill(saved);
       const data = await api("/api/embedded-proxy/reload", { method: "POST", body: "{}" });

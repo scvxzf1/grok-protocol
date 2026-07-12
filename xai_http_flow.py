@@ -5725,7 +5725,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if not dedicated_ts:
             try:
                 from http_batch_service import pick_turnstile_proxy
-                dedicated_ts = pick_turnstile_proxy(config if isinstance(config, dict) else {})
+                base_dir = None
+                try:
+                    mail_cfg = str(getattr(args, "mail_config", "") or "").strip()
+                    if mail_cfg:
+                        base_dir = Path(mail_cfg).expanduser().resolve().parent
+                except Exception:
+                    base_dir = None
+                dedicated_ts = pick_turnstile_proxy(
+                    config if isinstance(config, dict) else {},
+                    base_dir=base_dir,
+                )
             except Exception:
                 dedicated_ts = ""
         if dedicated_ts:

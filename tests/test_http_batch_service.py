@@ -915,7 +915,63 @@ class EmbeddedProxyBatchServiceTests(unittest.TestCase):
             self.assertEqual(pr.get("healthy"), 1)
             manager.probe_all.assert_called_once()
 
+    def test_config_center_persists_turnstile_proxy_fields_and_pool(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            cfg = root / "config.json"
+            cfg.write_text(
+                json.dumps(
+                    {
+                        "email_provider": "yyds",
+                        "yyds_api_key": "k",
+                        "turnstile_provider": "local",
+                        "register_count": 1,
+                        "concurrent_workers": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            service = svc.BatchService(config_path=cfg, root_dir=root)
+            updated = service.update_config_center(
+                {
+                    "fields": {
+                        "turnstile_proxy_enabled": True,
+                        "turnstile_proxy_mode": "pool",
+                        "turnstile_proxy": "http://user:pass@9.9.9.9:9999",
+                        "turnstile_proxy_file": "turnstile_proxies.txt",
+                        "turnstile_proxy_random": True,
+                    },
+                    "turnstile_proxy_pool_text": "http://a:b@1.1.1.1:1000\nhttp://c:d@2.2.2.2:1000\n",
+                }
+            )
+            fields = updated["fields"]
+            self.assertTrue(fields["turnstile_proxy_enabled"])
+            self.assertEqual(fields["turnstile_proxy_mode"], "pool")
+            self.assertEqual(fields["turnstile_proxy"], "http://user:pass@9.9.9.9:9999")
+            self.assertEqual(fields["turnstile_proxy_file"], "turnstile_proxies.txt")
+            self.assertTrue(fields["turnstile_proxy_random"])
+            self.assertEqual(updated["turnstile_proxy_pool"]["line_count"], 2)
+            disk = json.loads(cfg.read_text(encoding="utf-8"))
+            self.assertTrue(disk["turnstile_proxy_enabled"])
+            self.assertEqual(disk["turnstile_proxy_mode"], "pool")
+            self.assertEqual(disk["turnstile_proxy"], "http://user:pass@9.9.9.9:9999")
+            self.assertEqual(disk["turnstile_proxy_file"], "turnstile_proxies.txt")
+            pool_path = root / "turnstile_proxies.txt"
+            self.assertTrue(pool_path.is_file())
+            self.assertIn("http://a:b@1.1.1.1:1000", pool_path.read_text(encoding="utf-8"))
+            # reload path also sees the same values
+            reloaded = service.get_config_center()
+            self.assertTrue(reloaded["fields"]["turnstile_proxy_enabled"])
+            self.assertEqual(reloaded["turnstile_proxy_pool"]["line_count"], 2)
+            # pick_turnstile_proxy should honor the dedicated pool relative to config dir
+            picked = svc.pick_turnstile_proxy(disk, base_dir=root)
+            self.assertIn(picked, {
+                "http://a:b@1.1.1.1:1000",
+                "http://c:d@2.2.2.2:1000",
+            })
+
     def test_config_center_reads_and_writes_embedded_proxy_fields(self):
+
         with tempfile.TemporaryDirectory() as d:
             service = self._service(Path(d))
             data = service.get_config_center()
