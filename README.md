@@ -11,6 +11,7 @@
 - 仅本机绑定 `127.0.0.1`，默认端口 `33844`（可用 `XAI_WEBUI_PORT` 覆盖）
 - 同时只跑 1 个批次；含失败汇总、历史 run、浏览器残留清理
 - 导航：运行台 / 配置中心 / 凭证列表 / **CPA 巡检**
+- 隔离配置可用 `python webui_app.py --config /path/to/config.json`（或 `XAI_CONFIG_PATH`）
 - 旧 TUI（`./tui.sh`）仍保留作过渡
 - 也可单独启动 CPA：`python cpa_main.py`（默认 `127.0.0.1:8218`，自动跳到 `/cpa`）
 
@@ -316,6 +317,10 @@ python grok_register_ttk.py http credential --sso-file sso.txt --output-dir xai_
 人读 / AI agent 共用的完整说明（系统图、配置表、验收日志、故障表、Agent 契约）：
 
 **→ [USAGE.md](USAGE.md)**
+
+持续处理外部 Outlook/Graph 邮箱池时，可使用
+`server_mail_supervisor.py` 的断点续跑批次模式；master/work/state、代理清单与凭证目录
+都属于本机私有数据。完整命令、状态语义和退出码见 `USAGE.md`。
 
 ### GUI 模式
 

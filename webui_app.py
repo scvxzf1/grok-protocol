@@ -958,6 +958,11 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="xAI HTTP 协议 WebUI（仅本机）")
+    parser.add_argument(
+        "--config",
+        default=os.environ.get("XAI_CONFIG_PATH", str(ROOT_DIR / "config.json")),
+        help="配置文件路径（默认 config.json，也可用 XAI_CONFIG_PATH）",
+    )
     parser.add_argument("--host", default=os.environ.get("XAI_WEBUI_HOST", DEFAULT_WEBUI_HOST))
     parser.add_argument(
         "--port",
@@ -975,7 +980,11 @@ def main(argv: Optional[list] = None) -> int:
         # Soft guard: still allow override but warn loudly.
         print(f"[!] 警告: 绑定 {host} 会超出本机 loopback；规格默认仅 127.0.0.1")
     port = int(args.port or DEFAULT_WEBUI_PORT)
-    app = create_app()
+    config_path = Path(
+        str(args.config or (ROOT_DIR / "config.json"))
+    ).expanduser().resolve()
+    service = BatchService(config_path=config_path, root_dir=ROOT_DIR)
+    app = create_app(service=service)
     print(f"xAI HTTP WebUI -> http://{host}:{port}")
     if args.open:
         try:

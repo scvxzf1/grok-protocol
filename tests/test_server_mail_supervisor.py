@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import subprocess
 import sys
@@ -506,6 +508,56 @@ class ServerMailSupervisorTests(unittest.TestCase):
                 with self.assertRaises(sup.AlreadyRunningError):
                     with sup.SingleInstanceLock(lock_path):
                         pass
+
+    def test_cli_uses_custom_config_and_emits_aggregate_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            email = "cli-private@example.test"
+            config = root / "isolated-config.json"
+            master = root / "master.txt"
+            work = root / "work.txt"
+            proxy = root / "proxy.txt"
+            output = root / "credentials"
+            config.write_text(
+                json.dumps({"turnstile_provider": "local"}),
+                encoding="utf-8",
+            )
+            master.write_text(mail_line(email) + "\n", encoding="utf-8")
+            proxy.write_text(
+                "proxy.example.test:9000:PROXY_USER:PROXY_PASSWORD\n",
+                encoding="utf-8",
+            )
+            write_valid_credential(output, email)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with mock.patch.object(sup, "cleanup_browser_residues"):
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    rc = sup.main(
+                        [
+                            "--config",
+                            str(config),
+                            "--master",
+                            str(master),
+                            "--work",
+                            str(work),
+                            "--proxy",
+                            str(proxy),
+                            "--output",
+                            str(output),
+                        ]
+                    )
+
+            self.assertEqual(rc, 0)
+            state_path = master.with_suffix(".txt.state.json")
+            self.assertEqual(
+                json.loads(state_path.read_text(encoding="utf-8"))["status"],
+                "complete",
+            )
+            console = stdout.getvalue() + stderr.getvalue()
+            self.assertNotIn(email, console)
+            self.assertNotIn("PROXY_USER", console)
+            self.assertNotIn("PROXY_PASSWORD", console)
 
 
 if __name__ == "__main__":

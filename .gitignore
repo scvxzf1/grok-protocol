@@ -59,6 +59,7 @@ grok-*-协议分析*.md
 
 # Private integration inputs and transactional runtime state
 /测试用配置/
+proxy_pool.snapshot.txt
 *.state.json
 *.state.json.lock
 *.txt.lock
