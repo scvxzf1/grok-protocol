@@ -17,7 +17,6 @@ import argparse
 import ast
 import asyncio
 import concurrent.futures
-import fcntl
 import html as html_lib
 import json
 import os
@@ -37,6 +36,15 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
 
 from curl_cffi import requests
+
+from cross_process_lock import (
+    CrossProcessFileLock,
+    CrossProcessLockTimeout,
+    atomic_write_private_lines,
+    atomic_write_private_text,
+    configured_lock_timeout,
+    ensure_private_file,
+)
 
 from turnstile_broker import (
     FingerprintProfile,
@@ -174,6 +182,10 @@ def is_email_domain_rejected_error(exc: BaseException | str) -> bool:
 
 class MailboxError(XAIHttpFlowError):
     """Raised by the optional Cloudflare temporary mailbox adapter."""
+
+
+class MailboxPoolLockTimeout(MailboxError):
+    """Raised when a mailbox pool transaction cannot acquire its lock."""
 
 
 @dataclass
@@ -2680,6 +2692,10 @@ _LOCAL_TURNSTILE_SLOT_DIR = Path(
 DEFAULT_LOCAL_TURNSTILE_MAX_INFLIGHT = 2
 MIN_LOCAL_TURNSTILE_MAX_INFLIGHT = 1
 MAX_LOCAL_TURNSTILE_MAX_INFLIGHT = 12
+LOCAL_TURNSTILE_LOCK_TIMEOUT_SEC = configured_lock_timeout(
+    "XAI_LOCAL_TURNSTILE_LOCK_TIMEOUT_SEC",
+    default=120.0,
+)
 
 
 def _load_turnstile_inflight_config_fallback() -> Dict[str, Any]:
@@ -2761,34 +2777,47 @@ def _local_turnstile_slot(*, max_inflight: Optional[int] = None, log_callback: L
 
     slot_dir = _LOCAL_TURNSTILE_SLOT_DIR
     slot_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(slot_dir, 0o700)
+    except OSError:
+        pass
     gate_path = _LOCAL_TURNSTILE_LOCK_PATH
     gate_path.parent.mkdir(parents=True, exist_ok=True)
-    gate = open(gate_path, "a+", encoding="utf-8")
-    handle = None
+    slot_lock: Optional[CrossProcessFileLock] = None
     slot_idx = None
     waited = False
     started_wait = time.monotonic()
+    deadline = started_wait + LOCAL_TURNSTILE_LOCK_TIMEOUT_SEC
     try:
         while True:
-            fcntl.flock(gate.fileno(), fcntl.LOCK_EX)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise CrossProcessLockTimeout(
+                    gate_path,
+                    LOCAL_TURNSTILE_LOCK_TIMEOUT_SEC,
+                )
             try:
-                for i in range(limit):
-                    path_i = slot_dir / f"slot-{i}.lock"
-                    fh = open(path_i, "a+", encoding="utf-8")
-                    try:
-                        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    except BlockingIOError:
+                with CrossProcessFileLock(
+                    gate_path,
+                    timeout=min(1.0, remaining),
+                ):
+                    for i in range(limit):
+                        candidate = CrossProcessFileLock(
+                            slot_dir / f"slot-{i}.lock",
+                            timeout=0.0,
+                        )
                         try:
-                            fh.close()
-                        except Exception:
-                            pass
-                        continue
-                    handle = fh
-                    slot_idx = i
-                    break
-            finally:
-                fcntl.flock(gate.fileno(), fcntl.LOCK_UN)
-            if handle is not None:
+                            candidate.acquire()
+                        except CrossProcessLockTimeout:
+                            continue
+                        slot_lock = candidate
+                        slot_idx = i
+                        break
+            except CrossProcessLockTimeout:
+                # Another worker is scanning the small slot set.  Retry within
+                # the overall bounded wait rather than failing on the gate.
+                pass
+            if slot_lock is not None:
                 break
             if not waited:
                 waited = True
@@ -2796,7 +2825,7 @@ def _local_turnstile_slot(*, max_inflight: Optional[int] = None, log_callback: L
                     log_callback,
                     f"[Turnstile] 本地求解排队中（全局限流 {limit} 路浏览器，避免 4 并发互挤）",
                 )
-            time.sleep(0.35)
+            time.sleep(min(0.35, max(0.01, deadline - time.monotonic())))
         wait_ms = int((time.monotonic() - started_wait) * 1000)
         if waited:
             _log(
@@ -2805,19 +2834,8 @@ def _local_turnstile_slot(*, max_inflight: Optional[int] = None, log_callback: L
             )
         yield {"slot": slot_idx, "limit": limit, "wait_ms": wait_ms}
     finally:
-        if handle is not None:
-            try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-            except Exception:
-                pass
-            try:
-                handle.close()
-            except Exception:
-                pass
-        try:
-            gate.close()
-        except Exception:
-            pass
+        if slot_lock is not None:
+            slot_lock.release()
 
 
 # Cross-process YYDS account-create limiter.
@@ -2839,6 +2857,10 @@ _YYDS_DOMAIN_RR_LOCK_PATH = Path(
 _YYDS_DOMAIN_RR_STATE_PATH = Path(
     os.environ.get("XAI_YYDS_DOMAIN_RR_STATE_PATH")
     or (Path(tempfile.gettempdir()) / "xai-yyds-domain-rr-state.json")
+)
+YYDS_FILE_LOCK_TIMEOUT_SEC = configured_lock_timeout(
+    "XAI_YYDS_FILE_LOCK_TIMEOUT_SEC",
+    default=120.0,
 )
 
 
@@ -2891,22 +2913,13 @@ def _yyds_create_spacing_sec(config: Optional[Dict[str, Any]] = None) -> float:
 
 @contextmanager
 def _yyds_create_file_lock():
-    """Exclusive flock around YYDS create pacing + request."""
+    """Exclusive cross-process lock around YYDS create pacing + request."""
     lock_path = _YYDS_CREATE_LOCK_PATH
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    handle = open(lock_path, "a+", encoding="utf-8")
-    try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        yield handle
-    finally:
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        except OSError:
-            pass
-        try:
-            handle.close()
-        except OSError:
-            pass
+    with CrossProcessFileLock(
+        lock_path,
+        timeout=YYDS_FILE_LOCK_TIMEOUT_SEC,
+    ) as lock:
+        yield lock
 
 
 def _yyds_read_last_create_at() -> float:
@@ -2925,20 +2938,12 @@ def _yyds_write_last_create_at(ts: float) -> None:
     path = _YYDS_CREATE_STATE_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps({"last_create_at": float(ts)}, ensure_ascii=False)
-    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
     try:
-        tmp.write_text(payload, encoding="utf-8")
-        os.replace(tmp, path)
+        atomic_write_private_text(path, payload)
     except OSError:
-        try:
-            path.write_text(payload, encoding="utf-8")
-        except OSError:
-            pass
-        try:
-            if tmp.exists():
-                tmp.unlink()
-        except OSError:
-            pass
+        # Keep the last complete timestamp rather than publishing a partial
+        # fallback file after an interrupted atomic replace.
+        pass
 
 
 def _yyds_wait_create_slot() -> None:
@@ -3012,20 +3017,11 @@ def _yyds_normalize_domain_list(raw: Any) -> List[str]:
 @contextmanager
 def _yyds_domain_rr_lock():
     lock_path = _YYDS_DOMAIN_RR_LOCK_PATH
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    handle = open(lock_path, "a+", encoding="utf-8")
-    try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        yield handle
-    finally:
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        except OSError:
-            pass
-        try:
-            handle.close()
-        except OSError:
-            pass
+    with CrossProcessFileLock(
+        lock_path,
+        timeout=YYDS_FILE_LOCK_TIMEOUT_SEC,
+    ) as lock:
+        yield lock
 
 
 def _yyds_read_domain_rr_state() -> Dict[str, Any]:
@@ -3067,20 +3063,11 @@ def _yyds_write_domain_rr_state(*, index: int, rejected: Optional[List[str]] = N
         },
         ensure_ascii=False,
     )
-    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
     try:
-        tmp.write_text(payload, encoding="utf-8")
-        os.replace(tmp, path)
+        atomic_write_private_text(path, payload)
     except OSError:
-        try:
-            path.write_text(payload, encoding="utf-8")
-        except OSError:
-            pass
-        try:
-            if tmp.exists():
-                tmp.unlink()
-        except OSError:
-            pass
+        # Preserve the previous complete round-robin state.
+        pass
 
 
 def _yyds_read_domain_rr_index() -> int:
@@ -3385,6 +3372,14 @@ class YydsTempMailbox:
 MS_GRAPH_TOKEN_URL = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
 MS_GRAPH_SCOPE = "https://graph.microsoft.com/Mail.Read offline_access"
 MS_GRAPH_MESSAGES_URL = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages"
+MS_MAIL_POOL_LOCK_TIMEOUT_SEC = configured_lock_timeout(
+    "XAI_MS_MAIL_POOL_LOCK_TIMEOUT_SEC",
+    default=60.0,
+)
+_MS_CLIENT_ID_PATTERN = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
 
 
 def parse_ms_mail_line(line: str) -> Dict[str, str]:
@@ -3402,8 +3397,8 @@ def parse_ms_mail_line(line: str) -> Dict[str, str]:
     refresh_token = "----".join(parts[3:]).strip()
     if "@" not in email or not client_id or not refresh_token:
         raise MailboxError(f"微软邮箱行字段不完整: {mask_email(email)}")
-    if not re.fullmatch(r"[0-9a-fA-F-]{36}", client_id):
-        raise MailboxError(f"client_id 看起来不是 UUID: {client_id}")
+    if not _MS_CLIENT_ID_PATTERN.fullmatch(client_id):
+        raise MailboxError("client_id 格式错误（应为 UUID）")
     return {
         "email": email,
         "password": password,
@@ -3422,6 +3417,12 @@ def serialize_ms_mail_line(account: Dict[str, str]) -> str:
             str(account.get("refresh_token") or ""),
         ]
     )
+
+
+def _atomic_write_utf8_lines(path: Path, lines: Sequence[str]) -> None:
+    """Compatibility wrapper for atomic private mailbox/state line writes."""
+
+    atomic_write_private_lines(path, lines)
 
 
 class MicrosoftGraphMailbox:
@@ -3444,17 +3445,29 @@ class MicrosoftGraphMailbox:
         proxy: str = "",
         timeout: int = DEFAULT_TIMEOUT,
         mark_used: bool = True,
+        lock_timeout: Optional[float] = None,
     ):
-        self.path = Path(str(mail_file or "")).expanduser()
+        self.path = Path(str(mail_file or "")).expanduser().resolve(strict=False)
         if not self.path.is_file():
-            raise MailboxError(f"微软邮箱文件不存在: {self.path}")
+            raise MailboxError("微软邮箱文件不存在")
+        self.used_path = self.path.with_suffix(self.path.suffix + ".used")
+        self.lock_path = self.path.with_suffix(self.path.suffix + ".lock")
+        ensure_private_file(self.path)
+        ensure_private_file(self.used_path)
         self.timeout = max(5, int(timeout or DEFAULT_TIMEOUT))
+        self.lock_timeout = (
+            MS_MAIL_POOL_LOCK_TIMEOUT_SEC
+            if lock_timeout is None
+            else max(0.0, float(lock_timeout))
+        )
         self.proxies = _proxy_dict(proxy)
         self.mark_used = bool(mark_used)
         self.session = requests.Session(impersonate="chrome136")
         self.account: Dict[str, str] = {}
         self.access_token = ""
         self.access_expires_at = 0.0
+        self._claimed_for_return = False
+        self._claim_committed = False
 
     def _request(self, method: str, url: str, **kwargs: Any) -> Any:
         kwargs.setdefault("timeout", self.timeout)
@@ -3463,31 +3476,170 @@ class MicrosoftGraphMailbox:
         return getattr(self.session, method.lower())(url, **kwargs)
 
     def _claim_account(self) -> Dict[str, str]:
+        """Reserve one unique pool record under the durable ``.used`` ledger."""
+
+        try:
+            with CrossProcessFileLock(
+                self.lock_path,
+                timeout=self.lock_timeout,
+            ):
+                claimed = self._claim_account_locked()
+        except CrossProcessLockTimeout as exc:
+            raise MailboxPoolLockTimeout("微软邮箱池锁等待超时") from exc
+        except MailboxError:
+            raise
+        except Exception as exc:
+            raise MailboxError("微软邮箱池领取事务失败") from exc
+
+        self.account = dict(claimed)
+        self._claimed_for_return = bool(self.mark_used)
+        self._claim_committed = False
+        return claimed
+
+    def _claim_account_locked(self) -> Dict[str, str]:
         try:
             lines = self.path.read_text(encoding="utf-8").splitlines()
         except Exception as exc:
-            raise MailboxError(f"无法读取微软邮箱文件: {exc}") from exc
+            raise MailboxError("微软邮箱池读取失败") from exc
+        try:
+            used_lines = (
+                self.used_path.read_text(encoding="utf-8").splitlines()
+                if self.used_path.is_file()
+                else []
+            )
+        except Exception as exc:
+            raise MailboxError("微软邮箱已用记录读取失败") from exc
+
+        used_emails = set()
+        for used_line in used_lines:
+            try:
+                used_emails.add(
+                    parse_ms_mail_line(used_line)["email"].strip().lower()
+                )
+            except MailboxError:
+                continue
+
         remaining: List[str] = []
         claimed: Optional[Dict[str, str]] = None
         for line in lines:
             stripped = line.strip()
-            if claimed is None and stripped and not stripped.startswith("#"):
-                try:
-                    claimed = parse_ms_mail_line(stripped)
-                    if self.mark_used:
-                        continue
-                except MailboxError:
-                    remaining.append(line)
+            if not stripped or stripped.startswith("#"):
+                remaining.append(line)
+                continue
+            try:
+                account = parse_ms_mail_line(stripped)
+            except MailboxError:
+                remaining.append(line)
+                continue
+            email_key = account["email"].strip().lower()
+            if self.mark_used and email_key in used_emails:
+                # The durable ledger wins if a previous writer stopped after
+                # publishing .used but before removing the source row.
+                continue
+            if claimed is None:
+                claimed = account
+                if self.mark_used:
+                    used_emails.add(email_key)
                     continue
             remaining.append(line)
         if claimed is None:
-            raise MailboxError(f"微软邮箱文件没有可用账号: {self.path}")
+            raise MailboxError("微软邮箱文件没有可用账号")
         if self.mark_used:
-            self.path.write_text("\n".join(remaining) + ("\n" if remaining else ""), encoding="utf-8")
-            used_path = self.path.with_suffix(self.path.suffix + ".used")
-            with used_path.open("a", encoding="utf-8", newline="\n") as handle:
-                handle.write(serialize_ms_mail_line(claimed) + "\n")
+            # Commit the claim ledger first.  If publishing the source snapshot
+            # is interrupted, the next claimant filters the stale source row.
+            _atomic_write_utf8_lines(
+                self.used_path,
+                [*used_lines, serialize_ms_mail_line(claimed)],
+            )
+            try:
+                _atomic_write_utf8_lines(self.path, remaining)
+            except OSError:
+                # The reservation is already durable and remains unique.  A
+                # later claimant will clean the stale source entry.
+                pass
         return claimed
+
+    def reserve(self) -> Dict[str, str]:
+        """Public reservation operation used by batch/supervisor integrations."""
+
+        return self._claim_account()
+
+    @staticmethod
+    def _rewrite_matching_account(
+        lines: Sequence[str],
+        account: Dict[str, str],
+        *,
+        append_if_missing: bool,
+    ) -> Tuple[List[str], bool]:
+        email_key = str(account.get("email") or "").strip().lower()
+        rewritten: List[str] = []
+        replaced = False
+        for line in lines:
+            try:
+                parsed = parse_ms_mail_line(line)
+            except MailboxError:
+                rewritten.append(line)
+                continue
+            if parsed["email"].strip().lower() == email_key:
+                if not replaced:
+                    rewritten.append(serialize_ms_mail_line(account))
+                    replaced = True
+                continue
+            rewritten.append(line)
+        if append_if_missing and not replaced:
+            rewritten.append(serialize_ms_mail_line(account))
+            replaced = True
+        return rewritten, replaced
+
+    def _update_account_record(self, account: Dict[str, str]) -> None:
+        """Persist a rotated token in whichever file currently owns the row."""
+
+        try:
+            with CrossProcessFileLock(
+                self.lock_path,
+                timeout=self.lock_timeout,
+            ):
+                used_lines = (
+                    self.used_path.read_text(encoding="utf-8").splitlines()
+                    if self.used_path.is_file()
+                    else []
+                )
+                pool_lines = self.path.read_text(encoding="utf-8").splitlines()
+                email_key = str(account.get("email") or "").strip().lower()
+                owned_by_used = False
+                for line in used_lines:
+                    try:
+                        if parse_ms_mail_line(line)["email"].strip().lower() == email_key:
+                            owned_by_used = True
+                            break
+                    except MailboxError:
+                        continue
+                if owned_by_used:
+                    rewritten, _ = self._rewrite_matching_account(
+                        used_lines,
+                        account,
+                        append_if_missing=True,
+                    )
+                    _atomic_write_utf8_lines(self.used_path, rewritten)
+                else:
+                    rewritten, replaced = self._rewrite_matching_account(
+                        pool_lines,
+                        account,
+                        append_if_missing=False,
+                    )
+                    if not replaced:
+                        raise MailboxError("微软邮箱轮换令牌对应记录已不存在")
+                    _atomic_write_utf8_lines(self.path, rewritten)
+        except CrossProcessLockTimeout as exc:
+            raise MailboxPoolLockTimeout("微软邮箱池锁等待超时") from exc
+        except MailboxError:
+            raise
+        except Exception as exc:
+            raise MailboxError("微软邮箱轮换令牌持久化失败") from exc
+
+    # Kept as a narrow compatibility hook for the old reference tests.
+    def _update_used_account(self, account: Dict[str, str]) -> None:
+        self._update_account_record(account)
 
     def _refresh_access_token(self, account: Dict[str, str]) -> str:
         response = self._request(
@@ -3512,29 +3664,7 @@ class MicrosoftGraphMailbox:
         new_refresh = str(data.get("refresh_token") or "").strip()
         if new_refresh and new_refresh != account.get("refresh_token"):
             account["refresh_token"] = new_refresh
-            if self.mark_used:
-                used_path = self.path.with_suffix(self.path.suffix + ".used")
-                try:
-                    used_lines = used_path.read_text(encoding="utf-8").splitlines() if used_path.is_file() else []
-                    email = account["email"].lower()
-                    rewritten = []
-                    replaced = False
-                    for line in used_lines:
-                        try:
-                            parsed = parse_ms_mail_line(line)
-                        except MailboxError:
-                            rewritten.append(line)
-                            continue
-                        if parsed["email"].lower() == email:
-                            rewritten.append(serialize_ms_mail_line(account))
-                            replaced = True
-                        else:
-                            rewritten.append(line)
-                    if not replaced:
-                        rewritten.append(serialize_ms_mail_line(account))
-                    used_path.write_text("\n".join(rewritten) + "\n", encoding="utf-8")
-                except Exception:
-                    pass
+            self._update_account_record(account)
         expires_in = int(data.get("expires_in") or 3600)
         self.access_token = access
         self.access_expires_at = time.monotonic() + max(60, expires_in - 60)
@@ -3557,14 +3687,103 @@ class MicrosoftGraphMailbox:
                 return self.account["email"], token
             except MailboxError as exc:
                 last_error = exc
+                if not self.mark_used:
+                    # A non-consuming probe always sees the same first source
+                    # row, so advancing would repeat the same failed request.
+                    self.account = {}
+                    raise
                 print(
                     f"[HTTP][warn] 微软邮箱换票失败，跳过 {mask_email(self.account.get('email', ''))}: "
                     f"{_safe_error_text(exc)}",
                     flush=True,
                 )
+                # This record produced a mailbox-specific token failure and is
+                # intentionally retained in the used ledger.
+                self.commit_success()
                 self.account = {}
                 continue
         raise MailboxError(f"微软邮箱池连续换票失败: {_safe_error_text(last_error)}")
+
+    def release_to_pool(self, *, reason: str = "") -> bool:
+        """Return the current uncommitted reservation exactly once."""
+
+        del reason  # Failure categories are intentionally not persisted here.
+        if (
+            not self.mark_used
+            or not self._claimed_for_return
+            or self._claim_committed
+            or not self.account
+        ):
+            return False
+        account = dict(self.account)
+        email_key = str(account.get("email") or "").strip().lower()
+        try:
+            with CrossProcessFileLock(
+                self.lock_path,
+                timeout=self.lock_timeout,
+            ):
+                pool_lines = self.path.read_text(encoding="utf-8").splitlines()
+                used_lines = (
+                    self.used_path.read_text(encoding="utf-8").splitlines()
+                    if self.used_path.is_file()
+                    else []
+                )
+                authoritative = account
+                kept_used: List[str] = []
+                found_used = False
+                for line in used_lines:
+                    try:
+                        parsed = parse_ms_mail_line(line)
+                    except MailboxError:
+                        kept_used.append(line)
+                        continue
+                    if parsed["email"].strip().lower() == email_key:
+                        if not found_used:
+                            authoritative = parsed
+                            found_used = True
+                        continue
+                    kept_used.append(line)
+
+                # Deduplicate a prior partially completed release, then publish
+                # the available row before removing the authoritative ledger.
+                kept_pool: List[str] = []
+                for line in pool_lines:
+                    try:
+                        parsed = parse_ms_mail_line(line)
+                    except MailboxError:
+                        kept_pool.append(line)
+                        continue
+                    if parsed["email"].strip().lower() == email_key:
+                        continue
+                    kept_pool.append(line)
+                _atomic_write_utf8_lines(
+                    self.path,
+                    [serialize_ms_mail_line(authoritative), *kept_pool],
+                )
+                _atomic_write_utf8_lines(self.used_path, kept_used)
+        except CrossProcessLockTimeout as exc:
+            raise MailboxPoolLockTimeout("微软邮箱池锁等待超时") from exc
+        except MailboxError:
+            raise
+        except Exception as exc:
+            raise MailboxError("微软邮箱池归还事务失败") from exc
+        self.account = authoritative
+        self._claimed_for_return = False
+        return True
+
+    def release(self, *, reason: str = "") -> bool:
+        """Alias for supervisor lifecycle integrations."""
+
+        return self.release_to_pool(reason=reason)
+
+    def commit_success(self) -> bool:
+        """Mark the current reservation consumed so later release is a no-op."""
+
+        if not self._claimed_for_return or self._claim_committed:
+            return False
+        self._claim_committed = True
+        self._claimed_for_return = False
+        return True
 
     def _ensure_access_token(self, token: str = "") -> str:
         if self.access_token and time.monotonic() < self.access_expires_at:

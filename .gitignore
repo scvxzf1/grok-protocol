@@ -56,3 +56,11 @@ grok-*-协议分析*.md
 
 # Embedded mihomo runtime
 .embedded_mihomo/
+
+# Private integration inputs and transactional runtime state
+/测试用配置/
+*.state.json
+*.state.json.lock
+*.txt.lock
+*.tmp
+*.tmp.*
