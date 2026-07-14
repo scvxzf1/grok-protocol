@@ -1,4 +1,5 @@
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -471,15 +472,22 @@ print('[HTTP] fake backend completed', flush=True)
             root = Path(directory)
             # fake temp profiles
             (root / "xai-ts-chrome-aaa").mkdir()
+            os.utime(root / "xai-ts-chrome-aaa", (1, 1))
             (root / "xai-ts-probe-bbb").mkdir()
             (root / "xai-chrome-raw-ccc").mkdir()
             (root / "playwright_chromiumdev_profile-ddd").mkdir()
             (root / "keep-me").mkdir()
 
-            with mock.patch.object(batch_service, "_pgrep_count", side_effect=[12, 34]):
+            with mock.patch.object(
+                batch_service,
+                "_pgrep_count",
+                side_effect=[12, 34, 2],
+            ), mock.patch.object(batch_service, "_count_zombie_chrome", return_value=1):
                 status = tui.browser_health_status()
             self.assertEqual(status["chrome_count"], 12)
             self.assertEqual(status["playwright_count"], 34)
+            self.assertEqual(status["solver_count"], 2)
+            self.assertEqual(status["zombie_chrome_count"], 1)
             self.assertIn("chrome=12", tui.format_browser_health(status))
 
             result = tui.cleanup_browser_residues(
@@ -488,9 +496,12 @@ print('[HTTP] fake backend completed', flush=True)
                 kill_all_chrome=False,
                 pkill_fn=lambda pattern: 3 if "ms-playwright" in pattern else 0,
             )
-            self.assertEqual(result["killed_playwright"], 3)
-            self.assertEqual(result["removed_temp_dirs"], 4)
+            self.assertEqual(result["killed_playwright"], 0)
+            self.assertEqual(result["removed_temp_dirs"], 1)
             self.assertFalse((root / "xai-ts-chrome-aaa").exists())
+            self.assertTrue((root / "xai-ts-probe-bbb").exists())
+            self.assertTrue((root / "xai-chrome-raw-ccc").exists())
+            self.assertTrue((root / "playwright_chromiumdev_profile-ddd").exists())
             self.assertTrue((root / "keep-me").exists())
             summary = tui.format_cleanup_result(result)
             self.assertIn("Playwright", summary)

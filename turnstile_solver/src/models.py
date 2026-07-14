@@ -296,6 +296,11 @@ class PoolStats:
     browser_starts: int = 0
     browser_restarts: int = 0
     recycle_reasons: Dict[str, int] = field(default_factory=dict)
+    retry_attempts: int = 0
+    retry_successes: int = 0
+    failure_categories: Dict[str, int] = field(default_factory=dict)
+    last_failure_category: str = ""
+    last_error_code: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return sanitize_public_payload({
@@ -313,4 +318,9 @@ class PoolStats:
             "browser_starts": self.browser_starts,
             "browser_restarts": self.browser_restarts,
             "recycle_reasons": dict(self.recycle_reasons),
+            "retry_attempts": self.retry_attempts,
+            "retry_successes": self.retry_successes,
+            "failure_categories": dict(self.failure_categories),
+            "last_failure_category": self.last_failure_category,
+            "last_error_code": self.last_error_code,
         })

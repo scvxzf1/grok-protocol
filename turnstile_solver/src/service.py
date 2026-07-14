@@ -113,17 +113,10 @@ class SolverService:
             request.timeout_sec = self.config.browser_timeout_sec
         provider = str(request.provider or "local").strip().lower() or "local"
         if provider == "local":
-            # Prefer the one-shot enhanced capture path. The persistent browser pool
-            # is faster when healthy, but xAI currently requires email-entry + sitekey
-            # injection under virtual-headed Chrome; the one-shot path is the proven
-            # reliable route for headless/local registration.
-            try:
-                from .browser_worker import BrowserWorker
-
-                result = BrowserWorker(self.config).solve(request)
-            except Exception:
-                # Fallback to the pool if the one-shot adapter cannot start.
-                result = self.pool.solve(request)
+            # The persistent pool owns browser process, profile, retry, deadline,
+            # and fresh-context lifecycle.  Keeping one owner prevents a failed
+            # solve from silently spawning a second one-shot browser.
+            result = self.pool.solve(request)
             result.provider = "local"
         else:
             result = solve_external(request, self.config)

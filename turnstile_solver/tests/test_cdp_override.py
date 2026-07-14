@@ -101,8 +101,10 @@ class CdpOverrideTests(unittest.TestCase):
         self.assertEqual(metadata["fullVersionList"][0]["version"], "99.0.0.0")
 
     def test_browser_binary_major_mismatch_is_rejected(self):
-        completed = Mock(stdout="Google Chrome for Testing 135.0.7049.95", stderr="")
-        with patch("src.browser_runtime.subprocess.run", return_value=completed):
+        with patch(
+            "src.browser_runtime.detect_chrome_full_version",
+            return_value="135.0.7049.95",
+        ):
             with self.assertRaisesRegex(RuntimeError, "expected=136"):
                 _require_browser_version("/opt/chrome/chrome", 136)
 
@@ -191,6 +193,25 @@ class CdpOverrideTests(unittest.TestCase):
         self.assertIn("未捕获到可用 Turnstile token", result.error or "")
         self.assertNotIn("UAData platform 不一致", result.error or "")
         self.assertIn("fingerprint_warning", result.extras)
+
+    def test_challenge_error_is_returned_structurally_without_waiting_full_timeout(self):
+        class ChallengeErrorPage(FakePage):
+            def run_js(self, script):
+                if "__xaiTsLastError" in script:
+                    return "600010"
+                if "cf-turnstile-response" in script:
+                    return ""
+                return super().run_js(script)
+
+        page = ChallengeErrorPage()
+        worker = BrowserWorker(SolverConfig(strict_fingerprint=False))
+        request = SolveRequest(timeout_sec=30)
+        with patch("src.browser_worker.click_email_signup_entry", return_value=False):
+            result = worker.solve_on_page(page, request)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error, "Turnstile challenge error 600010")
+        self.assertEqual(result.extras["turnstile_error"], "600010")
 
     def test_success_with_empty_uadata_still_fails_strict_check(self):
         class EmptyButTokenPage(FakePage):

@@ -45,6 +45,7 @@ from cross_process_lock import (
     configured_lock_timeout,
     ensure_private_file,
 )
+from project_browser_registry import register_project_browser, unregister_project_browser
 
 from turnstile_broker import (
     FingerprintProfile,
@@ -103,16 +104,31 @@ def build_runtime_fingerprint_profile(
     return DEFAULT_FINGERPRINT
 
 
+def _is_tls_transport_error(exc: BaseException) -> bool:
+    """Identify handshake/transport failures that can use another TLS profile."""
 
-def _session_with_impersonate_fallback(impersonate: str, *, log_callback: LogFn = None) -> Any:
-    """Create curl_cffi Session, falling back when impersonate target is unsupported."""
+    text = str(exc or "").lower()
+    markers = (
+        "curl: (35)",
+        "tls connect error",
+        "ssl connect error",
+        "openssl_internal",
+        "wrong version number",
+        "schannel",
+        "handshake failure",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _impersonate_fallback_chain(primary: str) -> List[str]:
+    """Return a bounded, installed curl_cffi impersonation fallback chain."""
+
     from turnstile_broker import _impersonate_for_browser_major, _impersonate_is_usable
 
-    candidates = []
-    primary = str(impersonate or "").strip()
-    if primary:
-        candidates.append(primary)
+    selected = str(primary or "").strip()
+    candidates: List[str] = []
     for name in (
+        selected,
         _impersonate_for_browser_major("136"),
         "chrome136",
         "chrome131",
@@ -120,13 +136,52 @@ def _session_with_impersonate_fallback(impersonate: str, *, log_callback: LogFn 
         "chrome120",
         "chrome",
     ):
-        if name and name not in candidates:
-            candidates.append(name)
+        normalized = str(name or "").strip()
+        if not normalized or normalized in candidates:
+            continue
+        if normalized != selected and not _impersonate_is_usable(normalized):
+            continue
+        candidates.append(normalized)
+    return candidates
+
+
+def _rebuild_session_with_impersonate(client: Any, impersonate: str) -> None:
+    """Replace a client session while retaining its headers and cookie jar."""
+
+    previous = getattr(client, "session", None)
+    session = requests.Session(impersonate=str(impersonate or "chrome"))
+    previous_headers = getattr(previous, "headers", None)
+    if previous_headers is not None:
+        try:
+            session.headers.update(dict(previous_headers))
+        except Exception:
+            pass
+    previous_cookies = getattr(previous, "cookies", None)
+    if previous_cookies is not None:
+        try:
+            session.cookies.update(previous_cookies)
+        except Exception:
+            try:
+                jar = getattr(previous_cookies, "jar", None)
+                if jar is not None:
+                    session.cookies.update(jar)
+            except Exception:
+                pass
+    try:
+        setattr(session, "_xai_impersonate", str(impersonate or "chrome"))
+    except Exception:
+        pass
+    client.session = session
+
+
+
+def _session_with_impersonate_fallback(impersonate: str, *, log_callback: LogFn = None) -> Any:
+    """Create curl_cffi Session, falling back when impersonate target is unsupported."""
+    primary = str(impersonate or "").strip()
+    candidates = _impersonate_fallback_chain(primary)
 
     last_error: Optional[Exception] = None
     for name in candidates:
-        if name != primary and not _impersonate_is_usable(name):
-            continue
         try:
             session = requests.Session(impersonate=name)
             # Force-materialize impersonate support on versions that fail lazily.
@@ -138,6 +193,10 @@ def _session_with_impersonate_fallback(impersonate: str, *, log_callback: LogFn 
                     raise
             if name != primary:
                 _log(log_callback, f"[HTTP][warn] impersonate 回退: {primary or '-'} -> {name}")
+            try:
+                setattr(session, "_xai_impersonate", name)
+            except Exception:
+                pass
             return session
         except Exception as exc:
             last_error = exc
@@ -1389,8 +1448,8 @@ def _validate_local_fingerprint(
         )
     expected_primary = str(expected_language or "").split(",", 1)[0].split(";", 1)[0].strip().lower()
     observed_primary = str(observed_language or "").strip().lower()
-    # Only compare when the browser actually reported a value. Some headless /
-    # virtual-headed sessions transiently return empty language/platform fields.
+    # Only compare when the browser actually reported a value. Some startup/error
+    # pages transiently return empty language/platform fields.
     if expected_primary and observed_primary and observed_primary != expected_primary:
         raise VerificationRequiredError(
             "local Turnstile 浏览器语言与 HTTP 会话指纹不一致"
@@ -1873,7 +1932,43 @@ class BrowserlessXAIClient:
         if self.proxies and "proxies" not in kwargs:
             kwargs["proxies"] = self.proxies
         fn = getattr(self.session, method.lower())
-        return fn(url, **kwargs)
+        try:
+            return fn(url, **kwargs)
+        except Exception as exc:
+            if not _is_tls_transport_error(exc):
+                raise
+            fingerprint = getattr(self, "fingerprint", None)
+            primary = str(getattr(fingerprint, "impersonate", "") or "").strip()
+            active = str(vars(self).get("_active_impersonate") or "").strip()
+            if not active:
+                active = str(getattr(self.session, "_xai_impersonate", "") or "").strip()
+            active = active or primary
+            candidates = _impersonate_fallback_chain(primary)
+            try:
+                start_index = candidates.index(active)
+            except ValueError:
+                try:
+                    start_index = candidates.index(primary)
+                except ValueError:
+                    start_index = -1
+            last_error: Exception = exc
+            for candidate in candidates[start_index + 1 :]:
+                _log(
+                    self.log_callback,
+                    f"[HTTP][warn] TLS transport 失败，impersonate 重试: "
+                    f"{active or '-'} -> {candidate}",
+                )
+                try:
+                    _rebuild_session_with_impersonate(self, candidate)
+                    self._active_impersonate = candidate
+                    fn = getattr(self.session, method.lower())
+                    return fn(url, **kwargs)
+                except Exception as retry_exc:
+                    if not _is_tls_transport_error(retry_exc):
+                        raise
+                    last_error = retry_exc
+                    active = candidate
+            raise last_error
 
     def _assert_normal_page(self, response: Any, stage: str) -> None:
         if _is_cf_interstitial(response):
@@ -2680,7 +2775,7 @@ class CloudflareTempMailbox:
 
 # Cross-process local Turnstile browser limiter.
 # Each register worker is a separate process; without this, 4 workers open 4
-# Chrome+Xvfb at once and thrash each other (disconnect / empty timeout).
+# Chrome processes at once and thrash each other (disconnect / empty timeout).
 _LOCAL_TURNSTILE_LOCK_PATH = Path(
     os.environ.get("XAI_LOCAL_TURNSTILE_LOCK_PATH")
     or (Path(tempfile.gettempdir()) / "xai-local-turnstile.lock")
@@ -4525,120 +4620,10 @@ def _safe_call(fn, *args, **kwargs):
 
 
 
-def _virtual_display_available() -> bool:
-    """Return True when Xvfb can provide a virtual headed display."""
-    import shutil
-
-    return bool(shutil.which("Xvfb") or shutil.which("xvfb-run"))
-
-
-def _display_env_available() -> bool:
-    return bool(str(os.environ.get("DISPLAY") or "").strip())
-
-
 def _resolve_local_browser_mode(*, want_headless: bool) -> Tuple[str, bool]:
-    """Map user headless intent to an actual browser launch mode.
+    """Map the setting directly to headed or native Chrome headless-new."""
 
-    Returns (mode, use_headless_flag):
-      - headed: normal visible Chrome
-      - virtual-headed: headed Chrome under Xvfb (best "headless" for CF)
-      - headless-new: true Chrome headless (usually hard-blocked by x.ai)
-    """
-    if not want_headless:
-        return "headed", False
-    if _virtual_display_available():
-        return "virtual-headed", False
-    # Pure headless is consistently hard-blocked by accounts.x.ai in this project.
-    # Without Xvfb, map "headless" to real headed so we do not burn a doomed launch.
-    if _display_env_available():
-        return "headed", False
-    return "headless-new", True
-
-
-class _VirtualDisplaySession:
-    """Best-effort Xvfb session for virtual headed Chrome."""
-
-    def __init__(self, log_callback: LogFn = None):
-        self.log_callback = log_callback
-        self._backend = ""
-        self._display = None
-        self._proc = None
-        self._old_display = os.environ.get("DISPLAY")
-        self.active = False
-
-    def start(self) -> bool:
-        # 1) pyvirtualdisplay if installed
-        try:
-            from pyvirtualdisplay import Display  # type: ignore
-
-            disp = Display(visible=False, size=(1365, 900))
-            disp.start()
-            self._display = disp
-            self._backend = "pyvirtualdisplay"
-            self.active = True
-            _log(self.log_callback, f"[Turnstile] 已启动虚拟显示 backend=pyvirtualdisplay DISPLAY={os.environ.get('DISPLAY')}")
-            return True
-        except Exception:
-            pass
-
-        # 2) raw Xvfb
-        import shutil
-        import subprocess
-
-        xvfb = shutil.which("Xvfb")
-        if not xvfb:
-            return False
-        # Pick a high display number.
-        display_no = 90 + (os.getpid() % 20)
-        display = f":{display_no}"
-        try:
-            proc = subprocess.Popen(
-                [xvfb, display, "-screen", "0", "1365x900x24", "-nolisten", "tcp"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except Exception as exc:
-            _log(self.log_callback, f"[Turnstile][warn] 启动 Xvfb 失败: {exc}")
-            return False
-        time.sleep(0.3)
-        if proc.poll() is not None:
-            _log(self.log_callback, "[Turnstile][warn] Xvfb 立即退出，虚拟显示不可用")
-            return False
-        self._proc = proc
-        self._backend = "xvfb"
-        os.environ["DISPLAY"] = display
-        self.active = True
-        _log(self.log_callback, f"[Turnstile] 已启动虚拟显示 backend=xvfb DISPLAY={display}")
-        return True
-
-    def stop(self) -> None:
-        if not self.active and self._display is None and self._proc is None:
-            return
-        try:
-            if self._display is not None:
-                try:
-                    self._display.stop()
-                except Exception:
-                    pass
-                self._display = None
-            if self._proc is not None:
-                try:
-                    self._proc.terminate()
-                    self._proc.wait(timeout=2)
-                except Exception:
-                    try:
-                        self._proc.kill()
-                    except Exception:
-                        pass
-                self._proc = None
-        finally:
-            if self._old_display is None:
-                os.environ.pop("DISPLAY", None)
-            else:
-                os.environ["DISPLAY"] = self._old_display
-            if self.active:
-                _log(self.log_callback, f"[Turnstile] 已关闭虚拟显示 backend={self._backend or '-'}")
-            self.active = False
+    return ("headless-new", True) if want_headless else ("headed", False)
 
 
 def _build_turnstile_browser_options(
@@ -4695,7 +4680,7 @@ def _build_turnstile_browser_options(
             options._xai_profile_dir = profile_dir  # type: ignore[attr-defined]
         except Exception:
             pass
-        _log(log_callback, f"[Turnstile] 使用独立用户目录: {profile_dir}")
+        _log(log_callback, f"[Turnstile] 使用独立用户目录: {Path(profile_dir).name}")
     except Exception as exc:
         _log(log_callback, f"[Turnstile][warn] 创建独立用户目录失败: {exc}")
 
@@ -4751,8 +4736,7 @@ def _build_turnstile_browser_options(
             _safe_call(getattr(options, "set_argument", None), arg)
         _log(
             log_callback,
-            "[Turnstile][warn] headless 模式启用（headless=new）；"
-            "注入 sitekey widget 后会主动轮询/触发，成功率仍通常低于有头",
+            "[Turnstile] 已启用原生 Chrome --headless=new",
         )
 
     proxy = str(proxy or "").strip()
@@ -4839,8 +4823,7 @@ def _classify_turnstile_page_state(diag: Any) -> Dict[str, Any]:
         message = (
             "本地浏览器打开 accounts.x.ai 时被 Cloudflare 硬拦截(blocked)"
             f"（title={title or '-'}；url={url or '-'}）。"
-            "有头直连通常可解；无头易被硬拦，建议安装 Xvfb 走 virtual-headed，或改回有界面；"
-            "必要时换出口或改用远程 captcha provider。不要继续空等 Turnstile token。"
+            "当前启动模式将在本次捕获中保持不变；请让上层有界重试或更换出口。"
         )
         return {
             "blocked": True,
@@ -5068,6 +5051,7 @@ return {
   tokenLen: token.length,
   turnstileApiType: typeof window.turnstile,
   turnstileRespLen: turnstileResp.length,
+  turnstileError: String(window.__xaiTsLastError || ''),
   sitekeys,
   sitekeyCount: sitekeys.length,
   iframeCount: iframes.length,
@@ -5229,39 +5213,11 @@ def _nudge_turnstile_widget(page: Any, *, log_callback: LogFn = None) -> str:
     """Best-effort interaction with Turnstile host/iframe/shadow checkbox."""
     actions: list[str] = []
 
-    # 1) Plain DOM hosts
-    try:
-        clicked = page.run_js(
-            """
-const nodes = Array.from(document.querySelectorAll(
-  '#xai-local-ts-host, #xai-local-ts-host iframe, .cf-turnstile, [data-sitekey], #cf-turnstile, #turnstile-wrapper, iframe[src*="turnstile"], iframe[src*="challenges.cloudflare"]'
-));
-let n = 0;
-for (const node of nodes) {
-  try { node.scrollIntoView({block:'center', inline:'center'}); } catch (e) {}
-  try { node.click(); n += 1; } catch (e) {}
-  try {
-    const rect = node.getBoundingClientRect();
-    const x = rect.left + Math.min(Math.max(rect.width * 0.2, 8), 40);
-    const y = rect.top + rect.height / 2;
-    for (const type of ['pointerdown', 'mousedown', 'mouseup', 'click']) {
-      node.dispatchEvent(new MouseEvent(type, { bubbles: true, clientX: x, clientY: y, view: window }));
-    }
-  } catch (e) {}
-}
-return n;
-"""
-        )
-        if int(clicked or 0) > 0:
-            actions.append(f"dom:{clicked}")
-    except Exception:
-        pass
-
-    # 1b) Explicit Turnstile API execute / getResponse for injected widgets.
+    # Read the explicit widget response without repeatedly calling execute().
     try:
         api_hit = page.run_js(
             """
-let out = {executed:false, tokenLen:0, reset:false, error:''};
+let out = {tokenLen:0, error:''};
 try {
   if (window.turnstile && window.__xaiTsWidgetId != null) {
     try {
@@ -5273,20 +5229,12 @@ try {
         if (input) input.value = cur;
       }
     } catch (e) {}
-    try {
-      if (typeof turnstile.execute === 'function') {
-        turnstile.execute(window.__xaiTsWidgetId);
-        out.executed = true;
-      }
-    } catch (e) { out.error = String(e); }
   }
 } catch (e) { out.error = String(e); }
 return out;
 """
         )
         if isinstance(api_hit, dict):
-            if api_hit.get("executed"):
-                actions.append("api-execute")
             if int(api_hit.get("tokenLen") or 0) >= 80:
                 actions.append(f"api-token:{api_hit.get('tokenLen')}")
     except Exception:
@@ -5317,19 +5265,6 @@ return out;
                 except Exception:
                     iframe = None
             if iframe is not None:
-                try:
-                    iframe.run_js(
-                        """
-window.dtp = 1;
-function getRandomInt(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
-let sx = getRandomInt(800, 1200);
-let sy = getRandomInt(400, 700);
-try { Object.defineProperty(MouseEvent.prototype, 'screenX', { value: sx }); } catch (e) {}
-try { Object.defineProperty(MouseEvent.prototype, 'screenY', { value: sy }); } catch (e) {}
-"""
-                    )
-                except Exception:
-                    pass
                 clicked_shadow = False
                 try:
                     body_sr = iframe.ele("tag:body", timeout=0.2).shadow_root
@@ -5410,7 +5345,7 @@ function doRender() {{
   const opts = {{
     sitekey,
     callback: onToken,
-    'error-callback': function(code){{ window.__xaiTsLastError = String(code || 'error'); }},
+    'error-callback': function(code){{ window.__xaiTsLastError = String(code || 'error'); return true; }},
     'expired-callback': function(){{ window.__xaiTsToken = ''; }},
     'timeout-callback': function(){{ window.__xaiTsLastError = 'timeout'; }},
     size: 'normal',
@@ -5421,7 +5356,6 @@ function doRender() {{
   if (cdata) opts.cData = cdata;
   try {{
     window.__xaiTsWidgetId = turnstile.render(host, opts);
-    try {{ if (typeof turnstile.execute === 'function') turnstile.execute(window.__xaiTsWidgetId); }} catch (e) {{}}
     return {{ok:true, reason:'rendered', widgetId: window.__xaiTsWidgetId, tokenLen: (window.__xaiTsToken||'').length}};
   }} catch (e) {{
     return {{ok:false, reason:'render-error', error: String(e)}};
@@ -5519,8 +5453,7 @@ def _launch_turnstile_browser(options: Any, *, log_callback: LogFn = None) -> An
         ):
             hint = (
                 "有界面 Chrome 拉不起：当前图形会话资源耗尽（X11 clients / inotify / 打开文件过多）。"
-                "请先关掉大量 Playwright/Chrome 残留进程，或新开图形会话后再试；"
-                "若要稳定无真窗，请安装 Xvfb 走 virtual-headed。"
+                "请先清理本项目残留浏览器，或显式启用原生 headless=new。"
                 f" 原始错误: {msg}"
             )
         else:
@@ -5535,7 +5468,23 @@ def _launch_turnstile_browser(options: Any, *, log_callback: LogFn = None) -> An
     return browser
 
 
+def _turnstile_browser_pid(browser: Any) -> int:
+    if browser is None:
+        return 0
+    for name in ("process_id", "pid", "_process_id"):
+        try:
+            value = getattr(browser, name, 0)
+            value = value() if callable(value) else value
+            pid = int(value or 0)
+        except Exception:
+            pid = 0
+        if pid > 1:
+            return pid
+    return 0
+
+
 def _quit_turnstile_browser(browser: Any, options: Any = None) -> None:
+    browser_pid = _turnstile_browser_pid(browser)
     try:
         if browser is not None:
             browser.quit()
@@ -5546,6 +5495,17 @@ def _quit_turnstile_browser(browser: Any, options: Any = None) -> None:
         profile = getattr(options, "_xai_profile_dir", None) if options is not None else None
     except Exception:
         profile = None
+    if browser_pid > 1:
+        try:
+            from turnstile_solver.src.browser_runtime import _reap_chrome_process_tree
+
+            _reap_chrome_process_tree(browser_pid, timeout_sec=2.0)
+        except Exception:
+            pass
+    try:
+        unregister_project_browser(browser_pid, profile or "")
+    except Exception:
+        pass
     if profile:
         try:
             import shutil
@@ -5643,12 +5603,10 @@ def _capture_turnstile_token_impl(
     selected_proxy_raw = str(selected_proxy_raw or proxy or "").strip()
     browser_proxy = ""
     forwarder_instance = ""
-    virtual = None
     options = None
     browser = None
     page = None
     diag_samples: list[Dict[str, Any]] = []
-    hard_block_retried = False
     capture_started = time.monotonic()
     try:
         browser_proxy, forwarder_instance = _prepare_browser_proxy(
@@ -5659,38 +5617,62 @@ def _capture_turnstile_token_impl(
 
         want_headless = bool(headless)
         mode, use_headless = _resolve_local_browser_mode(want_headless=want_headless)
-        virtual = _VirtualDisplaySession(log_callback=log_callback) if mode == "virtual-headed" else None
-        if virtual is not None:
-            if not virtual.start():
-                _log(log_callback, "[Turnstile][warn] 虚拟显示启动失败，回退 headless-new")
-                mode, use_headless = "headless-new", True
-                virtual = None
-        if mode == "virtual-headed":
-            _log(log_callback, "[Turnstile] 无头请求已映射为 virtual-headed（Xvfb 有界面，对 Cloudflare 更友好）")
-        elif mode == "headed" and want_headless:
+        if mode == "headless-new":
             _log(
                 log_callback,
-                "[Turnstile][warn] 未检测到 Xvfb；纯 headless 会被 x.ai 硬拦，"
-                "本次无头选项已自动改走本机有界面",
+                "[Turnstile] 已启用原生 headless=new（无虚拟显示、无可见窗口、无有头回退）",
             )
-        elif mode == "headless-new" and want_headless:
-            _log(
-                log_callback,
-                "[Turnstile][warn] 未检测到 Xvfb 且无 DISPLAY；只能试 headless-new，"
-                "很可能被 x.ai 硬拦截",
-            )
+
+        if use_headless and not str(user_agent or "").strip():
+            runtime_fingerprint = build_runtime_fingerprint_profile()
+            user_agent = runtime_fingerprint.user_agent
+            accept_language = runtime_fingerprint.accept_language
+            expected_platform = runtime_fingerprint.navigator_platform
+            expected_client_hint_platform = runtime_fingerprint.client_hint_platform
+            expected_browser_major = runtime_fingerprint.browser_major
 
         options = _build_turnstile_browser_options(
             options=ChromiumOptions(),
             proxy=proxy,
             headless=bool(use_headless),
-            user_agent="",
+            user_agent=user_agent,
             log_callback=log_callback,
         )
         _log(log_callback, f"[Turnstile] 正在启动浏览器 mode={mode} headless={use_headless}")
         browser = _launch_turnstile_browser(options, log_callback=log_callback)
+        register_project_browser(
+            _turnstile_browser_pid(browser),
+            getattr(options, "_xai_profile_dir", ""),
+        )
         tabs = getattr(browser, "get_tabs", lambda: [])()
         page = tabs[-1] if tabs else browser.new_tab()
+        if str(user_agent or "").strip():
+            from turnstile_solver.src.browser_worker import apply_cdp_fingerprint_override
+            from turnstile_solver.src.models import SolveRequest as LocalSolveRequest
+
+            version_info = page.run_cdp("Browser.getVersion") or {}
+            product = str(version_info.get("product") or "")
+            match = re.search(r"(?:Headless)?Chrome/(\d+\.\d+\.\d+\.\d+)", product)
+            if not match:
+                raise XAIHttpFlowError(f"未识别 Chrome 完整版本: {product or '-'}")
+            local_request = LocalSolveRequest(
+                headless=bool(use_headless),
+                user_agent=str(user_agent or ""),
+                accept_language=str(accept_language or ""),
+                expected_platform=str(expected_platform or ""),
+                expected_client_hint_platform=str(expected_client_hint_platform or ""),
+                expected_browser_major=int(str(expected_browser_major or "0") or "0"),
+            )
+            apply_cdp_fingerprint_override(
+                page,
+                local_request,
+                browser_version=match.group(1),
+                strict=True,
+            )
+            _log(
+                log_callback,
+                f"[Turnstile] CDP 指纹已对齐 Chrome/{match.group(1).split('.', 1)[0]}",
+            )
         target_url = str(page_url or SIGNUP_URL).strip() or SIGNUP_URL
         page.get(target_url)
         _log(log_callback, f"[Turnstile] 已打开注册页: {target_url}")
@@ -5707,7 +5689,7 @@ def _capture_turnstile_token_impl(
         if inject_mode:
             _log(
                 log_callback,
-                f"[Turnstile] 使用 sitekey 注入模式 | sitekey={sitekey[:12]}… "
+                "[Turnstile] 使用 sitekey 注入模式 | sitekey=yes "
                 f"action={'yes' if action else 'no'} cdata={'yes' if cdata else 'no'} "
                 f"headless={'yes' if headless else 'no'}",
             )
@@ -5742,8 +5724,7 @@ def _capture_turnstile_token_impl(
                 f"cfInput={first_diag.get('hasCfInput')} "
                 f"tsIframes={first_diag.get('turnstileIframeCount')} "
                 f"inputs={first_diag.get('inputs')} "
-                f"title={first_diag.get('title')} "
-                f"body={str(first_diag.get('bodySnippet') or '')[:120]}",
+                f"title={first_diag.get('title')}",
             )
             # Hard Cloudflare block will never mount Turnstile; fail fast.
             # Soft challenge pages may clear themselves in headed mode, so wait.
@@ -5756,83 +5737,12 @@ def _capture_turnstile_token_impl(
                     kinds={"email_verification_deadend"},
                 )
             if classified0.get("kind") == "cloudflare_hard_block":
-                can_retry_headed = (
-                    want_headless
-                    and not hard_block_retried
-                    and mode in {"headless-new", "virtual-headed"}
-                    and _display_env_available()
+                _raise_if_turnstile_page_blocked(
+                    first_diag,
+                    log_callback=log_callback,
+                    stage="打开注册页后",
+                    kinds={"cloudflare_hard_block"},
                 )
-                if can_retry_headed:
-                    hard_block_retried = True
-                    _log(
-                        log_callback,
-                        "[Turnstile][warn] 当前模式被 Cloudflare 硬拦截，自动回退本机有界面重试一次",
-                    )
-                    try:
-                        if browser is not None:
-                            browser.quit()
-                    except Exception:
-                        pass
-                    browser = None
-                    if virtual is not None:
-                        virtual.stop()
-                        virtual = None
-                    mode, use_headless = "headed", False
-                    options = _build_turnstile_browser_options(
-                        options=ChromiumOptions(),
-                        proxy=proxy,
-                        headless=False,
-                        user_agent="",
-                        log_callback=log_callback,
-                    )
-                    _log(log_callback, "[Turnstile] 正在启动有界面回退浏览器…")
-                    browser = _launch_turnstile_browser(options, log_callback=log_callback)
-                    tabs = getattr(browser, "get_tabs", lambda: [])()
-                    page = tabs[-1] if tabs else browser.new_tab()
-                    page.get(target_url)
-                    _log(log_callback, f"[Turnstile] 有界面回退已打开注册页: {target_url}")
-                    try:
-                        page.wait.doc_loaded()
-                    except Exception:
-                        pass
-                    time.sleep(1.0)
-                    if inject_mode:
-                        _ensure_injected_turnstile_widget(
-                            page,
-                            sitekey=sitekey,
-                            action=action,
-                            cdata=cdata,
-                            log_callback=log_callback,
-                            wait_api_sec=3.0,
-                        )
-                        time.sleep(0.8)
-                    first_diag = _diagnose_turnstile_page(page)
-                    if isinstance(first_diag, dict):
-                        first_diag["_t"] = 0
-                        diag_samples.append(first_diag)
-                        _log(
-                            log_callback,
-                            "[Turnstile][diag] "
-                            f"t=0s tokenLen={first_diag.get('tokenLen')} "
-                            f"sitekeys={first_diag.get('sitekeyCount')} "
-                            f"cfInput={first_diag.get('hasCfInput')} "
-                            f"tsIframes={first_diag.get('turnstileIframeCount')} "
-                            f"title={first_diag.get('title')} "
-                            f"body={str(first_diag.get('bodySnippet') or '')[:120]}",
-                        )
-                        _raise_if_turnstile_page_blocked(
-                            first_diag,
-                            log_callback=log_callback,
-                            stage="有界面回退后",
-                            kinds={"cloudflare_hard_block", "email_verification_deadend"},
-                        )
-                else:
-                    _raise_if_turnstile_page_blocked(
-                        first_diag,
-                        log_callback=log_callback,
-                        stage="打开注册页后",
-                        kinds={"cloudflare_hard_block"},
-                    )
             elif classified0.get("blocked"):
                 _log(
                     log_callback,
@@ -5860,8 +5770,8 @@ def _capture_turnstile_token_impl(
         token = ""
         next_diag_at = started + 5
         next_prime_at = started + 8
-        next_nudge_at = started + 2
-        next_inject_at = started + 1
+        next_nudge_at = started + 18
+        next_inject_at = started + 4
         challenge_since: Optional[float] = None
         while time.monotonic() < deadline:
             now = time.monotonic()
@@ -5870,26 +5780,6 @@ def _capture_turnstile_token_impl(
                 break
 
             if inject_mode and now >= next_inject_at:
-                # If the widget has been idle too long in headless, force a re-render.
-                if headless and (now - started) >= 12:
-                    try:
-                        page.run_js(
-                            """
-try {
-  if (window.turnstile && window.__xaiTsWidgetId != null && typeof turnstile.remove === 'function') {
-    turnstile.remove(window.__xaiTsWidgetId);
-  }
-} catch (e) {}
-window.__xaiTsWidgetId = null;
-window.__xaiTsToken = '';
-const host = document.getElementById('xai-local-ts-host');
-if (host) host.innerHTML = '';
-return true;
-"""
-                        )
-                        _log(log_callback, "[Turnstile] headless 空闲过久，重置并重渲染 widget")
-                    except Exception:
-                        pass
                 _ensure_injected_turnstile_widget(
                     page,
                     sitekey=sitekey,
@@ -5898,11 +5788,11 @@ return true;
                     log_callback=log_callback,
                     wait_api_sec=2.5 if headless else 1.5,
                 )
-                next_inject_at = now + (3 if headless else 4)
+                next_inject_at = now + 8
 
             if now >= next_nudge_at:
                 _nudge_turnstile_widget(page, log_callback=log_callback)
-                next_nudge_at = now + (2 if (headless and inject_mode) else 3)
+                next_nudge_at = now + 12
 
             if (not inject_mode) and now >= next_prime_at:
                 snap_now = _diagnose_turnstile_page(page)
@@ -5948,9 +5838,15 @@ return true;
                         f"cfInput={snap.get('hasCfInput')} "
                         f"tsIframes={snap.get('turnstileIframeCount')} "
                         f"challenge={snap.get('challengeLike')} "
+                        f"tsError={snap.get('turnstileError') or '-'} "
                         f"state={classified.get('kind')} "
                         f"title={snap.get('title')}",
                     )
+                    challenge_error = str(snap.get("turnstileError") or "").strip()
+                    if challenge_error.startswith(("300", "600")):
+                        raise VerificationRequiredError(
+                            f"Turnstile challenge error {challenge_error}"
+                        )
                     if classified.get("kind") in {"cloudflare_hard_block", "email_verification_deadend"}:
                         _raise_if_turnstile_page_blocked(
                             snap,
@@ -5987,10 +5883,27 @@ return true;
                 "has_cf_input_any": any(bool(s.get("hasCfInput")) for s in diag_samples),
                 "turnstile_iframe_any": any(int(s.get("turnstileIframeCount") or 0) > 0 for s in diag_samples),
                 "challenge_like_any": any(bool(s.get("challengeLike")) for s in diag_samples),
+                "turnstile_error_last": str(
+                    (diag_samples[-1] if diag_samples else {}).get("turnstileError") or ""
+                ),
                 "last": diag_samples[-1] if diag_samples else {},
             }
-            _log(log_callback, f"[Turnstile][diag] 失败摘要: {summary}")
+            _log(
+                log_callback,
+                "[Turnstile][diag] 失败摘要: "
+                f"samples={summary['samples']} token_len_max={summary['token_len_max']} "
+                f"sitekey_count_max={summary['sitekey_count_max']} "
+                f"cf_input={summary['has_cf_input_any']} "
+                f"ts_iframe={summary['turnstile_iframe_any']} "
+                f"challenge={summary['challenge_like_any']} "
+                f"ts_error={summary['turnstile_error_last'] or '-'}",
+            )
             last_state = _classify_turnstile_page_state(diag_samples[-1] if diag_samples else {})
+            challenge_error = str(summary.get("turnstile_error_last") or "").strip()
+            if challenge_error:
+                raise VerificationRequiredError(
+                    f"Turnstile challenge error {challenge_error}"
+                )
             if last_state.get("blocked"):
                 raise VerificationRequiredError(str(last_state.get("message") or "Cloudflare blocked"))
             raise VerificationRequiredError(
@@ -6090,11 +6003,6 @@ return (async () => {
         return token
     finally:
         _quit_turnstile_browser(browser, options)
-        try:
-            if virtual is not None:
-                virtual.stop()
-        except Exception:
-            pass
         if forwarder_instance:
             try:
                 from local_proxy_forwarder import stop_local_forwarder

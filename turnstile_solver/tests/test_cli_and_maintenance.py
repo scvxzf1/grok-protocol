@@ -3,9 +3,10 @@ from __future__ import annotations
 import sys
 import threading
 import time
+import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -16,6 +17,7 @@ from src.__main__ import (
     _current_os_fingerprint,
     _strict_solve_fingerprint,
     build_parser,
+    main,
 )
 from src.browser_runtime import PersistentBrowserPool
 from src.config import SolverConfig
@@ -74,6 +76,19 @@ class CliDefaultsTests(unittest.TestCase):
         self.assertEqual(config.external_provider_workers, 30)
         self.assertEqual(config.external_queue_limit, 90)
         self.assertEqual(config.submit_workers, 8)
+
+    def test_serve_closes_service_after_uvicorn_returns(self):
+        service = Mock()
+        uvicorn_run = Mock()
+        uvicorn_module = types.SimpleNamespace(run=uvicorn_run)
+        with patch("src.__main__.SolverService", return_value=service), patch(
+            "src.api.create_app", return_value="app"
+        ), patch.dict(sys.modules, {"uvicorn": uvicorn_module}):
+            exit_code = main(["serve"])
+
+        self.assertEqual(exit_code, 0)
+        uvicorn_run.assert_called_once()
+        service.close.assert_called_once()
 
 
 class BrowserPoolMaintenanceTests(unittest.TestCase):

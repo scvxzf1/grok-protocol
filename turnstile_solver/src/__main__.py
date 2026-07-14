@@ -10,7 +10,7 @@ from typing import Dict, List, Optional
 from turnstile_broker import build_canonical_fingerprint_profile
 
 from .browser_runtime import _read_browser_full_version
-from .config import SolverConfig, load_config
+from .config import MAX_SUBMIT_WORKERS, SolverConfig, load_config
 from .models import SolveRequest
 from .service import SolverService
 
@@ -156,6 +156,8 @@ def _apply_serve_overrides(args: argparse.Namespace, config: SolverConfig) -> No
     ):
         value = int(getattr(args, name, 0) or 0)
         if value > 0:
+            if name == "submit_workers":
+                value = min(MAX_SUBMIT_WORKERS, value)
             setattr(config, name, value)
 
 
@@ -233,7 +235,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             )
             return 1
         app = create_app(service)
-        uvicorn.run(app, host=config.host, port=config.port, log_level="info", workers=1)
+        try:
+            uvicorn.run(app, host=config.host, port=config.port, log_level="info", workers=1)
+        finally:
+            service.close()
         return 0
 
     service.close()

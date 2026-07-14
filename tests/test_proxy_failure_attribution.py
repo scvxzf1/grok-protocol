@@ -32,6 +32,13 @@ class ProxyFailureAttributionTests(unittest.TestCase):
     def test_connect_refused_is_proxy(self):
         self.assertTrue(_looks_like_proxy_failure("ProxyError Connection refused"))
 
+    def test_later_transport_error_wins_over_earlier_challenge_timeout(self):
+        self.assertTrue(
+            _looks_like_proxy_failure(
+                "Turnstile timeout while waiting\nProxyError Connection refused"
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -18,7 +18,70 @@ from src.service import SolverService
 
 class SolverScaffoldTests(unittest.TestCase):
     def test_default_browser_tree_rss_budget_is_conservative(self):
-        self.assertEqual(SolverConfig().browser_max_rss_mb, 2048)
+        config = SolverConfig()
+        self.assertEqual(config.browser_max_tasks, 12)
+        self.assertEqual(config.browser_max_age_sec, 900)
+        self.assertEqual(config.browser_idle_ttl_sec, 90)
+        self.assertEqual(config.browser_max_rss_mb, 1024)
+        self.assertEqual(config.browser_solve_max_attempts, 2)
+        self.assertEqual(config.browser_retry_backoff_sec, 1.25)
+
+    def test_mapping_defaults_match_dataclass_defaults(self):
+        config = SolverConfig.from_dict({})
+        self.assertEqual(config.queue_timeout_sec, SolverConfig().queue_timeout_sec)
+        self.assertEqual(config.queue_timeout_sec, 180)
+
+    def test_string_boolean_config_values_are_parsed_explicitly(self):
+        config = SolverConfig.from_dict(
+            {
+                "turnstile_headless": "false",
+                "enable_metrics": "0",
+                "strict_fingerprint": "no",
+                "no_sandbox": "true",
+            }
+        )
+        self.assertFalse(config.headless)
+        self.assertFalse(config.enable_metrics)
+        self.assertFalse(config.strict_fingerprint)
+        self.assertTrue(config.no_sandbox)
+
+    def test_disabled_recycle_limits_and_retry_bounds_are_preserved(self):
+        config = SolverConfig.from_dict(
+            {
+                "browser_idle_ttl_sec": 0,
+                "browser_max_rss_mb": 0,
+                "browser_solve_max_attempts": 99,
+                "browser_retry_backoff_seconds": 99,
+            }
+        )
+        self.assertEqual(config.browser_idle_ttl_sec, 0)
+        self.assertEqual(config.browser_max_rss_mb, 0)
+        self.assertEqual(config.browser_solve_max_attempts, 4)
+        self.assertEqual(config.browser_retry_backoff_sec, 10.0)
+
+        minimums = SolverConfig.from_dict(
+            {
+                "browser_solve_max_attempts": 0,
+                "browser_retry_backoff_sec": 0,
+            }
+        )
+        self.assertEqual(minimums.browser_solve_max_attempts, 1)
+        self.assertEqual(minimums.browser_retry_backoff_sec, 0.0)
+
+    def test_canonical_seconds_keys_take_precedence_over_legacy_aliases(self):
+        config = SolverConfig.from_dict(
+            {
+                "browser_max_age_seconds": 601,
+                "browser_max_age_sec": 999,
+                "browser_idle_ttl_seconds": 0,
+                "browser_idle_ttl_sec": 999,
+                "browser_maintenance_interval_seconds": 0.25,
+                "browser_maintenance_interval_sec": 9,
+            }
+        )
+        self.assertEqual(config.browser_max_age_sec, 601)
+        self.assertEqual(config.browser_idle_ttl_sec, 0)
+        self.assertEqual(config.browser_maintenance_interval_sec, 0.25)
 
     def test_normalize_proxy_host_port_user_pass(self):
         self.assertEqual(

@@ -18,6 +18,7 @@ import re
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unicodedata
@@ -27,6 +28,11 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple
+
+from project_browser_registry import (
+    registered_project_browsers,
+    terminate_project_browser_trees,
+)
 
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -55,6 +61,7 @@ MIN_LOCAL_TURNSTILE_WORKERS = 1
 ABS_MAX_LOCAL_TURNSTILE_WORKERS = 6666
 DEFAULT_TURNSTILE_QUEUE_SIZE = 64
 DEFAULT_SUBMIT_WORKERS = 4
+MAX_SUBMIT_WORKERS = 32
 MAX_LOG_LINES = 700
 DEFAULT_SSO_CONVERT_RETRIES = 5
 DEFAULT_SSO_CONVERT_COOLDOWN = 3
@@ -222,10 +229,8 @@ def format_browser_health(status: Optional[Dict[str, int]] = None) -> str:
 
 _TEMP_DIR_GLOBS = (
     "xai-ts-chrome-*",
-    "xai-ts-probe*",
-    "xai-chrome-raw-*",
-    "playwright_chromiumdev_profile-*",
 )
+_TEMP_DIR_ORPHAN_GRACE_SEC = 30.0
 
 
 def _reap_zombie_children() -> int:
@@ -253,6 +258,8 @@ def _kill_orphan_turnstile_solvers(*, keep_pids: Optional[set[int]] = None) -> i
     then accumulate as zombies. Cleaning these orphans is safe for this project
     and does not touch the user's daily Chrome browser.
     """
+    if os.name == "nt":
+        return 0
     keep = set(int(x) for x in (keep_pids or set()) if int(x) > 1)
     keep.add(os.getpid())
     killed = 0
@@ -320,49 +327,52 @@ def cleanup_browser_residues(
     keep_solver_pids: Optional[set[int]] = None,
     pkill_fn=None,
 ) -> Dict[str, int]:
-    """Clean Playwright/Chrome residues that commonly block headed Turnstile launches.
+    """Clean only Chromium trees bearing this project's profile marker.
 
-    Default is conservative for the user's daily browser:
-      - kill Playwright Chromium leftovers
-      - kill this project's temp Chrome profiles (xai-ts-chrome-*)
-      - kill orphan turnstile_solver parents left by previous runs
-      - do NOT kill every Chrome process unless explicitly requested
+    The legacy ``kill_playwright``/``kill_all_chrome``/``pkill_fn`` arguments
+    remain call-compatible but never widen selection to unrelated browsers.
     """
-    if pkill_fn is None:
-        def pkill_fn(pattern: str) -> int:
-            before = _pgrep_count(pattern)
-            if before <= 0:
-                return 0
-            subprocess.run(
-                ["pkill", "-f", pattern],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            # Give the kernel a moment to reap.
-            time.sleep(0.2)
-            after = _pgrep_count(pattern)
-            return max(0, before - after)
+    del kill_playwright, kill_all_chrome, pkill_fn
 
     killed_solvers = int(_kill_orphan_turnstile_solvers(keep_pids=keep_solver_pids) if kill_orphan_solvers else 0)
-    killed_playwright = int(pkill_fn("ms-playwright/chromium") if kill_playwright else 0)
-    # Always reap this project's headless profiles; do not touch the user's daily Chrome.
-    killed_project_chrome = int(pkill_fn("xai-ts-chrome-") + pkill_fn("xai-chrome-raw-"))
-    killed_chrome = int(pkill_fn("chrome") if kill_all_chrome else 0) + killed_project_chrome
+    project_cleanup = terminate_project_browser_trees(grace_sec=2.0)
+    killed_project_chrome = int(project_cleanup.get("browser_roots") or 0)
+    killed_playwright = 0
+    killed_chrome = killed_project_chrome
     reaped_zombies = int(_reap_zombie_children())
 
-    root = Path(temp_root or "/tmp")
-    removed = 0
+    root = Path(temp_root or tempfile.gettempdir()).expanduser().resolve(strict=False)
+    removed = int(project_cleanup.get("profiles_removed") or 0)
+    try:
+        protected_profiles = {
+            str(Path(entry.get("profile_dir") or "").expanduser().resolve(strict=False))
+            for entry in registered_project_browsers()
+            if str(entry.get("profile_dir") or "").strip()
+        }
+    except Exception:
+        protected_profiles = set()
+    now = time.time()
     for pattern in _TEMP_DIR_GLOBS:
         for path in root.glob(pattern):
             try:
-                if path.is_dir():
-                    shutil.rmtree(path, ignore_errors=True)
+                resolved = path.resolve(strict=False)
+                if os.path.commonpath((str(resolved), str(root))) != str(root):
+                    continue
+                if str(resolved) in protected_profiles:
+                    continue
+                # Browser launch creates its profile shortly before publishing
+                # the PID.  A short grace period prevents a concurrent cleanup
+                # pass from deleting that not-yet-registered directory.
+                age = max(0.0, now - float(resolved.stat().st_mtime))
+                if age < _TEMP_DIR_ORPHAN_GRACE_SEC:
+                    continue
+                if resolved.is_dir():
+                    shutil.rmtree(resolved, ignore_errors=True)
                     removed += 1
-                elif path.exists():
-                    path.unlink(missing_ok=True)
+                elif resolved.exists():
+                    resolved.unlink(missing_ok=True)
                     removed += 1
-            except OSError:
+            except (OSError, ValueError):
                 continue
 
     health = browser_health_status()
@@ -743,17 +753,12 @@ PROXY_FAILURE_MARKERS = (
     "打开注册页 HTTP 403",
     "HTTP 403",
     "cf-ray",
-    # Local headless Turnstile empty-timeouts are often egress-quality related.
-    # Fail fast and switch embedded node instead of burning 3x long waits.
-    "Turnstile 求解失败",
-    "未捕获到可用 Turnstile token",
     "与页面的连接已断开",
     "浏览器启动/连接失败",
     "token_len=0",
 )
 
-# Pure mail / token-verify issues should not burn embedded proxy node retries.
-# Note: empty Turnstile capture timeouts ARE treated as proxy/egress failures above.
+# Challenge, mail, and token-verify issues should not burn embedded proxy retries.
 # IMPORTANT: do NOT use bare keywords like "邮箱" — normal success logs also contain
 # "邮箱验证码已通过校验", which would falsely suppress proxy rotation.
 NON_PROXY_FAILURE_MARKERS = (
@@ -761,6 +766,9 @@ NON_PROXY_FAILURE_MARKERS = (
     "Turnstile consume 后 token 无效",
     "返回的 Turnstile token 无效",
     "solver pool busy",
+    "turnstile timeout",
+    "turnstile challenge error",
+    "未捕获到可用 turnstile token",
     "YYDS create HTTP",
     "YYDS create",
     "shared_domain_restricted",
@@ -777,9 +785,9 @@ NON_PROXY_FAILURE_MARKERS = (
 def _looks_like_proxy_failure(text: str) -> bool:
     """Heuristics for embedded-proxy node failures / bad egress.
 
-    Local Turnstile empty-timeouts and browser disconnects usually correlate with
-    bad egress or overloaded browser+proxy pairs, so they should rotate nodes.
-    Pure email/token-verify failures stay excluded.
+    Browser disconnects and transport errors rotate nodes. Challenge timeouts and
+    Turnstile error families stay with the browser retry classifier instead of
+    charging an infrastructure failure to the route.
     """
     blob = str(text or "")
     if not blob:
@@ -788,8 +796,6 @@ def _looks_like_proxy_failure(text: str) -> bool:
 
     # Strong proxy/browser signals first (may coexist with earlier successful mail logs).
     strong_proxy_signals = (
-        "turnstile 求解失败",
-        "未捕获到可用 turnstile token",
         "与页面的连接已断开",
         "浏览器启动/连接失败",
         "token_len=0",
@@ -805,29 +811,27 @@ def _looks_like_proxy_failure(text: str) -> bool:
         "connection refused",
         "打开注册页 http 403",
     )
-    if any(sig in lower for sig in strong_proxy_signals):
-        # Still exclude pure mail-provider failures if that is the only/terminal issue.
-        mail_only = (
-            "yyds create http" in lower
-            or "shared_domain_restricted" in lower
-            or "email-domain-rejected" in lower
-            or "email domain has been rejected" in lower
-        )
-        if not mail_only:
-            return True
+    last_strong_signal = max((lower.rfind(sig) for sig in strong_proxy_signals), default=-1)
+    last_non_proxy_signal = max(
+        (lower.rfind(marker.lower()) for marker in NON_PROXY_FAILURE_MARKERS),
+        default=-1,
+    )
+    # Worker logs are chronological.  Let the later terminal diagnosis win so
+    # an earlier token_len=0 does not mask a subsequent token-verification
+    # rejection, while a later transport error still rotates the route.
+    if last_non_proxy_signal > last_strong_signal:
+        return False
+    if last_strong_signal >= 0:
+        return True
 
-    for marker in NON_PROXY_FAILURE_MARKERS:
-        if marker.lower() in lower:
-            return False
+    if last_non_proxy_signal >= 0:
+        return False
     if "没有可用的内嵌代理节点" in blob or "内嵌代理已启用但管理器未就绪" in blob:
         return True
     for marker in PROXY_FAILURE_MARKERS:
         if marker.lower() in lower:
             return True
     if "tls" in lower and ("error" in lower or "connect" in lower):
-        return True
-    # Generic timeout while solving turnstile: rotate egress.
-    if "turnstile" in lower and ("timeout" in lower or "超时" in blob or "elapsed_ms=50" in lower):
         return True
     return False
 
@@ -1146,8 +1150,12 @@ def _load_runtime_fields(settings: Settings) -> None:
     settings.submit_workers = max(
         1,
         min(
-            MAX_WORKERS,
-            _positive_int(config.get("submit_workers", DEFAULT_SUBMIT_WORKERS), "提交并发", MAX_WORKERS),
+            MAX_SUBMIT_WORKERS,
+            _positive_int(
+                config.get("submit_workers", DEFAULT_SUBMIT_WORKERS),
+                "提交并发",
+                MAX_SUBMIT_WORKERS,
+            ),
         ),
     )
     settings.sso_convert_retries = _bounded_int(
@@ -1340,7 +1348,7 @@ def build_plan(settings: Settings) -> RunPlan:
         )
         if turnstile_headless:
             warnings.append(
-                "本地无头会映射为 virtual-headed（Xvfb）；"
+                "本地浏览器无头使用原生 Chrome --headless=new（不会启动可见窗口或有头回退）；"
                 f"建议账号并发 ≤ {local_cap}"
                 "（配置 concurrent_workers / local_turnstile_max_workers）。"
             )
@@ -1392,7 +1400,7 @@ def build_plan(settings: Settings) -> RunPlan:
     submit_workers = max(
         1,
         min(
-            MAX_WORKERS,
+            MAX_SUBMIT_WORKERS,
             int(
                 config.get("submit_workers")
                 or settings.submit_workers
@@ -1403,7 +1411,7 @@ def build_plan(settings: Settings) -> RunPlan:
     turnstile_broker_url = str(
         settings.turnstile_broker_url or config.get("turnstile_broker_url") or ""
     ).strip()
-    # Local headless/virtual-headed capture is process-local and stable only when
+    # Local native-headless capture is process-local and stable only when
     # each register worker solves independently. The shared HTTP broker path has
     # repeatedly timed out under concurrency (browser_starts=0 / Read timed out),
     # so default local runs force direct capture unless an external broker URL is
@@ -3274,7 +3282,7 @@ def _settings_to_public_dict(settings: Settings) -> Dict[str, object]:
         "turnstile_headless": settings.turnstile_headless,
         "local_turnstile_max_workers": resolve_local_turnstile_max_workers(settings.config or {}, strict=False),
         "local_turnstile_max_inflight": resolve_local_turnstile_max_inflight_cfg(settings.config or {}, strict=False),
-        "submit_workers": max(1, min(MAX_WORKERS, int((settings.config or {}).get("submit_workers") or settings.submit_workers or DEFAULT_SUBMIT_WORKERS))),
+        "submit_workers": max(1, min(MAX_SUBMIT_WORKERS, int((settings.config or {}).get("submit_workers") or settings.submit_workers or DEFAULT_SUBMIT_WORKERS))),
         "turnstile_solve_timeout": _bounded_int((settings.config or {}).get("turnstile_solve_timeout"), "Turnstile单次超时", minimum=5, maximum=600, default=90),
         "turnstile_solve_retries": _bounded_int((settings.config or {}).get("turnstile_solve_retries"), "Turnstile重试次数", minimum=1, maximum=10, default=1),
         "mail_code_timeout_sec": _bounded_int((settings.config or {}).get("mail_code_timeout_sec"), "邮箱验证码等待", minimum=10, maximum=180, default=40),
@@ -4065,7 +4073,7 @@ def build_config_center(settings: Settings) -> Dict[str, object]:
             "submit_workers": max(
                 1,
                 min(
-                    MAX_WORKERS,
+                    MAX_SUBMIT_WORKERS,
                     int(raw.get("submit_workers") or settings.submit_workers or DEFAULT_SUBMIT_WORKERS),
                 ),
             ),
@@ -4213,11 +4221,11 @@ class BatchService:
             submit_workers=max(
                 1,
                 min(
-                    MAX_WORKERS,
+                    MAX_SUBMIT_WORKERS,
                     _positive_int(
                         config.get("submit_workers", DEFAULT_SUBMIT_WORKERS),
                         "提交并发",
-                        MAX_WORKERS,
+                        MAX_SUBMIT_WORKERS,
                     ),
                 ),
             ),
@@ -4303,7 +4311,7 @@ class BatchService:
             )
             speed_touched = True
         if "submit_workers" in data:
-            sw = _positive_int(data.get("submit_workers"), "提交并发", MAX_WORKERS)
+            sw = _positive_int(data.get("submit_workers"), "提交并发", MAX_SUBMIT_WORKERS)
             self.settings.submit_workers = sw
             cfg_speed["submit_workers"] = int(sw)
             speed_touched = True
@@ -4571,7 +4579,7 @@ class BatchService:
             self.settings.submit_workers = _positive_int(
                 fields.get("submit_workers"),
                 "提交并发",
-                MAX_WORKERS,
+                MAX_SUBMIT_WORKERS,
             )
             cfg["submit_workers"] = int(self.settings.submit_workers)
 
@@ -5896,4 +5904,3 @@ class BatchService:
             return
         runner.tick()
         self._sync_logs()
-
