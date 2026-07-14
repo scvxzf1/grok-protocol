@@ -1,6 +1,9 @@
-"""Small protocol tests for the optional parent HTTP proxy tunnel."""
+"""Protocol and exclusive-port tests for the local HTTP proxy forwarder."""
 
+import socket
+import socketserver
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
 
 import local_proxy_forwarder as forwarder
@@ -118,6 +121,140 @@ class LocalProxyForwarderParentChainTests(unittest.TestCase):
         self.assertTrue(inner.startswith(b"GET http://api.example/status HTTP/1.1\r\n"))
         self.assertIn(b"Proxy-Authorization: Basic dXAtdXNlcjp1cC1wYXNz", inner)
         self.assertNotIn(b"client-credentials", inner)
+
+
+class LocalProxyForwarderOwnershipTests(unittest.TestCase):
+    @staticmethod
+    def _free_port():
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            return int(sock.getsockname()[1])
+
+    @staticmethod
+    def _instance(port):
+        return forwarder.LocalProxyForwarder(
+            forwarder.UpstreamProxy("http", "upstream.example", 8080),
+            local_port=port,
+        )
+
+    def tearDown(self):
+        forwarder.stop_local_forwarder()
+
+    def test_parallel_bind_never_shares_one_worker_port(self):
+        port = self._free_port()
+        first = self._instance(port)
+        second = self._instance(port)
+        try:
+            self.assertEqual(first.start(), f"http://127.0.0.1:{port}")
+            with self.assertRaises(OSError):
+                second.start()
+        finally:
+            second.stop()
+            first.stop()
+
+    def test_parallel_start_race_has_exactly_one_port_owner(self):
+        port = self._free_port()
+        instances = [self._instance(port), self._instance(port)]
+
+        def start(item):
+            try:
+                return (True, item.start())
+            except OSError:
+                return (False, "")
+
+        try:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                results = list(executor.map(start, instances))
+            self.assertEqual(sum(ok for ok, _url in results), 1)
+        finally:
+            for item in instances:
+                item.stop()
+
+    def test_fast_stop_start_reclaims_port_after_full_shutdown(self):
+        port = self._free_port()
+        first = self._instance(port)
+        first.start()
+        first.stop()
+        second = self._instance(port)
+        try:
+            self.assertEqual(second.start(), f"http://127.0.0.1:{port}")
+            with socket.create_connection(("127.0.0.1", port), timeout=1):
+                pass
+        finally:
+            second.stop()
+
+    def test_registry_replacement_cleans_stale_worker_before_rebind(self):
+        port = self._free_port()
+        key = "stale-worker-test"
+        first_url, used = forwarder.ensure_local_forwarder(
+            "http://u1:p1@one.example:8080",
+            preferred_local_port=port,
+            instance_key=key,
+        )
+        self.assertTrue(used)
+        second_url, used = forwarder.ensure_local_forwarder(
+            "http://u2:p2@two.example:8080",
+            preferred_local_port=port,
+            instance_key=key,
+        )
+        self.assertTrue(used)
+        self.assertEqual(first_url, second_url)
+        self.assertEqual(len(forwarder._FORWARDERS), 1)
+        self.assertEqual(forwarder.get_active_local_proxy_url(key), second_url)
+
+    def test_registry_does_not_return_externally_stopped_instance(self):
+        port = self._free_port()
+        key = "externally-stopped-test"
+        first_url, _ = forwarder.ensure_local_forwarder(
+            "http://u:p@one.example:8080",
+            preferred_local_port=port,
+            instance_key=key,
+        )
+        stale = forwarder._FORWARDERS[key]
+        stale.stop()
+        self.assertFalse(stale.is_running)
+        second_url, used = forwarder.ensure_local_forwarder(
+            "http://u:p@one.example:8080",
+            preferred_local_port=port,
+            instance_key=key,
+        )
+        self.assertTrue(used)
+        self.assertEqual(first_url, second_url)
+        self.assertIsNot(forwarder._FORWARDERS[key], stale)
+        self.assertTrue(forwarder._FORWARDERS[key].is_running)
+
+    def test_non_bind_startup_error_is_not_hidden_by_ephemeral_fallback(self):
+        with mock.patch.object(
+            forwarder.LocalProxyForwarder,
+            "start",
+            side_effect=RuntimeError("readiness failed"),
+        ) as start:
+            with self.assertRaisesRegex(RuntimeError, "readiness failed"):
+                forwarder.ensure_local_forwarder(
+                    "http://u:p@one.example:8080",
+                    preferred_local_port=self._free_port(),
+                    instance_key="startup-error-test",
+                )
+        self.assertEqual(start.call_count, 1)
+
+    def test_windows_server_bind_requests_exclusive_address_use(self):
+        server = object.__new__(forwarder.ThreadingTCPServer)
+        server.socket = mock.Mock()
+        with mock.patch.object(forwarder.os, "name", "nt"), mock.patch.object(
+            socketserver.TCPServer,
+            "server_bind",
+        ) as base_bind:
+            forwarder.ThreadingTCPServer.server_bind(server)
+        server.socket.setsockopt.assert_called_once_with(
+            socket.SOL_SOCKET,
+            socket.SO_EXCLUSIVEADDRUSE,
+            1,
+        )
+        base_bind.assert_called_once_with()
+
+    def test_server_reuse_flags_are_disabled(self):
+        self.assertFalse(forwarder.ThreadingTCPServer.allow_reuse_address)
+        self.assertFalse(forwarder.ThreadingTCPServer.allow_reuse_port)
 
 
 if __name__ == "__main__":

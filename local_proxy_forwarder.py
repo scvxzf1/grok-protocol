@@ -20,6 +20,7 @@ proxy must itself be reached through a local proxy such as Clash.
 from __future__ import annotations
 
 import base64
+import os
 import select
 import socket
 import socketserver
@@ -34,6 +35,10 @@ DEFAULT_LOCAL_HOST = "127.0.0.1"
 DEFAULT_LOCAL_PORT = 17890
 BUFFER_SIZE = 65536
 CONNECT_TIMEOUT = 20
+
+
+class LocalProxyBindError(OSError):
+    """Raised only when the requested local listening address cannot bind."""
 
 
 @dataclass
@@ -345,8 +350,20 @@ class _ProxyHandler(socketserver.BaseRequestHandler):
 
 
 class ThreadingTCPServer(socketserver.ThreadingTCPServer):
-    allow_reuse_address = True
+    # A worker port is a lease.  Reuse would allow two processes to believe
+    # they own the same endpoint during a fast restart, especially on Windows.
+    allow_reuse_address = False
+    allow_reuse_port = False
     daemon_threads = True
+
+    def server_bind(self):
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(
+                socket.SOL_SOCKET,
+                socket.SO_EXCLUSIVEADDRUSE,
+                1,
+            )
+        super().server_bind()
 
 
 class LocalProxyForwarder:
@@ -385,51 +402,115 @@ class LocalProxyForwarder:
             port = self._server.server_address[1]
         return f"http://{self.local_host}:{port}"
 
+    @property
+    def is_running(self) -> bool:
+        with self._lock:
+            return bool(
+                self._server is not None
+                and self._thread is not None
+                and self._thread.is_alive()
+            )
+
     def start(self) -> str:
         with self._lock:
             if self._server is not None:
-                return self.local_url
+                if self._thread is not None and self._thread.is_alive():
+                    return self.local_url
+                stale_server = self._server
+                self._server = None
+                self._thread = None
+                try:
+                    stale_server.server_close()
+                except Exception:
+                    pass
 
             handler = type(
                 "BoundProxyHandler",
                 (_ProxyHandler,),
                 {"upstream": self.upstream, "parent_proxy": self.parent_proxy},
             )
-            server = ThreadingTCPServer((self.local_host, self.local_port), handler)
+            try:
+                server = ThreadingTCPServer((self.local_host, self.local_port), handler)
+            except OSError as exc:
+                raise LocalProxyBindError(str(exc)) from exc
+            t = threading.Thread(
+                target=server.serve_forever,
+                kwargs={"poll_interval": 0.05},
+                name="local-proxy-forwarder",
+                daemon=True,
+            )
             self._server = server
-            self.local_port = server.server_address[1]
-            t = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.2}, name="local-proxy-forwarder", daemon=True)
-            t.start()
             self._thread = t
-            # quick readiness
-            deadline = time.time() + 3
-            while time.time() < deadline:
+            self.local_port = int(server.server_address[1])
+            thread_started = False
+            try:
+                t.start()
+                thread_started = True
+                ready = False
+                deadline = time.monotonic() + 3.0
+                while time.monotonic() < deadline:
+                    try:
+                        with socket.create_connection(
+                            (self.local_host, self.local_port), timeout=0.3
+                        ):
+                            ready = True
+                            break
+                    except OSError:
+                        time.sleep(0.05)
+                if ready and not t.is_alive():
+                    ready = False
+                if not ready:
+                    raise OSError(
+                        f"local proxy forwarder did not become ready on "
+                        f"{self.local_host}:{self.local_port}"
+                    )
+                return self.local_url
+            except BaseException:
+                self._server = None
+                self._thread = None
+                if thread_started:
+                    try:
+                        server.shutdown()
+                    except Exception:
+                        pass
                 try:
-                    with socket.create_connection((self.local_host, self.local_port), timeout=0.3):
-                        break
+                    server.server_close()
                 except Exception:
-                    time.sleep(0.05)
-            return self.local_url
+                    pass
+                if t.is_alive():
+                    t.join(timeout=1.0)
+                raise
 
     def stop(self, timeout: float = 2.0):
         with self._lock:
             server = self._server
-            self._server = None
-            self._thread = None
-        if not server:
-            return
-        def _shutdown():
+            serve_thread = self._thread
+            if not server:
+                return
+            wait = max(0.2, float(timeout or 2.0))
+            deadline = time.monotonic() + wait
+
+            def _shutdown():
+                try:
+                    server.shutdown()
+                except Exception:
+                    pass
+
+            shutdown_thread = threading.Thread(
+                target=_shutdown,
+                name="local-proxy-forwarder-shutdown",
+                daemon=True,
+            )
+            shutdown_thread.start()
+            shutdown_thread.join(timeout=max(0.0, deadline - time.monotonic()))
             try:
-                server.shutdown()
+                server.server_close()
             except Exception:
                 pass
-        t = threading.Thread(target=_shutdown, daemon=True)
-        t.start()
-        t.join(timeout=max(0.2, float(timeout or 2.0)))
-        try:
-            server.server_close()
-        except Exception:
-            pass
+            if serve_thread is not None and serve_thread is not threading.current_thread():
+                serve_thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            self._server = None
+            self._thread = None
 
 
 # process-level forwarder pool (supports concurrent workers)
@@ -505,7 +586,11 @@ def ensure_local_forwarder(
     )
     with _FORWARDER_LOCK:
         existing = _FORWARDERS.get(ikey)
-        if existing is not None and _FORWARDER_UPSTREAM_KEYS.get(ikey) == key:
+        if (
+            existing is not None
+            and _FORWARDER_UPSTREAM_KEYS.get(ikey) == key
+            and existing.is_running
+        ):
             return existing.local_url, True
         # recreate this instance only
         if existing is not None:
@@ -517,7 +602,12 @@ def ensure_local_forwarder(
             _FORWARDER_UPSTREAM_KEYS.pop(ikey, None)
 
         # prefer fixed port for default instance; workers use preferred+offset or free port
-        port = int(preferred_local_port or DEFAULT_LOCAL_PORT)
+        # ``0`` explicitly requests an OS-assigned exclusive port.
+        port = (
+            DEFAULT_LOCAL_PORT
+            if preferred_local_port is None
+            else int(preferred_local_port)
+        )
         try:
             fwd = LocalProxyForwarder(
                 up,
@@ -526,7 +616,7 @@ def ensure_local_forwarder(
                 parent_proxy=parent,
             )
             url = fwd.start()
-        except OSError:
+        except LocalProxyBindError:
             fwd = LocalProxyForwarder(
                 up,
                 local_host=DEFAULT_LOCAL_HOST,

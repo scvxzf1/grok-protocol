@@ -12,6 +12,7 @@ import json
 import os
 import random
 import queue
+import secrets
 import shutil
 import signal
 import re
@@ -25,6 +26,7 @@ import unicodedata
 import urllib.error
 import urllib.request
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple
@@ -54,6 +56,14 @@ CIRCUIT_PAUSE_SEC = 30.0
 CONTINUOUS_STALL_RECOVERY_SEC = 20.0
 PROXY_HEALTH_CHECK_INTERVAL_SEC = 15.0
 PROXY_DEAD_PAUSE_SEC = 15.0
+STATIC_PROXY_HEALTH_TIMEOUT_SEC = 12.0
+STATIC_PROXY_HEALTH_PROBE_WORKERS = 2
+STATIC_PROXY_HEALTH_ATTEMPTS = 3
+STATIC_PROXY_HEALTH_BACKOFF_SEC = 0.35
+STATIC_PROXY_SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
+STATIC_PROXY_MS_TOKEN_URL = (
+    "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
+)
 RECENT_WORKER_WINDOW = 200
 MAX_WORKERS = 128
 MAX_LOCAL_TURNSTILE_WORKERS = 3  # default local Turnstile concurrency cap
@@ -450,6 +460,10 @@ class RunPlan:
     warnings: List[str] = field(default_factory=list)
     embedded_proxy_enabled: bool = False
     embedded_proxy_max_node_retries: int = 3
+    # Static HTTP affinity remains opt-in for compatibility with generic
+    # weighted rotation.  A durable supervisor may force this switch per run.
+    proxy_slot_sticky: bool = False
+    proxy_pool_entries: Tuple[str, ...] = field(default_factory=tuple)
     target_mode: str = TARGET_MODE_COUNT
     target_success: int = 0
     continuous_max_runtime_min: int = 0
@@ -470,6 +484,8 @@ class WorkerState:
     proxy_local_http: str = ""
     # HTTP pool assignment (proxies.txt / subscription HTTP). Can mix with embedded.
     manual_proxy: str = ""
+    manual_proxy_lease_token: str = field(default="", repr=False)
+    uses_independent_turnstile_proxy: bool = False
     tried_node_ids: List[str] = field(default_factory=list)
     proxy_attempt: int = 0
 
@@ -1448,6 +1464,7 @@ def build_plan(settings: Settings) -> RunPlan:
         maximum=20,
         default=3,
     )
+    proxy_slot_sticky = _as_bool(config.get("proxy_slot_sticky"))
     if target_mode == TARGET_MODE_CONTINUOUS:
         if target_success > 0:
             warnings.append(
@@ -1482,6 +1499,7 @@ def build_plan(settings: Settings) -> RunPlan:
         warnings=warnings,
         embedded_proxy_enabled=embedded_proxy_enabled,
         embedded_proxy_max_node_retries=embedded_proxy_max_node_retries,
+        proxy_slot_sticky=proxy_slot_sticky,
         target_mode=target_mode,
         target_success=target_success,
         continuous_max_runtime_min=continuous_max_runtime_min,
@@ -1627,6 +1645,9 @@ class BatchRunner:
         self._last_browser_residue_cleanup_at: float = 0.0
         self._hybrid_proxy_seq: int = 0
         self._manual_proxy_rotator = None
+        self._proxy_pool_snapshot_path: Optional[Path] = None
+        self._static_proxy_health: Dict[int, Dict[str, object]] = {}
+        self._static_proxy_entries: Tuple[str, ...] = tuple()
 
     @staticmethod
     def _free_loopback_port() -> int:
@@ -1920,9 +1941,364 @@ class BatchRunner:
         self.workers = new_workers
 
     def _log(self, source: str, message: str) -> None:
-        message = _safe_text(message)
+        message = _safe_text(self._redact_proxy_text(message))
         if message:
             self.logs.append(f"[{source}] {message}")
+
+    def _redact_proxy_text(self, value: object) -> str:
+        """Return secret-free text for UI state and persisted worker logs."""
+        proxies: Sequence[str] = self._static_proxy_entries
+        rotator = getattr(self, "_manual_proxy_rotator", None)
+        if rotator is not None:
+            try:
+                proxies = tuple(rotator.proxies())
+            except Exception:
+                pass
+        try:
+            from proxy_pool import redact_proxy_text
+
+            return redact_proxy_text(value, proxies)
+        except Exception:
+            return str(value or "")
+
+    def _uses_static_proxy_leases(self) -> bool:
+        return bool(
+            getattr(self.plan, "proxy_slot_sticky", False)
+            and self._http_proxy_pool_active()
+        )
+
+    def _manual_proxy_source_path(self) -> Optional[Path]:
+        args = list(self.plan.proxy_args or [])
+        for index, token in enumerate(args):
+            if token == "--proxy-file" and index + 1 < len(args):
+                return Path(args[index + 1]).expanduser().resolve()
+        try:
+            cfg = _read_config(self.plan.config_path)
+        except Exception:
+            cfg = {}
+        raw = str((cfg or {}).get("proxy_file") or "").strip()
+        if not raw:
+            return None
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            path = self.plan.config_path.parent / path
+        return path.resolve()
+
+    def _prepare_static_proxy_snapshot(self) -> None:
+        """Freeze the HTTP pool once for this batch and build its lease owner."""
+        if not self._uses_static_proxy_leases():
+            return
+        try:
+            from proxy_pool import ProxyRotator, load_proxy_lines, normalize_proxy_pool
+        except Exception as exc:  # pragma: no cover - import failure is fatal
+            raise TuiConfigError(f"加载静态代理租约组件失败: {exc}") from exc
+
+        configured = tuple(getattr(self.plan, "proxy_pool_entries", ()) or ())
+        if configured:
+            entries = normalize_proxy_pool(configured)
+            source_name = "plan"
+        else:
+            source = self._manual_proxy_source_path()
+            entries = load_proxy_lines(str(source)) if source is not None else []
+            source_name = source.name if source is not None else "proxy-file"
+        if not entries:
+            raise TuiConfigError("静态 HTTP 代理租约缺少有效的启动快照条目")
+
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        target = self.run_dir / "proxy_pool.snapshot.txt"
+        temp = target.with_name(
+            f".{target.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+        )
+        fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write("\n".join(entries) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp, target)
+            try:
+                os.chmod(target, 0o600)
+            except OSError:
+                pass
+        finally:
+            try:
+                temp.unlink()
+            except FileNotFoundError:
+                pass
+
+        self._proxy_pool_snapshot_path = target
+        self._static_proxy_entries = tuple(entries)
+        self.plan.proxy_pool_entries = tuple(entries)
+        self._manual_proxy_rotator = ProxyRotator(
+            entries,
+            stats_file=str(ROOT_DIR / "proxy_stats.log"),
+        )
+        self._log(
+            "SYSTEM",
+            f"[Proxy] 本批次静态 HTTP 池已冻结 | source={source_name} valid={len(entries)}",
+        )
+
+    def _perform_static_proxy_health_request(
+        self,
+        proxy_url: str,
+        target: str,
+    ) -> Tuple[int, str]:
+        """Probe one real registration dependency through a prepared route."""
+        from curl_cffi import requests as curl_requests
+
+        common = {
+            "proxies": {"http": proxy_url, "https": proxy_url},
+            "timeout": STATIC_PROXY_HEALTH_TIMEOUT_SEC,
+            "impersonate": "chrome136",
+            "allow_redirects": False,
+        }
+        if target == "signup":
+            response = curl_requests.get(STATIC_PROXY_SIGNUP_URL, **common)
+        elif target == "ms_token":
+            response = curl_requests.post(
+                STATIC_PROXY_MS_TOKEN_URL,
+                data={
+                    "client_id": "PROXY_HEALTH_CHECK",
+                    "grant_type": "refresh_token",
+                    "refresh_token": "PROXY_HEALTH_CHECK",
+                },
+                **common,
+            )
+        else:  # pragma: no cover - internal programming error
+            raise ValueError(f"unknown proxy health target: {target}")
+        return (
+            int(getattr(response, "status_code", 0) or 0),
+            str(getattr(response, "text", "") or "")[:4096],
+        )
+
+    @staticmethod
+    def _static_proxy_transport_reason(exc: BaseException) -> str:
+        text_value = f"{type(exc).__name__}: {exc}".lower()
+        if any(
+            marker in text_value
+            for marker in (
+                "curl: (35)",
+                "tls connect",
+                "ssl connect",
+                "openssl",
+                "unexpected eof",
+                "certificate verify",
+            )
+        ):
+            return "curl_tls_error"
+        if any(
+            marker in text_value
+            for marker in (
+                "curl: (5)",
+                "curl: (6)",
+                "curl: (7)",
+                "curl: (28)",
+                "curl: (56)",
+                "proxy",
+                "connect",
+                "timeout",
+                "timed out",
+            )
+        ):
+            return "proxy_transport_error"
+        return "target_transport_error"
+
+    @staticmethod
+    def _classify_static_proxy_target(
+        target: str,
+        status_code: int,
+        body: str,
+    ) -> Tuple[bool, str]:
+        status = int(status_code or 0)
+        lowered = str(body or "").lower()
+        region_markers = (
+            "unsupported region",
+            "unsupported_region",
+            "restricted region",
+            "restricted_region",
+            "not available in your region",
+            "not available in your country",
+            "unsupported country",
+            "unsupported_country",
+            "country_block",
+            "cf_country",
+            "geo_block",
+        )
+        if target == "signup":
+            if status == 403 or (
+                status == 451 and any(marker in lowered for marker in region_markers)
+            ):
+                return False, "signup_region_403"
+            if 200 <= status < 400:
+                return True, "ok"
+            return False, f"signup_http_{status or 0}"
+        if target == "ms_token":
+            if 200 <= status < 500 and status not in {403, 407, 429}:
+                return True, "ok"
+            return False, f"ms_token_http_{status or 0}"
+        return False, "unknown_target"
+
+    def _probe_static_proxy_slot(
+        self,
+        slot_index: int,
+        proxy_raw: str,
+    ) -> Dict[str, object]:
+        """Probe signup and Microsoft token routes for one frozen entry."""
+        forwarder_key = (
+            f"batch-proxy-health-{self.run_id}-{int(slot_index)}-"
+            f"{secrets.token_hex(3)}"
+        )
+        target_results: Dict[str, Dict[str, object]] = {}
+        try:
+            from local_proxy_forwarder import ensure_local_forwarder
+
+            proxy_url, _ = ensure_local_forwarder(
+                proxy_raw,
+                preferred_local_port=0,
+                instance_key=forwarder_key,
+                parent_proxy_raw="",
+            )
+        except Exception as exc:
+            try:
+                from local_proxy_forwarder import stop_local_forwarder
+
+                stop_local_forwarder(instance_key=forwarder_key)
+            except Exception:
+                pass
+            return {
+                "index": int(slot_index),
+                "ok": False,
+                "reason": self._static_proxy_transport_reason(exc),
+                "targets": target_results,
+            }
+
+        try:
+            for target in ("signup", "ms_token"):
+                for attempt in range(1, STATIC_PROXY_HEALTH_ATTEMPTS + 1):
+                    try:
+                        status, body = self._perform_static_proxy_health_request(
+                            proxy_url,
+                            target,
+                        )
+                        ok, reason = self._classify_static_proxy_target(
+                            target,
+                            status,
+                            body,
+                        )
+                        target_results[target] = {
+                            "ok": ok,
+                            "status_code": status,
+                            "reason": reason,
+                            "attempts": attempt,
+                        }
+                    except Exception as exc:
+                        reason = self._static_proxy_transport_reason(exc)
+                        target_results[target] = {
+                            "ok": False,
+                            "status_code": None,
+                            "reason": reason,
+                            "attempts": attempt,
+                        }
+                    item = target_results[target]
+                    if item.get("ok"):
+                        break
+                    reason = str(item.get("reason") or "")
+                    retryable = reason in {
+                        "curl_tls_error",
+                        "proxy_transport_error",
+                        "target_transport_error",
+                    } or reason.endswith("_429") or bool(
+                        re.search(r"_http_5\d\d$", reason)
+                    )
+                    if not retryable or attempt >= STATIC_PROXY_HEALTH_ATTEMPTS:
+                        break
+                    time.sleep(
+                        STATIC_PROXY_HEALTH_BACKOFF_SEC * attempt
+                        + min(0.2, int(slot_index) * 0.04)
+                    )
+        finally:
+            try:
+                from local_proxy_forwarder import stop_local_forwarder
+
+                stop_local_forwarder(instance_key=forwarder_key)
+            except Exception:
+                pass
+
+        failures = [
+            str(item.get("reason") or "target_probe_failed")
+            for item in target_results.values()
+            if not item.get("ok")
+        ]
+        return {
+            "index": int(slot_index),
+            "ok": not failures and len(target_results) == 2,
+            "reason": ",".join(dict.fromkeys(failures)) if failures else "ok",
+            "targets": target_results,
+        }
+
+    def _probe_static_proxy_slots(self) -> None:
+        """Run the bounded two-target gate before any registration starts."""
+        if not self._uses_static_proxy_leases():
+            return
+        entries = list(self._static_proxy_entries)
+        if not entries:
+            raise TuiConfigError("静态 HTTP 代理探测缺少完整的启动快照")
+
+        results: Dict[int, Dict[str, object]] = {}
+        with ThreadPoolExecutor(
+            max_workers=max(1, min(len(entries), STATIC_PROXY_HEALTH_PROBE_WORKERS)),
+            thread_name_prefix="static-proxy-health",
+        ) as executor:
+            futures = {
+                executor.submit(self._probe_static_proxy_slot, index, proxy): index
+                for index, proxy in enumerate(entries)
+            }
+            for future in as_completed(futures):
+                index = int(futures[future])
+                try:
+                    results[index] = dict(future.result())
+                except Exception as exc:  # one bad probe must not hide peers
+                    results[index] = {
+                        "index": index,
+                        "ok": False,
+                        "reason": self._static_proxy_transport_reason(exc),
+                        "targets": {},
+                    }
+
+        self._static_proxy_health = results
+        rotator = self._manual_proxy_rotator
+        healthy = 0
+        isolated: List[int] = []
+        for index, proxy in enumerate(entries):
+            item = results.get(index) or {
+                "ok": False,
+                "reason": "target_probe_missing",
+            }
+            ok = bool(item.get("ok"))
+            reason = str(item.get("reason") or ("ok" if ok else "target_probe_failed"))
+            if rotator is not None:
+                rotator.record_result(proxy, ok, f"preflight:{reason}")
+                if ok:
+                    rotator.mark_good(proxy)
+                else:
+                    rotator.mark_bad(proxy)
+            if ok:
+                healthy += 1
+            else:
+                isolated.append(index)
+                self._log(
+                    "SYSTEM",
+                    f"[Proxy] 静态 HTTP 槽位 #{index + 1} 启动隔离: {reason}",
+                )
+        suffix = ""
+        if isolated:
+            suffix = "；隔离 " + ", ".join(f"#{index + 1}" for index in isolated)
+        self._log(
+            "SYSTEM",
+            f"[Proxy] 双目标启动探测完成: 健康 {healthy}/{len(entries)}{suffix}",
+        )
+        if healthy <= 0 and not self.plan.embedded_proxy_enabled:
+            raise TuiConfigError("静态 HTTP 代理均未通过注册依赖探测")
 
     def start(self) -> None:
         if self.started:
@@ -1935,6 +2311,8 @@ class BatchRunner:
                 os.chmod(directory, 0o700)
             except OSError:
                 pass
+        self._prepare_static_proxy_snapshot()
+        self._probe_static_proxy_slots()
         if self.plan.provider == "local":
             cleanup = cleanup_browser_residues(kill_playwright=True, kill_all_chrome=False)
             self._last_browser_residue_cleanup_at = time.monotonic()
@@ -2017,12 +2395,13 @@ class BatchRunner:
             )
         except Exception:
             ts_proxy = ""
+        worker.uses_independent_turnstile_proxy = bool(ts_proxy)
         if ts_proxy:
             command.extend(["--turnstile-proxy", ts_proxy])
         return command
 
     def _append_worker_log(self, worker: WorkerState, message: str) -> None:
-        text_line = _safe_text(message)
+        text_line = _safe_text(self._redact_proxy_text(message))
         if not text_line:
             return
         self.events.put((worker.index, text_line))
@@ -2428,7 +2807,8 @@ class BatchRunner:
             worker.last_log = "没有可用的内嵌代理节点"
             self._log(f"W{worker.index:02d}", worker.last_log)
             return False
-        worker.manual_proxy = ""
+        if worker.manual_proxy or worker.manual_proxy_lease_token:
+            self._release_manual_proxy(worker, success=None, reason="switch_to_embedded")
         worker.proxy_node_id = str(node.id)
         worker.proxy_node_name = str(getattr(node, "name", "") or "")
         worker.proxy_local_http = str(getattr(node, "local_http", "") or "")
@@ -2452,7 +2832,7 @@ class BatchRunner:
             return
         manager = self.embedded_proxy_manager
         node_id = worker.proxy_node_id
-        reason_text = str(reason or worker.last_log or "")
+        reason_text = self._redact_proxy_text(reason or worker.last_log or "")
         if manager is not None:
             try:
                 manager.release(node_id, failed=failed, reason=reason_text)
@@ -2493,7 +2873,7 @@ class BatchRunner:
         return self._http_proxy_pool_active()
 
     def _ensure_manual_proxy_rotator(self):
-        """Lazily build process-level ProxyRotator from plan proxy-file."""
+        """Build the rotator from the frozen snapshot or legacy live pool."""
         if getattr(self, "_manual_proxy_rotator", None) is not None:
             return self._manual_proxy_rotator
         try:
@@ -2502,29 +2882,30 @@ class BatchRunner:
             self._log("SYSTEM", f"[Proxy] 无法加载 proxy_pool: {exc}")
             self._manual_proxy_rotator = None
             return None
-        proxy_file = ""
-        args = list(self.plan.proxy_args or [])
-        for i, tok in enumerate(args):
-            if tok == "--proxy-file" and i + 1 < len(args):
-                proxy_file = args[i + 1]
-                break
-        if not proxy_file:
-            cfg_path = getattr(self.plan, "config_path", None)
-            try:
-                cfg = _read_config(cfg_path) if cfg_path else {}
-            except Exception:
-                cfg = {}
-            proxy_file = str((cfg or {}).get("proxy_file") or "proxies.txt")
-            if not os.path.isabs(proxy_file):
-                base = Path(cfg_path).parent if cfg_path else ROOT_DIR
-                proxy_file = str(base / proxy_file)
-        proxies = load_proxy_lines(proxy_file)
-        stats = str(ROOT_DIR / "proxy_stats.log")
-        rotator = configure_global_rotator(proxies, stats_file=stats, force=True)
+        source = self._manual_proxy_source_path()
+        proxy_file = str(source or "")
+        if self._uses_static_proxy_leases():
+            proxies = list(
+                self._static_proxy_entries
+                or tuple(getattr(self.plan, "proxy_pool_entries", ()) or ())
+            )
+            if not proxies and source is not None:
+                # Direct unit/integration callers may acquire before start();
+                # production start() always freezes the file first.
+                proxies = load_proxy_lines(str(source))
+                self._static_proxy_entries = tuple(proxies)
+            rotator = ProxyRotator(proxies, stats_file=str(ROOT_DIR / "proxy_stats.log"))
+        else:
+            proxies = load_proxy_lines(proxy_file)
+            rotator = configure_global_rotator(
+                proxies,
+                stats_file=str(ROOT_DIR / "proxy_stats.log"),
+                force=True,
+            )
         self._manual_proxy_rotator = rotator
         self._log(
             "SYSTEM",
-            f"[Proxy] 手动代理池已就绪 | file={os.path.basename(proxy_file)} valid={len(rotator)}",
+            f"[Proxy] 手动代理池已就绪 | file={os.path.basename(proxy_file) or 'snapshot'} valid={len(rotator)}",
         )
         if len(rotator) == 0:
             self._log("SYSTEM", "[Proxy][warn] 手动代理池有效条目为 0（可能全是 null host）")
@@ -2539,16 +2920,21 @@ class BatchRunner:
             worker.last_log = "HTTP 代理池无有效条目（请检查 proxies.txt / 订阅 HTTP 节点）"
             self._log(f"W{worker.index:02d}", worker.last_log)
             return False
-        proxy = str(rotator.next() or "").strip()
+        lease = None
+        if self._uses_static_proxy_leases():
+            lease = rotator.acquire_lease(owner=f"worker-{worker.index}")
+            proxy = str(getattr(lease, "proxy", "") or "").strip()
+        else:
+            proxy = str(rotator.next() or "").strip()
         if not proxy:
-            worker.last_log = "HTTP 代理池暂时无可用代理（可能全部冷却）"
+            worker.last_log = "HTTP 代理池暂时无空闲健康租约（可能占用中或冷却中）"
             self._log(f"W{worker.index:02d}", worker.last_log)
             return False
-        # Clear any previous embedded lease fields; one worker one egress.
-        worker.proxy_node_id = None
-        worker.proxy_node_name = ""
-        worker.proxy_local_http = ""
+        # Clear any previous embedded lease; one worker owns one egress.
+        if worker.proxy_node_id:
+            self._release_embedded_proxy(worker, failed=False)
         worker.manual_proxy = proxy
+        worker.manual_proxy_lease_token = str(getattr(lease, "token", "") or "")
         worker.proxy_attempt = int(worker.proxy_attempt or 0) + 1
         try:
             from proxy_pool import extract_country, mask_proxy
@@ -2589,7 +2975,7 @@ class BatchRunner:
         for source in order:
             if source == "embedded":
                 # Ensure no stale HTTP assignment remains.
-                worker.manual_proxy = ""
+                self._release_manual_proxy(worker, success=None, reason="switch_to_embedded")
                 if self._acquire_embedded_proxy(worker):
                     return True
                 errors.append(worker.last_log or "内嵌代理无可用节点")
@@ -2605,10 +2991,18 @@ class BatchRunner:
         self._log(f"W{worker.index:02d}", worker.last_log)
         return False
 
-    def _report_manual_proxy_outcome(self, worker: WorkerState, *, success: bool, reason: str = "") -> None:
+    def _release_manual_proxy(
+        self,
+        worker: WorkerState,
+        *,
+        success: Optional[bool] = None,
+        reason: str = "",
+    ) -> bool:
+        """Release a worker's HTTP route exactly once and attribute an outcome."""
         proxy = str(worker.manual_proxy or "").strip()
-        if not proxy:
-            return
+        token = str(worker.manual_proxy_lease_token or "").strip()
+        if not proxy and not token:
+            return False
         rotator = getattr(self, "_manual_proxy_rotator", None)
         if rotator is None:
             try:
@@ -2617,16 +3011,45 @@ class BatchRunner:
                 rotator = get_global_rotator()
             except Exception:
                 rotator = None
-        if rotator is None:
-            return
+        released = False
         try:
-            rotator.record_result(proxy, bool(success), reason=str(reason or "")[:120])
-            if success:
-                rotator.mark_good(proxy)
+            clean_reason = self._redact_proxy_text(reason)[:120]
+            if rotator is not None and token:
+                released = bool(
+                    rotator.release_lease(
+                        token,
+                        success=success,
+                        reason=clean_reason,
+                    )
+                )
+            elif rotator is not None and proxy:
+                # Legacy non-sticky rotation has no token, but clearing the
+                # assignment still makes duplicate exit-path calls idempotent.
+                if success is not None:
+                    rotator.record_result(proxy, bool(success), reason=clean_reason)
+                    if success:
+                        rotator.mark_good(proxy)
+                    else:
+                        rotator.mark_bad(proxy)
+                released = True
             else:
-                rotator.mark_bad(proxy)
+                released = bool(proxy or token)
         except Exception:
-            pass
+            released = False
+        finally:
+            worker.manual_proxy = ""
+            worker.manual_proxy_lease_token = ""
+        return released
+
+    def _report_manual_proxy_outcome(
+        self,
+        worker: WorkerState,
+        *,
+        success: bool,
+        reason: str = "",
+    ) -> None:
+        """Compatibility wrapper for callers using the pre-lease method name."""
+        self._release_manual_proxy(worker, success=success, reason=reason)
 
     def _worker_proxy_failure_blob(self, worker: WorkerState, reason_text: str = "") -> str:
         parts = [reason_text, worker.last_log]
@@ -2636,6 +3059,55 @@ class BatchRunner:
             except OSError:
                 pass
         return "\n".join(str(p) for p in parts if p)
+
+    @staticmethod
+    def _uses_independent_turnstile_route_for_failure(
+        worker: WorkerState,
+        failure_blob: str,
+    ) -> bool:
+        text_value = str(failure_blob or "").lower()
+        return bool(
+            worker.uses_independent_turnstile_proxy
+            and ("turnstile" in text_value or "captcha" in text_value)
+        )
+
+    def _isolate_static_proxy_lease(
+        self,
+        worker: WorkerState,
+        reason: str,
+    ) -> bool:
+        """Cooldown one runtime-bad static route and return its lease once."""
+        if not self._uses_static_proxy_leases() or not worker.manual_proxy_lease_token:
+            return False
+        proxy = str(worker.manual_proxy or "")
+        try:
+            index = self._static_proxy_entries.index(proxy)
+        except ValueError:
+            index = -1
+        released = self._release_manual_proxy(
+            worker,
+            success=False,
+            reason=self._redact_proxy_text(reason)[:120],
+        )
+        if not released:
+            return False
+        if index >= 0:
+            self._static_proxy_health[index] = {
+                "index": index,
+                "ok": False,
+                "reason": "runtime_proxy_failure",
+                "targets": {},
+            }
+        self._log(
+            "SYSTEM",
+            f"[Proxy] 静态 HTTP 槽位 "
+            f"#{index + 1 if index >= 0 else '?'} 运行期隔离并进入冷却",
+        )
+        return True
+
+    # Compatibility hook retained for callers of the previous indexed-slot API.
+    def _isolate_static_proxy_slot(self, worker: WorkerState, reason: str) -> bool:
+        return self._isolate_static_proxy_lease(worker, reason)
 
     def _maybe_retry_proxy_node(self, worker: WorkerState, reason_text: str = "") -> bool:
         """If failure looks proxy-related and retries remain, switch egress and respawn.
@@ -2650,8 +3122,20 @@ class BatchRunner:
             return False
         max_retries = max(1, int(self.plan.embedded_proxy_max_node_retries or 3))
         blob = self._worker_proxy_failure_blob(worker, reason_text)
+        if self._uses_independent_turnstile_route_for_failure(worker, blob):
+            # A dedicated solver route owns this failure.  Keep the registration
+            # route out of proxy retry/isolation attribution.
+            return False
         if not _looks_like_proxy_failure(blob):
             return False
+
+        if self._isolate_static_proxy_lease(worker, blob):
+            # This attempt diagnosed infrastructure rather than a business
+            # account result.  Refill creates a replacement logical task.
+            worker.last_log = "[Proxy] 静态 HTTP 路由已隔离，任务将重排"
+            self._mark_terminal(worker, "stopped")
+            self.started_tasks = max(0, int(self.started_tasks) - 1)
+            return True
 
         current_id = worker.proxy_node_id
         if current_id and current_id not in worker.tried_node_ids:
@@ -2714,6 +3198,11 @@ class BatchRunner:
             if worker.proxy_node_id:
                 self._release_embedded_proxy(worker, failed=False)
 
+    def _release_all_manual_proxies(self) -> None:
+        for worker in self.workers:
+            if worker.manual_proxy or worker.manual_proxy_lease_token:
+                self._release_manual_proxy(worker, success=None, reason="batch_finalize")
+
     def _spawn_one(self, worker: WorkerState, *, acquire_proxy: bool = True) -> bool:
         """Try to launch one worker process.
 
@@ -2728,10 +3217,27 @@ class BatchRunner:
                     worker.last_log = "没有可用代理"
                 # Do not mark failed / do not write failure counters.
                 return False
-        command = self._command_for(worker)
+        try:
+            command = self._command_for(worker)
+        except Exception as exc:
+            self._mark_terminal(worker, "failed")
+            worker.last_log = self._redact_proxy_text(f"构建工作进程命令失败: {exc}")
+            self._release_manual_proxy(
+                worker,
+                success=False,
+                reason="command_build_failed",
+            )
+            self._release_embedded_proxy(worker, failed=False, reason=worker.last_log)
+            self._record_failure(worker, worker.last_log)
+            self._log(f"W{worker.index:02d}", worker.last_log)
+            return False
         log_handle = None
         try:
             log_handle = worker.log_path.open("w", encoding="utf-8", buffering=1)
+            try:
+                os.chmod(worker.log_path, 0o600)
+            except OSError:
+                pass
             child_env = os.environ.copy()
             try:
                 cfg_for_env = _read_config(self.plan.config_path)
@@ -2755,9 +3261,14 @@ class BatchRunner:
                 bufsize=1,
                 env=child_env,
             )
-        except OSError as exc:
+        except Exception as exc:
             self._mark_terminal(worker, "failed")
-            worker.last_log = f"无法启动进程: {exc}"
+            worker.last_log = self._redact_proxy_text(f"无法启动进程: {exc}")
+            self._release_manual_proxy(
+                worker,
+                success=False,
+                reason="process_spawn_failed",
+            )
             self._release_embedded_proxy(worker, failed=True, reason=worker.last_log)
             self._record_failure(worker, worker.last_log)
             self._log(f"W{worker.index:02d}", worker.last_log)
@@ -2777,11 +3288,12 @@ class BatchRunner:
             assert process.stdout is not None
             try:
                 for line in iter(process.stdout.readline, ""):
+                    safe_line = self._redact_proxy_text(line)
                     try:
-                        log_handle.write(line)
+                        log_handle.write(safe_line)
                     except OSError:
                         pass
-                    self.events.put((worker.index, line))
+                    self.events.put((worker.index, safe_line))
             finally:
                 try:
                     process.stdout.close()
@@ -2845,6 +3357,24 @@ class BatchRunner:
         # Touch progress so next recovery waits another full window if spawn still fails.
         self._last_progress_at = now
 
+    def _available_spawn_slots(self) -> int:
+        """Return general worker slots, capped only for HTTP-only sticky runs."""
+        slots = max(0, int(self.plan.workers) - len(self.active))
+        if (
+            slots > 0
+            and self._uses_static_proxy_leases()
+            and not self.plan.embedded_proxy_enabled
+        ):
+            rotator = self._ensure_manual_proxy_rotator()
+            free_leases = 0
+            if rotator is not None:
+                try:
+                    free_leases = int(rotator.available_lease_count())
+                except Exception:
+                    free_leases = 0
+            slots = min(slots, max(0, free_leases))
+        return slots
+
     def _spawn_available(self) -> None:
         if self.done:
             return
@@ -2864,7 +3394,7 @@ class BatchRunner:
             return
 
         # Hard cap attempts in one tick: never create more than worker slots.
-        slots = max(0, int(self.plan.workers) - len(self.active))
+        slots = self._available_spawn_slots()
         attempts = 0
         while slots > 0 and attempts < int(self.plan.workers) and self._should_refill():
             if self._refill_pause_active():
@@ -2880,7 +3410,7 @@ class BatchRunner:
             if launched:
                 self.started_tasks += 1
                 self._last_progress_at = time.monotonic()
-                slots = max(0, int(self.plan.workers) - len(self.active))
+                slots = self._available_spawn_slots()
                 continue
             # Launch failed without becoming active.
             reason = worker.last_log or "启动失败"
@@ -2889,6 +3419,9 @@ class BatchRunner:
             resource_shortage = (
                 "没有可用的内嵌代理节点" in reason
                 or "内嵌代理已启用但管理器未就绪" in reason
+                or "无空闲健康租约" in reason
+                or "HTTP 代理池无有效条目" in reason
+                or "没有可用代理" in reason
             )
             if resource_shortage:
                 # Remove non-started worker so it does not pollute active/queues.
@@ -2904,7 +3437,7 @@ class BatchRunner:
                 self._mark_terminal(worker, "failed")
                 self._record_failure(worker, reason)
             # Still respect one-tick budget; avoid tight-loop storm.
-            slots = max(0, int(self.plan.workers) - len(self.active))
+            slots = self._available_spawn_slots()
             # brief pause after hard spawn errors too
             self._pause_refill(reason, seconds=min(DEFAULT_REFILL_PAUSE_SEC, 1.0))
             break
@@ -2931,7 +3464,7 @@ class BatchRunner:
                     self._record_failure(worker, msg)
                 self._log(f"W{worker_index:02d}", worker.last_log)
                 continue
-            worker.last_log = _safe_text(raw)
+            worker.last_log = _safe_text(self._redact_proxy_text(raw))
             self._log(f"W{worker_index:02d}", raw)
 
     def _check_processes(self) -> None:
@@ -2946,6 +3479,7 @@ class BatchRunner:
             if self.stopping:
                 self._mark_terminal(worker, "stopped")
                 worker.last_log = "已被操作者停止"
+                self._release_manual_proxy(worker, success=None, reason="batch_stopped")
                 self._release_embedded_proxy(worker, failed=False)
                 self._log(f"W{worker.index:02d}", worker.last_log)
             elif return_code == 0:
@@ -2968,11 +3502,18 @@ class BatchRunner:
                     continue
                 blob = self._worker_proxy_failure_blob(worker, reason)
                 category = classify_failure_text(blob)
-                self._report_manual_proxy_outcome(
-                    worker,
-                    success=False,
-                    reason=category if category != "unknown" else reason,
-                )
+                if self._uses_independent_turnstile_route_for_failure(worker, blob):
+                    self._release_manual_proxy(
+                        worker,
+                        success=None,
+                        reason="independent_turnstile_failure",
+                    )
+                else:
+                    self._report_manual_proxy_outcome(
+                        worker,
+                        success=False,
+                        reason=category if category != "unknown" else reason,
+                    )
                 self._mark_terminal(worker, "failed")
                 # Attribute proxy/TLS failure to the node only when it looks like egress/TLS.
                 self._release_embedded_proxy(
@@ -3015,6 +3556,7 @@ class BatchRunner:
                 f"批量完成: 成功={self.succeeded}, 失败={self.failed}, 账号数={self.account_count}",
             )
         finally:
+            self._release_all_manual_proxies()
             self._release_all_embedded_proxies()
             self._stop_shared_broker()
             self.phase = "done"
@@ -3050,6 +3592,7 @@ class BatchRunner:
             if worker.status == "queued":
                 self._mark_terminal(worker, "stopped")
                 worker.last_log = "因批次被停止而未启动"
+                self._release_manual_proxy(worker, success=None, reason="batch_stopped")
                 self._release_embedded_proxy(worker, failed=False)
                 self._log(f"W{worker.index:02d}", worker.last_log)
         for worker in list(self.workers):
@@ -3109,8 +3652,8 @@ class BatchRunner:
             "stopping": self.stopping,
             "phase": self.phase,
             "refill_paused": bool(self.refill_paused),
-            "refill_pause_reason": self.refill_pause_reason or "",
-            "pause_reason": self.refill_pause_reason or "",
+            "refill_pause_reason": self._redact_proxy_text(self.refill_pause_reason or ""),
+            "pause_reason": self._redact_proxy_text(self.refill_pause_reason or ""),
             "circuit_open": bool(self.circuit_open),
             "proxy_unhealthy": bool(self._proxy_unhealthy),
             "target_mode": getattr(self.plan, "target_mode", TARGET_MODE_COUNT),
@@ -3140,7 +3683,7 @@ class BatchRunner:
                 {
                     "index": worker.index,
                     "status": worker.status,
-                    "last_log": worker.last_log,
+                    "last_log": self._redact_proxy_text(worker.last_log),
                     "return_code": worker.return_code,
                 }
                 for worker in shown_workers
@@ -3152,6 +3695,10 @@ class BatchRunner:
         target = self.run_dir / "summary.json"
         try:
             target.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            try:
+                os.chmod(target, 0o600)
+            except OSError:
+                pass
         except OSError as exc:
             self._log("SYSTEM", f"无法写入 summary.json: {exc}")
 
