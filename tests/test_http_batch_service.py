@@ -1058,6 +1058,7 @@ class EmbeddedProxyBatchServiceTests(unittest.TestCase):
                 "vless://11111111-1111-1111-1111-111111111111@jp.example:443?security=tls#jp\n"
                 "hy2://secret@hy.example:8443?sni=hy.example#hy\n"
                 "anytls://pwd@any.example:443?sni=any.example#any\n"
+                "trojan://synthetic-secret@trojan.example:443?sni=edge.example#trojan\n"
                 "http://1.1.1.1:80\n"
             )
             with mock.patch(
@@ -1067,16 +1068,18 @@ class EmbeddedProxyBatchServiceTests(unittest.TestCase):
                 data = service.fetch_embedded_subscription_nodes(
                     urls=["https://example.test/sub"]
                 )
-            self.assertEqual(data.get("cached_node_count"), 3)
+            self.assertEqual(data.get("cached_node_count"), 4)
             self.assertEqual(data.get("cached_vless_count"), 1)
             self.assertEqual((data.get("cached_by_protocol") or {}).get("hysteria2"), 1)
             self.assertEqual((data.get("cached_by_protocol") or {}).get("anytls"), 1)
+            self.assertEqual((data.get("cached_by_protocol") or {}).get("trojan"), 1)
             cache_path = service.embedded_node_cache_path()
             self.assertTrue(cache_path.is_file())
             text = cache_path.read_text(encoding="utf-8")
             self.assertIn("vless://11111111-1111-1111-1111-111111111111@jp.example:443", text)
             self.assertIn("hy2://secret@hy.example:8443", text)
             self.assertIn("anytls://pwd@any.example:443", text)
+            self.assertIn("trojan://synthetic-secret@trojan.example:443", text)
             disk = json.loads((Path(d) / "config.json").read_text(encoding="utf-8"))
             self.assertEqual(disk.get("proxy_subscription_urls"), ["https://example.test/sub"])
 

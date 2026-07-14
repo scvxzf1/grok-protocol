@@ -178,12 +178,61 @@ class ConfigGenTests(unittest.TestCase):
         self.assertEqual(cfg["listeners"][0]["port"], 29000)
         self.assertTrue(nodes[0].local_http.startswith("http://127.0.0.1:"))
 
+    def test_build_mihomo_config_trojan(self):
+        from embedded_proxy_manager import (
+            NodeSlot,
+            build_mihomo_config,
+            is_embedded_share_link,
+            parse_embedded_node,
+            parse_trojan_node,
+        )
+
+        raw = (
+            "trojan://synthetic%2Dsecret@trojan.example:443?"
+            "sni=edge.example&skip-cert-verify=1&udp=1&ip-version=ipv4#trojan-a"
+        )
+        parsed = parse_trojan_node(raw)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["password"], "synthetic-secret")
+        self.assertEqual(parsed["server"], "trojan.example")
+        self.assertEqual(parsed["params"]["ip-version"], "ipv4")
+        self.assertEqual(parse_embedded_node(raw)["protocol"], "trojan")
+        self.assertTrue(is_embedded_share_link(raw))
+        self.assertIsNone(parse_trojan_node("trojan://trojan.example:443"))
+
+        node = NodeSlot(
+            id="trojan-1",
+            name=parsed["name"],
+            server=parsed["server"],
+            port=parsed["port"],
+            protocol="trojan",
+            local_http="",
+            password=parsed["password"],
+            params=parsed["params"],
+            raw=parsed["raw"],
+        )
+        cfg = build_mihomo_config([node], listen_host="127.0.0.1", base_port=29500)
+        self.assertEqual(len(cfg["proxies"]), 1)
+        proxy = cfg["proxies"][0]
+        self.assertEqual(proxy["type"], "trojan")
+        self.assertEqual(proxy["password"], "synthetic-secret")
+        self.assertEqual(proxy["sni"], "edge.example")
+        self.assertTrue(proxy["skip-cert-verify"])
+        self.assertTrue(proxy["udp"])
+        self.assertEqual(proxy["ip-version"], "ipv4")
+        self.assertEqual(cfg["listeners"][0]["port"], 29500)
+        self.assertEqual(node.local_http, "http://127.0.0.1:29500")
+
 
 class LifecycleTests(unittest.TestCase):
     def test_find_binary_prefers_explicit_then_path(self):
         from embedded_proxy_manager import find_mihomo_binary
 
-        self.assertEqual(find_mihomo_binary("/usr/bin/verge-mihomo"), "/usr/bin/verge-mihomo")
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "verge-mihomo"
+            binary.write_bytes(b"synthetic executable")
+            binary.chmod(0o755)
+            self.assertEqual(find_mihomo_binary(str(binary)), str(binary.resolve()))
 
     def test_probe_marks_healthy(self):
         from embedded_proxy_manager import EmbeddedProxyConfig, EmbeddedProxyManager, NodeSlot
@@ -240,19 +289,21 @@ class LifecycleTests(unittest.TestCase):
                 params={"security": "tls", "sni": "jp.example", "type": "tcp"},
             )
         ]
-        cfg = EmbeddedProxyConfig(
-            binary_path="/usr/bin/verge-mihomo",
-            base_port=28000,
-            listen_host="127.0.0.1",
-        )
-        m = EmbeddedProxyManager(cfg)
-
         fake_proc = mock.Mock()
         fake_proc.poll.return_value = None
         fake_proc.pid = 4242
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            binary = root / "verge-mihomo"
+            binary.write_bytes(b"synthetic executable")
+            binary.chmod(0o755)
+            cfg = EmbeddedProxyConfig(
+                binary_path=str(binary),
+                base_port=28000,
+                listen_host="127.0.0.1",
+            )
+            m = EmbeddedProxyManager(cfg)
             with mock.patch.object(m, "_project_root", return_value=root):
                 with mock.patch("embedded_proxy_manager.subprocess.Popen", return_value=fake_proc) as popen:
                     with mock.patch.object(m, "_wait_port_open", return_value=True):
@@ -264,9 +315,10 @@ class LifecycleTests(unittest.TestCase):
             self.assertTrue(info.get("running"))
             popen.assert_called_once()
             args = popen.call_args[0][0]
-            self.assertEqual(args[0], "/usr/bin/verge-mihomo")
+            self.assertEqual(args[0], str(binary.resolve()))
             self.assertIn("-f", args)
             self.assertIn("-d", args)
+            m.stop()
 
 
 class CooldownReviveTests(unittest.TestCase):
@@ -308,4 +360,3 @@ class CooldownReviveTests(unittest.TestCase):
         mgr._running = True
         st = mgr.status()
         self.assertEqual(st["healthy"], 1)
-

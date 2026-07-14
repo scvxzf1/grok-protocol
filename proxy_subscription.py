@@ -3,7 +3,7 @@
 
 Supports:
   - base64 / plain text subscription bodies
-  - Clash YAML (`proxies:` list) including type=http/socks5/vless/hysteria2/anytls/...
+  - Clash YAML (`proxies:` list) including type=http/socks5/vless/hysteria2/anytls/trojan/...
   - http(s)://user:pass@host:port
   - socks5://user:pass@host:port
   - host:port:user:pass
@@ -406,6 +406,7 @@ def parse_share_link(raw: str) -> Optional[ParsedNode]:
         body = line[len("trojan://"):]
         main, _, _frag = body.partition("#")
         cred, _, hostport = main.partition("@")
+        password = unquote(cred.split("?", 1)[0])
         host, port = hostport, 0
         if ":" in hostport:
             host, port_s = hostport.rsplit(":", 1)
@@ -419,10 +420,10 @@ def parse_share_link(raw: str) -> Optional[ParsedNode]:
             scheme="trojan",
             host=host,
             port=port,
-            password=cred,
+            password=password,
             name=name,
             usable_http=False,
-            note="Trojan 需本地客户端承接，不能直接写入 HTTP 代理池",
+            note="Trojan 需内嵌 mihomo / 本地客户端承接，不能直接写入 HTTP 代理池",
         )
 
     if lower.startswith("ss://"):
@@ -675,6 +676,82 @@ def _clash_proxy_to_node(item: object) -> Optional[ParsedNode]:
             note="Hysteria2 需内嵌 mihomo / 本地客户端承接，不能直接写入 HTTP 代理池",
         )
 
+    if ptype == "trojan":
+        if not server or port <= 0:
+            return None
+        secret = password or uuid
+        if not secret:
+            return None
+        params: Dict[str, object] = {}
+        sni = _as_text(item.get("sni") or item.get("servername") or "")
+        if sni:
+            params["sni"] = sni
+        network = _as_text(item.get("network") or "")
+        if network:
+            params["type"] = network
+        if "skip-cert-verify" in item or "skip_cert_verify" in item or "insecure" in item:
+            insecure = item.get(
+                "insecure", item.get("skip-cert-verify", item.get("skip_cert_verify"))
+            )
+            params["skip-cert-verify"] = _as_boolish(insecure)
+        if "udp" in item:
+            params["udp"] = _as_boolish(item.get("udp"))
+        ip_version = _as_text(item.get("ip-version") or item.get("ip_version") or "")
+        if ip_version:
+            params["ip-version"] = ip_version
+        alpn = item.get("alpn")
+        if isinstance(alpn, (list, tuple)):
+            alpn_text = ",".join(str(x).strip() for x in alpn if str(x).strip())
+        else:
+            alpn_text = _as_text(alpn)
+        if alpn_text:
+            params["alpn"] = alpn_text
+        client_fp = _as_text(
+            item.get("client-fingerprint")
+            or item.get("client_fingerprint")
+            or item.get("fp")
+            or ""
+        )
+        if client_fp:
+            params["client-fingerprint"] = client_fp
+        if network == "ws":
+            ws = item.get("ws-opts") or item.get("ws_opts") or {}
+            if isinstance(ws, dict):
+                params["path"] = _as_text(ws.get("path") or item.get("path") or "/") or "/"
+                headers = ws.get("headers") if isinstance(ws.get("headers"), dict) else {}
+                host_header = _as_text(
+                    (headers or {}).get("Host")
+                    or (headers or {}).get("host")
+                    or item.get("host")
+                    or ""
+                )
+                if host_header:
+                    params["host"] = host_header
+        elif network == "grpc":
+            grpc = item.get("grpc-opts") or item.get("grpc_opts") or {}
+            if isinstance(grpc, dict):
+                service = _as_text(
+                    grpc.get("grpc-service-name") or grpc.get("serviceName") or ""
+                )
+                if service:
+                    params["serviceName"] = service
+        query = _clash_query(params)
+        raw = f"trojan://{quote(secret, safe='')}@{server}:{port}"
+        if query:
+            raw = f"{raw}?{query}"
+        if name:
+            raw = f"{raw}#{quote(name, safe='')}"
+        return ParsedNode(
+            raw=raw,
+            scheme="trojan",
+            host=server,
+            port=port,
+            password=secret,
+            name=name,
+            usable_http=False,
+            note="Trojan 需内嵌 mihomo / 本地客户端承接，不能直接写入 HTTP 代理池",
+        )
+
     if ptype == "anytls":
         if not server or port <= 0:
             return None
@@ -905,7 +982,7 @@ def import_proxy_subscriptions(
         merged.warnings.append(
             "订阅已拉取，但没有可直接用于注册机的 HTTP 代理节点。"
             "当前节点多为 VLESS/Hysteria2/AnyTLS/VMess/SS/Trojan，"
-            "可走内嵌 mihomo（VLESS/Hysteria2/AnyTLS）或本地客户端 HTTP 入口。"
+            "可走内嵌 mihomo（VLESS/Hysteria2/AnyTLS/Trojan）或本地客户端 HTTP 入口。"
         )
     merged.usable_pool_lines = list(pool)
     merged.pool_lines = header + pool

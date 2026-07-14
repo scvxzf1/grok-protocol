@@ -714,7 +714,7 @@ PROXY_POOL_SOURCE_LABELS = {
     PROXY_POOL_SOURCE_MANUAL: "手动维护",
     PROXY_POOL_SOURCE_SUBSCRIPTION: "订阅导入",
 }
-# 内嵌 mihomo 节点缓存（VLESS/Hysteria2/AnyTLS；与订阅拉取解耦；启动只读此文件）
+# 内嵌 mihomo 节点缓存（VLESS/Hysteria2/AnyTLS/Trojan；与订阅拉取解耦；启动只读此文件）
 EMBEDDED_VLESS_CACHE_REL = Path(".embedded_mihomo") / "vless_nodes.txt"
 EMBEDDED_NODE_CACHE_REL = Path(".embedded_mihomo") / "nodes.txt"
 
@@ -2912,7 +2912,7 @@ class BatchRunner:
         """True when HTTP proxy pool (proxies.txt) is configured for this run.
 
         Can be combined with embedded mihomo: registration workers may use either
-        embedded VLESS/Hy2/AnyTLS nodes or subscription HTTP proxies.
+        embedded VLESS/Hy2/AnyTLS/Trojan nodes or subscription HTTP proxies.
         """
         mode = str(self.plan.proxy_mode or "").strip().lower()
         if mode in {"none", "direct"}:
@@ -5571,6 +5571,7 @@ class BatchService:
             + int(schemes.get("hysteria2") or 0)
             + int(schemes.get("hy2") or 0)
             + int(schemes.get("anytls") or 0)
+            + int(schemes.get("trojan") or 0)
         )
         if _as_bool(cfg.get("embedded_proxy_enabled")):
             if embedded_candidate_n > 0 and not result.usable_pool_lines:
@@ -5605,7 +5606,7 @@ class BatchService:
             cfg["proxy"] = local_http
         elif not result.usable_pool_lines and embedded_enabled and embedded_candidate_n > 0:
             data.setdefault("warnings", []).append(
-                f"订阅含 {embedded_candidate_n} 个可内嵌节点（VLESS/Hysteria2/AnyTLS）。"
+                f"订阅含 {embedded_candidate_n} 个可内嵌节点（VLESS/Hysteria2/AnyTLS/Trojan）。"
                 "HTTP 代理池不可直接使用它们；请到左列“内嵌 mihomo”先「拉取订阅节点」再「启动/重载」。"
             )
             data["vless_for_embedded"] = True
@@ -5667,7 +5668,7 @@ class BatchService:
         return Path(self.root_dir) / EMBEDDED_VLESS_CACHE_REL
 
     def embedded_node_cache_path(self) -> Path:
-        """Primary cache for embedded nodes (vless/hysteria2/anytls)."""
+        """Primary cache for embedded nodes (vless/hysteria2/anytls/trojan)."""
         return Path(self.root_dir) / EMBEDDED_NODE_CACHE_REL
 
     def _embedded_proxy_cfg_from_settings(self):
@@ -5698,7 +5699,7 @@ class BatchService:
             parsed = None
             if raw_line:
                 parsed = parse_embedded_node(raw_line)
-            if not parsed and scheme in {"vless", "hysteria2", "anytls"}:
+            if not parsed and scheme in {"vless", "hysteria2", "anytls", "trojan"}:
                 # Fallback: reconstruct is not available without raw; skip incomplete inventory.
                 continue
             if not parsed:
@@ -5734,7 +5735,7 @@ class BatchService:
         path.parent.mkdir(parents=True, exist_ok=True)
         lines = [
             f"# embedded node cache written_at={time.strftime('%Y-%m-%dT%H:%M:%S')}",
-            f"# protocols=vless,hysteria2,anytls",
+            f"# protocols=vless,hysteria2,anytls,trojan",
             f"# urls={', '.join(urls or [])}",
             f"# count={len(slots)}",
         ]
@@ -5795,6 +5796,8 @@ class BatchService:
                 key = "hysteria2"
             elif lower.startswith("anytls://"):
                 key = "anytls"
+            elif lower.startswith("trojan://"):
+                key = "trojan"
             else:
                 key = "other"
             by_proto[key] = by_proto.get(key, 0) + 1
@@ -5942,7 +5945,7 @@ class BatchService:
         all_slots = self._embedded_slots_from_nodes(result.nodes or [], max_nodes=0)
         if not all_slots:
             raise TuiConfigError(
-                "订阅中没有可用的内嵌节点（VLESS / Hysteria2 / AnyTLS），无法缓存内嵌池"
+                "订阅中没有可用的内嵌节点（VLESS / Hysteria2 / AnyTLS / Trojan），无法缓存内嵌池"
             )
         path = self._write_embedded_node_cache(all_slots, urls=url_list)
         _apply_subscription_urls_to_config(cfg, url_list)
@@ -6013,6 +6016,8 @@ class BatchService:
                     self.scheme = "hysteria2"
                 elif lower.startswith("anytls://"):
                     self.scheme = "anytls"
+                elif lower.startswith("trojan://"):
+                    self.scheme = "trojan"
                 else:
                     self.scheme = ""
                 self.raw = raw_line
