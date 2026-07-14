@@ -25,6 +25,16 @@ from src.models import SolveResult
 
 
 class CliDefaultsTests(unittest.TestCase):
+    def test_solve_cli_has_no_parent_proxy_option(self):
+        parser = build_parser()
+        solve_parser = next(
+            action.choices["solve"]
+            for action in parser._actions
+            if isinstance(getattr(action, "choices", None), dict)
+            and "solve" in action.choices
+        )
+        self.assertNotIn("parent_proxy", {action.dest for action in solve_parser._actions})
+
     def test_public_json_masks_proxy_while_cli_keeps_internal_raw_value(self):
         raw_proxy = "http://proxy-user:proxy-password@192.0.2.10:8080"
         result = SolveResult(ok=True, token="token", proxy=raw_proxy)

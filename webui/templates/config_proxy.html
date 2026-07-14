@@ -87,7 +87,6 @@
           </select>
           <input type="checkbox" name="embedded_proxy_enabled" id="embeddedProxyEnabled" />
           <input name="proxy_file" type="text" value="proxies.txt" />
-          <input name="proxy_parent" type="text" />
           <input name="local_proxy_port" type="number" value="17890" />
           <input type="checkbox" name="proxy_random" checked />
           <input type="checkbox" name="proxy_rotate_session" />
@@ -229,10 +228,6 @@
             <label>
               <span class="field-title">失败换出口次数</span>
               <input id="proxyRetriesVisible" type="number" min="0" max="20" />
-            </label>
-            <label>
-              <span class="field-title">上游父代理</span>
-              <input id="proxyParentVisible" type="text" />
             </label>
             <label>
               <span class="field-title">本地转发端口</span>

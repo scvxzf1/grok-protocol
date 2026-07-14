@@ -305,7 +305,6 @@ DEFAULT_CONFIG = {
     "proxy_file": "proxies.txt",
     "proxy_random": True,
     "proxy_rotate_session": True,
-    "proxy_parent": "",
     "local_proxy_port": 17890,
     "proxy_preflight_enabled": True,
     "proxy_preflight_url": "https://api.ipify.org?format=json",
@@ -353,6 +352,8 @@ def load_config():
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 loaded = json.load(f)
+            if isinstance(loaded, dict):
+                loaded.pop("proxy_parent", None)
             config = {**DEFAULT_CONFIG, **loaded}
         except Exception:
             config = DEFAULT_CONFIG.copy()
@@ -880,12 +881,10 @@ def get_runtime_proxy_url(log_callback=None):
         preferred = int(config.get("local_proxy_port", 17890) or 17890)
         worker_id = int(config.get("_worker_id", 0) or 0)
         instance_key = f"worker-{worker_id}" if worker_id > 0 else "default"
-        parent_raw = str(config.get("proxy_parent", "") or "").strip()
         effective, used_fwd = ensure_local_forwarder(
             raw,
             preferred_local_port=preferred,
             instance_key=instance_key,
-            parent_proxy_raw=parent_raw,
         )
     except Exception as exc:
         if log_callback:
@@ -896,20 +895,14 @@ def get_runtime_proxy_url(log_callback=None):
         except Exception:
             return raw
     if used_fwd and log_callback:
-        key = f"{effective}|{raw}|{config.get('proxy_parent', '')}"
+        key = f"{effective}|{raw}"
         if key != _last_forwarder_log_key:
             try:
                 up = parse_proxy_string(raw)
                 up_desc = f"{up.host}:{up.port}" if up else _mask_proxy_for_log(raw)
             except Exception:
                 up_desc = _mask_proxy_for_log(raw)
-            parent_hint = str(config.get("proxy_parent", "") or "").strip()
-            if parent_hint:
-                log_callback(
-                    f"[*] 已启动链式本机代理 {effective} -> {_mask_proxy_for_log(parent_hint)} -> {up_desc}"
-                )
-            else:
-                log_callback(f"[*] 已启动本机代理转发 {effective} -> {up_desc}")
+            log_callback(f"[*] 已启动本机代理转发 {effective} -> {up_desc}")
             _last_forwarder_log_key = key
     return effective
 

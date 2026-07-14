@@ -9,12 +9,6 @@ Why:
 Supports:
   - HTTP CONNECT (HTTPS sites)
   - plain HTTP proxy requests
-
-An optional parent HTTP proxy can be used for chained routing.  In that mode
-the local forwarder first opens a CONNECT tunnel through the parent to the
-configured upstream proxy, then speaks the normal upstream proxy protocol
-inside that tunnel.  This is useful when an authenticated residential/upstream
-proxy must itself be reached through a local proxy such as Clash.
 """
 
 from __future__ import annotations
@@ -159,9 +153,6 @@ def _parse_request_head(head: bytes) -> Tuple[str, str, str, dict]:
 
 class _ProxyHandler(socketserver.BaseRequestHandler):
     upstream: UpstreamProxy = None  # type: ignore
-    # When set, TCP traffic to ``upstream`` is tunneled through this HTTP
-    # proxy before the forwarder sends its own CONNECT/plain HTTP request.
-    parent_proxy: Optional[UpstreamProxy] = None
 
     def handle(self):
         client: socket.socket = self.request
@@ -187,52 +178,11 @@ class _ProxyHandler(socketserver.BaseRequestHandler):
                 pass
 
     def _open_upstream(self) -> socket.socket:
-        """Open a socket to the upstream proxy, optionally through a parent.
-
-        With a parent configured, this performs::
-
-            local forwarder --CONNECT--> parent HTTP proxy --TCP tunnel--> upstream proxy
-
-        The returned socket is therefore indistinguishable from a direct
-        socket to the upstream.  Parent credentials are used only for this
-        outer CONNECT; upstream credentials continue to be added by
-        ``_handle_connect`` / ``_handle_http`` inside the resulting tunnel.
-        """
+        """Open a direct socket to the authenticated upstream proxy."""
         up = self.upstream
-        parent = self.parent_proxy
-        if parent is None:
-            sock = socket.create_connection((up.host, up.port), timeout=CONNECT_TIMEOUT)
-            sock.settimeout(CONNECT_TIMEOUT)
-            return sock
-
-        # Establish the outer HTTP CONNECT tunnel first.  The parent may have
-        # its own Basic credentials, which must not be sent to the upstream.
-        sock = socket.create_connection((parent.host, parent.port), timeout=CONNECT_TIMEOUT)
+        sock = socket.create_connection((up.host, up.port), timeout=CONNECT_TIMEOUT)
         sock.settimeout(CONNECT_TIMEOUT)
-        target = f"{up.host}:{up.port}"
-        try:
-            req = (
-                f"CONNECT {target} HTTP/1.1\r\n"
-                f"Host: {target}\r\n"
-                f"{self._auth_header_lines(parent)}"
-                f"Proxy-Connection: keep-alive\r\n"
-                f"\r\n"
-            )
-            sock.sendall(req.encode("iso-8859-1"))
-            resp = _recv_until(sock)
-            status_line = resp.split(b"\r\n", 1)[0]
-            if b" 200 " not in status_line and not status_line.endswith(b" 200"):
-                safe_status = status_line.decode("iso-8859-1", errors="replace")[:200]
-                raise OSError(
-                    f"parent proxy CONNECT to upstream {target} failed: {safe_status or 'empty response'}"
-                )
-            return sock
-        except Exception:
-            try:
-                sock.close()
-            except Exception:
-                pass
-            raise
+        return sock
 
     @staticmethod
     def _auth_header_lines(proxy: Optional[UpstreamProxy] = None) -> str:
@@ -374,10 +324,6 @@ class LocalProxyForwarder:
             proxy requests.  Its optional credentials are injected locally.
         local_host: Bind host for the no-auth local endpoint.
         local_port: Bind port (``0`` chooses a free port).
-        parent_proxy: Optional HTTP parent proxy used to reach ``upstream``.
-            The forwarder first sends ``CONNECT upstream.host:upstream.port``
-            to this parent, then sends the normal upstream request through the
-            tunnel.  Parent and upstream credentials are kept separate.
     """
 
     def __init__(
@@ -385,12 +331,10 @@ class LocalProxyForwarder:
         upstream: UpstreamProxy,
         local_host: str = DEFAULT_LOCAL_HOST,
         local_port: int = 0,
-        parent_proxy: Optional[UpstreamProxy] = None,
     ):
         self.upstream = upstream
         self.local_host = local_host
         self.local_port = int(local_port or 0)
-        self.parent_proxy = parent_proxy
         self._server: Optional[ThreadingTCPServer] = None
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
@@ -427,7 +371,7 @@ class LocalProxyForwarder:
             handler = type(
                 "BoundProxyHandler",
                 (_ProxyHandler,),
-                {"upstream": self.upstream, "parent_proxy": self.parent_proxy},
+                {"upstream": self.upstream},
             )
             try:
                 server = ThreadingTCPServer((self.local_host, self.local_port), handler)
@@ -515,7 +459,7 @@ class LocalProxyForwarder:
 
 # process-level forwarder pool (supports concurrent workers)
 _FORWARDERS: dict = {}  # instance_key -> LocalProxyForwarder
-_FORWARDER_UPSTREAM_KEYS: dict = {}  # instance_key -> (upstream, parent) route key
+_FORWARDER_UPSTREAM_KEYS: dict = {}  # instance_key -> upstream route key
 _FORWARDER_LOCK = threading.Lock()
 _DEFAULT_INSTANCE = "default"
 
@@ -538,22 +482,16 @@ def ensure_local_forwarder(
     proxy_raw: str,
     preferred_local_port: int = DEFAULT_LOCAL_PORT,
     instance_key: str = _DEFAULT_INSTANCE,
-    parent_proxy_raw: str = "",
 ) -> Tuple[str, bool]:
-    """Ensure local forwarder for an authenticated proxy and optional parent.
+    """Ensure a local forwarder for an authenticated HTTP proxy.
 
     Returns: (effective_proxy_url, used_forwarder)
       - if proxy empty: ("", False)
-      - if proxy has no auth and no parent: (normalized upstream url, False)
-      - if proxy has auth or a parent: (http://127.0.0.1:port, True)
+      - if proxy has no auth: (normalized upstream url, False)
+      - if proxy has auth: (http://127.0.0.1:port, True)
 
     instance_key: concurrent workers should pass distinct keys (e.g. worker-0)
     so they do not stomp each other's forwarders.
-
-    parent_proxy_raw: Optional HTTP proxy URL/string for a chained route.  The
-    local forwarder CONNECTs to the selected upstream through this proxy first,
-    e.g. ``http://127.0.0.1:7890`` for a local Clash HTTP listener.  Parent
-    credentials are supported and are used only on the outer CONNECT.
     """
     raw = str(proxy_raw or "").strip()
     ikey = str(instance_key or _DEFAULT_INSTANCE)
@@ -566,10 +504,7 @@ def ensure_local_forwarder(
         stop_local_forwarder(instance_key=ikey)
         return "", False
 
-    parent_raw = str(parent_proxy_raw or "").strip()
-    parent = parse_proxy_string(parent_raw) if parent_raw else None
-
-    if not up.has_auth and parent is None:
+    if not up.has_auth:
         # no auth needed; browser can use upstream directly
         stop_local_forwarder(instance_key=ikey)
         return f"http://{up.host}:{up.port}", False
@@ -579,10 +514,6 @@ def ensure_local_forwarder(
         up.port,
         up.username,
         up.password,
-        parent.host if parent else "",
-        parent.port if parent else 0,
-        parent.username if parent else "",
-        parent.password if parent else "",
     )
     with _FORWARDER_LOCK:
         existing = _FORWARDERS.get(ikey)
@@ -613,7 +544,6 @@ def ensure_local_forwarder(
                 up,
                 local_host=DEFAULT_LOCAL_HOST,
                 local_port=port,
-                parent_proxy=parent,
             )
             url = fwd.start()
         except LocalProxyBindError:
@@ -621,7 +551,6 @@ def ensure_local_forwarder(
                 up,
                 local_host=DEFAULT_LOCAL_HOST,
                 local_port=0,
-                parent_proxy=parent,
             )
             url = fwd.start()
         _FORWARDERS[ikey] = fwd

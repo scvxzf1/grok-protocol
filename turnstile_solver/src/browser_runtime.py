@@ -315,7 +315,6 @@ class BrowserAffinity:
     """Only process-level browser settings belong in this immutable key."""
 
     proxy_digest: str
-    parent_proxy_digest: str
     user_agent_digest: str
     accept_language_digest: str
     ua_policy: str
@@ -332,7 +331,6 @@ class BrowserAffinity:
         cls,
         *,
         proxy: str,
-        parent_proxy: str,
         user_agent: str,
         headless: bool,
         locale: str,
@@ -347,7 +345,6 @@ class BrowserAffinity:
         language = str(accept_language or "").strip()
         return cls(
             proxy_digest=_digest_secret(proxy),
-            parent_proxy_digest=_digest_secret(parent_proxy),
             user_agent_digest=hashlib.sha256(ua.encode("utf-8")).hexdigest()[:16] if ua else "native",
             accept_language_digest=(
                 hashlib.sha256(language.encode("utf-8")).hexdigest()[:16] if language else "native"
@@ -367,7 +364,6 @@ class BrowserAffinity:
         raw = "|".join(
             (
                 self.proxy_digest,
-                self.parent_proxy_digest,
                 self.user_agent_digest,
                 self.accept_language_digest,
                 self.ua_policy,
@@ -393,14 +389,12 @@ class BrowserSlot:
         *,
         affinity: BrowserAffinity,
         upstream_proxy: str,
-        parent_proxy: str,
         user_agent: str,
     ):
         self.config = config
         self.worker = worker
         self.affinity = affinity
         self.upstream_proxy_raw = str(upstream_proxy or "")
-        self.parent_proxy_raw = str(parent_proxy or "")
         self.user_agent = str(user_agent or "").strip()
         self.slot_id = uuid.uuid4().hex[:12]
         self.browser = None
@@ -575,7 +569,6 @@ class BrowserSlot:
         try:
             self.browser_proxy, self.upstream_proxy, self.forwarder_instance = prepare_browser_proxy(
                 self.upstream_proxy_raw,
-                parent_proxy=self.parent_proxy_raw,
                 preferred_local_port=0,
                 instance_key=f"ts-slot-{self.slot_id}",
             )
@@ -684,7 +677,6 @@ class BrowserSlot:
         locale = self.config.locale or accept_language.split(",", 1)[0].split(";", 1)[0].strip()
         expected = BrowserAffinity.build(
             proxy=request.proxy or self.config.proxy,
-            parent_proxy=str((request.metadata or {}).get("parent_proxy") or self.config.parent_proxy or ""),
             user_agent=request.user_agent or self.config.user_agent,
             headless=bool(request.headless or self.config.headless),
             locale=locale,
@@ -917,15 +909,13 @@ class PersistentBrowserPool:
             self.stats.recycle_reasons[reason] = self.stats.recycle_reasons.get(reason, 0) + 1
             self._refresh_stats_locked()
 
-    def _request_parts(self, request: SolveRequest) -> Tuple[BrowserAffinity, str, str, str]:
+    def _request_parts(self, request: SolveRequest) -> Tuple[BrowserAffinity, str, str]:
         proxy = str(request.proxy or self.config.proxy or "").strip()
-        parent = str((request.metadata or {}).get("parent_proxy") or self.config.parent_proxy or "").strip()
         ua = str(request.user_agent or self.config.user_agent or "").strip()
         accept_language = str(request.accept_language or self.config.accept_language or "").strip()
         locale = self.config.locale or accept_language.split(",", 1)[0].split(";", 1)[0].strip()
         affinity = BrowserAffinity.build(
             proxy=proxy,
-            parent_proxy=parent,
             user_agent=ua,
             headless=bool(request.headless or self.config.headless),
             locale=locale,
@@ -936,10 +926,10 @@ class PersistentBrowserPool:
             expected_browser_major=request.expected_browser_major,
             no_sandbox=self.config.resolved_no_sandbox(),
         )
-        return affinity, proxy, parent, ua
+        return affinity, proxy, ua
 
     def _acquire(self, request: SolveRequest, deadline: float) -> Optional[BrowserSlot]:
-        affinity, proxy, parent, ua = self._request_parts(request)
+        affinity, proxy, ua = self._request_parts(request)
         waiter_counted = False
         try:
             while True:
@@ -990,7 +980,6 @@ class PersistentBrowserPool:
                         self.worker,
                         affinity=affinity,
                         upstream_proxy=proxy,
-                        parent_proxy=parent,
                         user_agent=ua,
                     )
                     try:

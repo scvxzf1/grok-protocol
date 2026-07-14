@@ -35,7 +35,6 @@ class HttpTuiLauncherTests(unittest.TestCase):
                         "proxy": "",
                         "proxy_file": "",
                         "proxy_random": False,
-                        "proxy_parent": "",
                     }
                 ),
                 encoding="utf-8",
@@ -86,7 +85,6 @@ class HttpTuiLauncherTests(unittest.TestCase):
                         "proxy": "",
                         "proxy_file": "",
                         "proxy_random": False,
-                        "proxy_parent": "",
                     }
                 ),
                 encoding="utf-8",
@@ -253,7 +251,6 @@ print('[HTTP] fake backend completed', flush=True)
                         "proxy": "",
                         "proxy_file": "",
                         "proxy_random": False,
-                        "proxy_parent": "",
                     }
                 ),
                 encoding="utf-8",

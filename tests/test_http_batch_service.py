@@ -201,6 +201,37 @@ class RunHistoryTests(unittest.TestCase):
 
 
 class ConfigCenterTests(unittest.TestCase):
+    def test_retired_parent_proxy_is_not_exposed_or_persisted(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            cfg = root / "config.json"
+            cfg.write_text(
+                json.dumps(
+                    {
+                        "email_provider": "yyds",
+                        "turnstile_provider": "local",
+                        "tui_proxy_mode": "direct",
+                        "proxy": "http://127.0.0.1:8080",
+                        "proxy_parent": "http://127.0.0.1:7890",
+                        "register_count": 1,
+                        "concurrent_workers": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            service = svc.BatchService(config_path=cfg, root_dir=root)
+            data = service.get_config_center()
+            self.assertNotIn("proxy_parent", data["fields"])
+            plan = svc.build_plan(service.settings)
+            self.assertNotIn("--proxy-parent", plan.proxy_args)
+
+            service.update_config_center(
+                {"fields": {"proxy_parent": "http://127.0.0.1:7891"}}
+            )
+            disk = json.loads(cfg.read_text(encoding="utf-8"))
+            self.assertNotIn("proxy_parent", disk)
+
     def test_config_center_masks_and_updates_proxy_pool(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)

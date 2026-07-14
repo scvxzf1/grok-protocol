@@ -700,6 +700,7 @@ def apply_egress_mode_to_config(cfg: Dict[str, object], egress_mode: object) -> 
     cfg["proxy_mode"] = proxy_mode
     cfg["tui_proxy_mode"] = proxy_mode
     cfg["embedded_proxy_enabled"] = bool(embedded)
+    cfg.pop("proxy_parent", None)
     return mode
 
 
@@ -1012,6 +1013,9 @@ def _read_config(path: Path) -> Dict[str, object]:
         raise TuiConfigError(f"无法读取配置 JSON: {exc}") from exc
     if not isinstance(data, dict):
         raise TuiConfigError("配置 JSON 根节点必须是对象")
+    # Retire the former chained-egress option.  Keeping it out of the in-memory
+    # config also removes it the next time the configuration is persisted.
+    data.pop("proxy_parent", None)
     return data
 
 
@@ -1328,9 +1332,6 @@ def _resolve_proxy_args(settings: Settings) -> Tuple[str, List[str]]:
     elif mode != "none":
         raise TuiConfigError(f"不支持的代理模式: {mode}")
 
-    parent_proxy = str(config.get("proxy_parent") or "").strip()
-    if mode != "none" and parent_proxy:
-        args.extend(["--proxy-parent", parent_proxy])
     return mode, args
 
 
@@ -2212,7 +2213,6 @@ class BatchRunner:
                 proxy_raw,
                 preferred_local_port=0,
                 instance_key=forwarder_key,
-                parent_proxy_raw="",
             )
         except Exception as exc:
             try:
@@ -2432,15 +2432,8 @@ class BatchRunner:
         if self.plan.embedded_proxy_enabled and worker.proxy_local_http:
             command.extend(["--proxy", worker.proxy_local_http])
         elif str(worker.manual_proxy or "").strip():
-            # Parent-side pool assignment: one concrete proxy per worker.
+            # Batch-side pool assignment: one concrete proxy per worker.
             command.extend(["--proxy", str(worker.manual_proxy).strip()])
-            parent_proxy = ""
-            for i, tok in enumerate(self.plan.proxy_args):
-                if tok == "--proxy-parent" and i + 1 < len(self.plan.proxy_args):
-                    parent_proxy = self.plan.proxy_args[i + 1]
-                    break
-            if parent_proxy:
-                command.extend(["--proxy-parent", parent_proxy])
         else:
             command.extend(self.plan.proxy_args)
         # Independent Turnstile solve proxy (optional).
@@ -4794,7 +4787,6 @@ def build_config_center(settings: Settings) -> Dict[str, object]:
                 maximum=20,
                 default=3,
             ),
-            "proxy_parent": str(raw.get("proxy_parent") or ""),
             "proxy_random": _as_bool(raw.get("proxy_random")),
             "proxy_rotate_session": _as_bool(raw.get("proxy_rotate_session")),
             "turnstile_proxy_enabled": _as_bool(raw.get("turnstile_proxy_enabled")),
@@ -5089,7 +5081,6 @@ class BatchService:
             "embedded_proxy_binary",
             "embedded_proxy_listen_host",
             "embedded_proxy_probe_host",
-            "proxy_parent",
             "turnstile_proxy",
             "turnstile_proxy_file",
             "turnstile_proxy_mode",

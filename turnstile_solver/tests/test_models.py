@@ -31,6 +31,15 @@ class SolverScaffoldTests(unittest.TestCase):
         self.assertEqual(config.queue_timeout_sec, SolverConfig().queue_timeout_sec)
         self.assertEqual(config.queue_timeout_sec, 180)
 
+    def test_retired_proxy_chain_keys_are_ignored(self):
+        config = SolverConfig.from_dict(
+            {
+                "parent_proxy": "http://127.0.0.1:7890",
+                "proxy_parent": "http://127.0.0.1:7891",
+            }
+        )
+        self.assertFalse(hasattr(config, "parent_proxy"))
+
     def test_string_boolean_config_values_are_parsed_explicitly(self):
         config = SolverConfig.from_dict(
             {

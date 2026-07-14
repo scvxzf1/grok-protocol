@@ -525,7 +525,6 @@ class ServerMailSupervisor:
         for key in (
             "proxy_rotate_session",
             "proxy",
-            "proxy_parent",
             "proxy_subscription_local_http",
             "turnstile_proxy",
             "turnstile_proxy_file",

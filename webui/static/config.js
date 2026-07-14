@@ -120,7 +120,6 @@ function fill(data) {
     "embedded_proxy_max_node_retries",
     f.embedded_proxy_max_node_retries == null ? 3 : f.embedded_proxy_max_node_retries
   );
-  set("proxy_parent", f.proxy_parent || "");
   set("local_proxy_port", f.local_proxy_port || 17890);
   set("proxy_random", !!f.proxy_random, true);
   set("proxy_rotate_session", !!f.proxy_rotate_session, true);
@@ -252,7 +251,6 @@ function collectFields() {
   if (present("embedded_proxy_probe_port")) put("embedded_proxy_probe_port", Number(g("embedded_proxy_probe_port") || 443));
   if (present("embedded_proxy_probe_timeout_sec")) put("embedded_proxy_probe_timeout_sec", Number(g("embedded_proxy_probe_timeout_sec") || 5));
   if (present("embedded_proxy_max_node_retries")) put("embedded_proxy_max_node_retries", Number(g("embedded_proxy_max_node_retries") || 3));
-  put("proxy_parent", g("proxy_parent"));
   if (present("local_proxy_port")) put("local_proxy_port", Number(g("local_proxy_port") || 17890));
   if (present("proxy_random")) put("proxy_random", g("proxy_random", true));
   if (present("proxy_rotate_session")) put("proxy_rotate_session", g("proxy_rotate_session", true));
@@ -1466,7 +1464,6 @@ function syncAdvancedMirrorsFromHidden() {
     ["embeddedProxyEnabledVisible", "embedded_proxy_enabled", "checked"],
     ["proxyFileVisible", "proxy_file", "value"],
     ["proxyRetriesVisible", "embedded_proxy_max_node_retries", "value"],
-    ["proxyParentVisible", "proxy_parent", "value"],
     ["localProxyPortVisible", "local_proxy_port", "value"],
     ["proxyRandomVisible", "proxy_random", "checked"],
     ["proxyRotateVisible", "proxy_rotate_session", "checked"],
@@ -1494,7 +1491,6 @@ function bindAdvancedMirrors() {
     ["embeddedProxyEnabledVisible", "embedded_proxy_enabled", "checked", "change"],
     ["proxyFileVisible", "proxy_file", "value", "input"],
     ["proxyRetriesVisible", "embedded_proxy_max_node_retries", "value", "input"],
-    ["proxyParentVisible", "proxy_parent", "value", "input"],
     ["localProxyPortVisible", "local_proxy_port", "value", "input"],
     ["proxyRandomVisible", "proxy_random", "checked", "change"],
     ["proxyRotateVisible", "proxy_rotate_session", "checked", "change"],

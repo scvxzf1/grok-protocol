@@ -33,7 +33,6 @@
   "proxies": [],
   "proxy_random": true,
   "proxy_rotate_session": true,
-  "proxy_parent": "",
   "proxy_file": "proxies.txt",
   "proxy_pool_source": "manual",
   "concurrent_workers": 16,

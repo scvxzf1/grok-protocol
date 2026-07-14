@@ -59,6 +59,8 @@ class ApiSchemaRegressionTests(unittest.TestCase):
         operation = schema["paths"]["/v1/solve"]["post"]
         self.assertIn("requestBody", operation)
         self.assertIn("application/json", operation["requestBody"]["content"])
+        properties = schema["components"]["schemas"]["SolveBody"]["properties"]
+        self.assertNotIn("parent_proxy", properties)
 
     def test_minimal_solve_json_is_not_model_resolution_422(self):
         with TestClient(self.app) as client:

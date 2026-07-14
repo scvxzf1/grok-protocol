@@ -159,7 +159,6 @@ Required `data-tip` map:
 | proxy_mode | auto/直连/代理池/关闭，控制出口怎么走 |
 | proxy | 单个代理地址，格式如 http://user:pass@host:port |
 | proxy_file | 代理列表文件路径，默认 proxies.txt |
-| proxy_parent | 先经本地 Clash 等再上认证代理（可选） |
 | local_proxy_port | 本机无认证转发端口，浏览器流常用 |
 | proxy_random | 从代理池随机挑，而不是固定顺序 |
 | proxy_rotate_session | 尽量换会话出口，降低同 IP 连打风险 |
@@ -197,10 +196,10 @@ Checkbox template:
 Run:
 
 ```bash
-python3 -c "from pathlib import Path; import re; html=Path(\"webui/templates/config.html\").read_text(encoding=\"utf-8\"); tips=re.findall(r\"class=\\\"help-tip\\\"[^>]*data-tip=\\\"([^\\\"]+)\\\"\", html); names=[n for n in re.findall(r\"name=\\\"([a-z0-9_]+)\\\"\", html) if n!=\"viewport\"]; expected={\"email_provider\",\"yyds_api_base\",\"yyds_api_key\",\"yyds_jwt\",\"turnstile_provider\",\"turnstile_api_key\",\"turnstile_headless\",\"local_turnstile_max_workers\",\"cloudflare_api_base\",\"cloudflare_api_key\",\"duckmail_api_key\",\"ms_mail_file\",\"proxy_mode\",\"proxy\",\"proxy_file\",\"proxy_parent\",\"local_proxy_port\",\"proxy_random\",\"proxy_rotate_session\",\"xai_oauth_output_dir\",\"grok2api_remote_base\",\"grok2api_remote_app_key\",\"grok2api_pool_name\"}; print(len(tips), sorted(expected-set(names))); assert len(tips)==23 and not (expected-set(names)); print(\"OK\")"
+python3 -c "from pathlib import Path; import re; html=Path(\"webui/templates/config.html\").read_text(encoding=\"utf-8\"); tips=re.findall(r\"class=\\\"help-tip\\\"[^>]*data-tip=\\\"([^\\\"]+)\\\"\", html); names=[n for n in re.findall(r\"name=\\\"([a-z0-9_]+)\\\"\", html) if n!=\"viewport\"]; expected={\"email_provider\",\"yyds_api_base\",\"yyds_api_key\",\"yyds_jwt\",\"turnstile_provider\",\"turnstile_api_key\",\"turnstile_headless\",\"local_turnstile_max_workers\",\"cloudflare_api_base\",\"cloudflare_api_key\",\"duckmail_api_key\",\"ms_mail_file\",\"proxy_mode\",\"proxy\",\"proxy_file\",\"local_proxy_port\",\"proxy_random\",\"proxy_rotate_session\",\"xai_oauth_output_dir\",\"grok2api_remote_base\",\"grok2api_remote_app_key\",\"grok2api_pool_name\"}; print(len(tips), sorted(expected-set(names))); assert len(tips)==22 and not (expected-set(names)); print(\"OK\")"
 ```
 
-Expected: `23 []` then `OK`
+Expected: `22 []` then `OK`
 
 - [ ] **Step 3: Commit**
 
@@ -314,6 +313,5 @@ git commit -m "feat: enable mobile toggle for config help tips"
 
 3. **Consistency**
    - Classes: `field-title` / `help-tip` / `is-open` / `data-tip`
-   - Tip count target: 23
+   - Tip count target: 22
    - Keep `local_turnstile_max_workers`
-

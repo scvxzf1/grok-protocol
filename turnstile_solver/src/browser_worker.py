@@ -427,20 +427,16 @@ def _log(log_callback: LogFn, message: str) -> None:
 def prepare_browser_proxy(
     proxy: str = "",
     *,
-    parent_proxy: str = "",
     preferred_local_port: int = 0,
     instance_key: str = "",
 ) -> Tuple[str, str, str]:
     """Return (browser_proxy_url, upstream_proxy_url, forwarder_instance_key)."""
     upstream = normalize_proxy(proxy)
-    parent = normalize_proxy(parent_proxy)
-    if not upstream and not parent:
+    if not upstream:
         return "", "", ""
-    if parent and not upstream:
-        raise RuntimeError("设置 parent_proxy 时必须同时提供 proxy 上游")
 
     parsed = parse_proxy(upstream)
-    needs_forwarder = bool(parent) or bool(parsed.username or parsed.password)
+    needs_forwarder = bool(parsed.username or parsed.password)
     if not needs_forwarder:
         return upstream, upstream, ""
 
@@ -451,7 +447,6 @@ def prepare_browser_proxy(
         upstream,
         preferred_local_port=int(preferred_local_port or 0),
         instance_key=key,
-        parent_proxy_raw=parent,
     )
     return str(browser_proxy or ""), upstream, key
 
@@ -798,11 +793,6 @@ class BrowserWorker:
         started = time.monotonic()
         page_url = (request.page_url or self.config.signup_url).strip()
         upstream_raw = (request.proxy or self.config.proxy or "").strip()
-        parent_proxy = (
-            str((request.metadata or {}).get("parent_proxy") or "")
-            or self.config.parent_proxy
-            or ""
-        ).strip()
         timeout = max(5, int(request.timeout_sec or self.config.browser_timeout_sec))
         headless = bool(request.headless) or bool(self.config.headless)
         min_len = max(20, int(self.config.token_min_length or 80))
@@ -813,7 +803,6 @@ class BrowserWorker:
         try:
             browser_proxy, upstream_proxy, forwarder_instance = prepare_browser_proxy(
                 upstream_raw,
-                parent_proxy=parent_proxy,
                 preferred_local_port=int(self.config.local_proxy_port or 0),
                 instance_key=f"ts-worker-{uuid.uuid4().hex[:10]}",
             )
@@ -839,7 +828,6 @@ class BrowserWorker:
             diag = diag if isinstance(diag, dict) else {}
             extras = {
                 "browser_proxy": browser_proxy,
-                "parent_proxy": normalize_proxy(parent_proxy),
                 "forwarder_instance": forwarder_instance,
                 "diagnostics": diag,
                 "language": str(diag.get("language") or "").strip(),
@@ -896,7 +884,6 @@ class BrowserWorker:
                 elapsed_ms=elapsed_ms,
                 error=str(exc),
                 extras={
-                    "parent_proxy": normalize_proxy(parent_proxy),
                     "forwarder_instance": forwarder_instance,
                 },
             )

@@ -117,7 +117,6 @@ cp config.example.json config.json
 | `email_provider` | 邮箱服务商：`duckmail`、`yyds`、`cloudflare` |
 | `register_count` | 本次目标注册数量 |
 | `proxy` | 代理地址，可留空 |
-| `proxy_parent` | 可选父 HTTP 代理；设置后本地转发器会先经它 CONNECT 到认证上游，例如 Clash `http://127.0.0.1:7890` |
 | `enable_nsfw` | 注册后是否尝试开启 NSFW |
 | `cloudflare_api_base` | Cloudflare 临时邮箱 API 地址 |
 | `cloudflare_api_key` | Cloudflare 临时邮箱接口密钥；默认匿名模式留空，admin 模式填 `ADMIN_PASSWORD` |
@@ -257,7 +256,6 @@ python grok_register_ttk.py http mail-probe --mail-config config.json
 # 推荐：captcha 服务 + 邮箱配置，无浏览器
 python grok_register_ttk.py http register \
   --proxy-file proxies.txt --proxy-random \
-  --proxy-parent http://127.0.0.1:7890 \
   --mail-config config.json \
   --turnstile-provider yescaptcha \
   --turnstile-api-key "$YESCAPTCHA_KEY" \

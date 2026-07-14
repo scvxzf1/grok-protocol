@@ -22,7 +22,6 @@ def _slot(headless: bool) -> BrowserSlot:
     config = SolverConfig(strict_fingerprint=False, headless=headless)
     affinity = BrowserAffinity.build(
         proxy="",
-        parent_proxy="",
         user_agent="",
         headless=headless,
         locale="",
@@ -32,7 +31,6 @@ def _slot(headless: bool) -> BrowserSlot:
         BrowserWorker(config),
         affinity=affinity,
         upstream_proxy="",
-        parent_proxy="",
         user_agent="",
     )
 

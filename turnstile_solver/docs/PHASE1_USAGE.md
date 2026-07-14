@@ -6,7 +6,6 @@
 cd /path/to/grok协议
 python3 -m turnstile_solver.src solve \
   --proxy "http://user:pass@host:port" \
-  --parent-proxy "http://127.0.0.1:7890" \
   --output /tmp/turnstile.txt \
   --proxy-used-file /tmp/turnstile.proxy.txt
 ```

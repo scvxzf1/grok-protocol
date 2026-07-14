@@ -37,48 +37,40 @@ class _RecordingClient:
         self.sent.append(data)
 
 
-def _handler(upstream, parent=None):
+def _handler(upstream):
     """Build a handler without constructing a socketserver request handler."""
     handler = object.__new__(forwarder._ProxyHandler)
     handler.upstream = upstream
-    handler.parent_proxy = parent
     handler._pipe = lambda *_args: None
     return handler
 
 
-class LocalProxyForwarderParentChainTests(unittest.TestCase):
-    def test_parent_connect_precedes_authenticated_upstream_connect(self):
-        parent = forwarder.UpstreamProxy(
-            "http", "127.0.0.1", 7890, "parent-user", "parent-pass"
-        )
+class LocalProxyForwarderProtocolTests(unittest.TestCase):
+    def test_authenticated_upstream_connect_injects_proxy_authorization(self):
         upstream = forwarder.UpstreamProxy(
             "http", "residential.example", 10000, "up-user", "up-pass"
         )
-        # The first response belongs to the outer parent CONNECT; the second
-        # belongs to the CONNECT sent through that tunnel to the upstream.
         tunnel = _RecordingSocket(
             (
-                b"HTTP/1.1 200 Connection Established\r\n\r\n",
                 b"HTTP/1.1 200 Connection Established\r\n\r\n",
             )
         )
         client = _RecordingClient()
 
         with mock.patch.object(forwarder.socket, "create_connection", return_value=tunnel) as connect:
-            _handler(upstream, parent)._handle_connect(client, "api.example:443", "HTTP/1.1")
+            _handler(upstream)._handle_connect(client, "api.example:443", "HTTP/1.1")
 
-        connect.assert_called_once_with(("127.0.0.1", 7890), timeout=forwarder.CONNECT_TIMEOUT)
-        self.assertEqual(len(tunnel.sent), 2)
-        outer, inner = tunnel.sent
-        self.assertIn(b"CONNECT residential.example:10000 HTTP/1.1", outer)
-        self.assertIn(b"Proxy-Authorization: Basic cGFyZW50LXVzZXI6cGFyZW50LXBhc3M=", outer)
-        self.assertNotIn(b"dXAtdXNlcjp1cC1wYXNz", outer)
-        self.assertIn(b"CONNECT api.example:443 HTTP/1.1", inner)
-        self.assertIn(b"Proxy-Authorization: Basic dXAtdXNlcjp1cC1wYXNz", inner)
-        self.assertNotIn(b"cGFyZW50LXVzZXI6cGFyZW50LXBhc3M=", inner)
+        connect.assert_called_once_with(
+            ("residential.example", 10000),
+            timeout=forwarder.CONNECT_TIMEOUT,
+        )
+        self.assertEqual(len(tunnel.sent), 1)
+        request = tunnel.sent[0]
+        self.assertIn(b"CONNECT api.example:443 HTTP/1.1", request)
+        self.assertIn(b"Proxy-Authorization: Basic dXAtdXNlcjp1cC1wYXNz", request)
         self.assertEqual(client.sent, [b"HTTP/1.1 200 Connection Established\r\n\r\n"])
 
-    def test_without_parent_opening_upstream_remains_direct(self):
+    def test_opening_upstream_is_direct(self):
         upstream = forwarder.UpstreamProxy("http", "upstream.example", 8080)
         sock = _RecordingSocket()
 
@@ -89,25 +81,19 @@ class LocalProxyForwarderParentChainTests(unittest.TestCase):
         connect.assert_called_once_with(("upstream.example", 8080), timeout=forwarder.CONNECT_TIMEOUT)
         self.assertEqual(sock.sent, [])
 
-    def test_plain_http_request_is_sent_inside_parent_tunnel(self):
-        parent = forwarder.UpstreamProxy("http", "127.0.0.1", 7890)
+    def test_plain_http_request_injects_upstream_auth_directly(self):
         upstream = forwarder.UpstreamProxy(
             "http", "residential.example", 10000, "up-user", "up-pass"
         )
-        tunnel = _RecordingSocket(
-            (
-                b"HTTP/1.1 200 Connection Established\r\n\r\n",
-                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
-            )
-        )
+        tunnel = _RecordingSocket()
         raw_head = (
             b"GET http://api.example/status HTTP/1.1\r\n"
             b"Host: api.example\r\n"
             b"Proxy-Authorization: Basic client-credentials\r\n\r\n"
         )
 
-        with mock.patch.object(forwarder.socket, "create_connection", return_value=tunnel):
-            _handler(upstream, parent)._handle_http(
+        with mock.patch.object(forwarder.socket, "create_connection", return_value=tunnel) as connect:
+            _handler(upstream)._handle_http(
                 _RecordingClient(),
                 "GET",
                 "http://api.example/status",
@@ -116,11 +102,14 @@ class LocalProxyForwarderParentChainTests(unittest.TestCase):
                 raw_head,
             )
 
-        outer, inner = tunnel.sent
-        self.assertIn(b"CONNECT residential.example:10000 HTTP/1.1", outer)
-        self.assertTrue(inner.startswith(b"GET http://api.example/status HTTP/1.1\r\n"))
-        self.assertIn(b"Proxy-Authorization: Basic dXAtdXNlcjp1cC1wYXNz", inner)
-        self.assertNotIn(b"client-credentials", inner)
+        connect.assert_called_once_with(
+            ("residential.example", 10000),
+            timeout=forwarder.CONNECT_TIMEOUT,
+        )
+        request = tunnel.sent[0]
+        self.assertTrue(request.startswith(b"GET http://api.example/status HTTP/1.1\r\n"))
+        self.assertIn(b"Proxy-Authorization: Basic dXAtdXNlcjp1cC1wYXNz", request)
+        self.assertNotIn(b"client-credentials", request)
 
 
 class LocalProxyForwarderOwnershipTests(unittest.TestCase):

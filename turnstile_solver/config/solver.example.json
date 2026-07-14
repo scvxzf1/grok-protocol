@@ -7,7 +7,6 @@
   "signup_url": "https://accounts.x.ai/sign-up?redirect=grok-com",
   "headless": false,
   "proxy": "",
-  "parent_proxy": "",
   "proxy_file": "",
   "local_proxy_port": 0,
   "user_agent": "",

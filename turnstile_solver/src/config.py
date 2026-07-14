@@ -212,7 +212,6 @@ class SolverConfig:
     signup_url: str = DEFAULT_SIGNUP_URL
     headless: bool = False
     proxy: str = ""
-    parent_proxy: str = ""
     proxy_file: str = ""
     local_proxy_port: int = 0
     user_agent: str = ""
@@ -260,7 +259,6 @@ class SolverConfig:
                 default=False,
             ),
             proxy=str(data.get("proxy") or ""),
-            parent_proxy=str(data.get("parent_proxy") or data.get("proxy_parent") or ""),
             proxy_file=str(data.get("proxy_file") or ""),
             local_proxy_port=int(data.get("local_proxy_port") or 0),
             user_agent=str(data.get("user_agent") or ""),

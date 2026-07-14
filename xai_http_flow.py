@@ -917,7 +917,6 @@ def _proxy_has_embedded_auth(proxy: str) -> bool:
 def _prepare_browser_proxy(
     proxy: str = "",
     *,
-    parent_proxy: str = "",
     preferred_local_port: int = 0,
     instance_key: str = "",
     log_callback: LogFn = None,
@@ -925,25 +924,22 @@ def _prepare_browser_proxy(
     """Resolve a proxy URL that Chromium/DrissionPage can actually consume.
 
     Chrome rejects ``http://user:pass@host:port`` with ``ERR_NO_SUPPORTED_PROXIES``.
-    When credentials (or a parent chain) are present, expose a local no-auth
-    forwarder on ``127.0.0.1`` and inject ``Proxy-Authorization`` upstream.
+    When credentials are present, expose a local no-auth forwarder on
+    ``127.0.0.1`` and inject ``Proxy-Authorization`` upstream.
 
     Returns ``(browser_proxy_url, forwarder_instance_key)``.
     """
     proxy = str(proxy or "").strip()
-    parent = str(parent_proxy or "").strip()
-    if not proxy and not parent:
+    if not proxy:
         return "", ""
-    if parent and not proxy:
-        raise XAIHttpFlowError("设置 parent_proxy 时必须同时提供上游 proxy")
 
     # Local no-auth endpoints are already browser-safe.
     parts = _parse_proxy_components(proxy)
     host = str(parts.get("host") or "").lower()
-    if host in {"127.0.0.1", "localhost", "::1"} and not parent and not _proxy_has_embedded_auth(proxy):
+    if host in {"127.0.0.1", "localhost", "::1"} and not _proxy_has_embedded_auth(proxy):
         return normalize_proxy(proxy), ""
 
-    needs_forwarder = bool(parent) or _proxy_has_embedded_auth(proxy)
+    needs_forwarder = _proxy_has_embedded_auth(proxy)
     if not needs_forwarder:
         return normalize_proxy(proxy), ""
 
@@ -955,7 +951,6 @@ def _prepare_browser_proxy(
             proxy,
             preferred_local_port=int(preferred_local_port or 0),
             instance_key=key,
-            parent_proxy_raw=parent,
         )
     except Exception as exc:
         raise XAIHttpFlowError(f"本地代理转发启动失败: {exc}") from exc
@@ -4502,11 +4497,6 @@ def _add_proxy_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--proxy-file", default="", help="代理池文件；每行一个代理")
     parser.add_argument("--proxy-random", action="store_true", help="从代理池随机选择一条")
     parser.add_argument("--proxy-index", type=int, default=0, help="代理池固定索引（默认 0）")
-    parser.add_argument(
-        "--proxy-parent",
-        default="",
-        help="可选父 HTTP 代理；例如 http://127.0.0.1:7890，经其连接选中的认证上游",
-    )
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
 
 
@@ -4625,8 +4615,8 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _resolve_runtime_proxy(args: argparse.Namespace, logger: Callable[[str], None]) -> Tuple[str, str, str]:
-    """Return (effective_proxy_url, forwarder_instance_key, selected_upstream_raw)."""
+def _resolve_runtime_proxy(args: argparse.Namespace) -> Tuple[str, str]:
+    """Return (effective_proxy_url, selected_upstream_raw)."""
     selected_raw = str(getattr(args, "proxy", "") or "").strip()
     if not selected_raw and str(getattr(args, "proxy_file", "") or "").strip():
         path = Path(str(args.proxy_file).strip())
@@ -4638,23 +4628,7 @@ def _resolve_runtime_proxy(args: argparse.Namespace, logger: Callable[[str], Non
                 else:
                     selected_raw = lines[int(getattr(args, "proxy_index", 0) or 0) % len(lines)]
     selected = normalize_proxy(selected_raw) if selected_raw else ""
-    parent_proxy = str(getattr(args, "proxy_parent", "") or "").strip()
-    forwarder_instance = ""
-    proxy = selected
-    if parent_proxy:
-        if not proxy:
-            raise XAIHttpFlowError("设置 --proxy-parent 时还必须提供 --proxy 或 --proxy-file 上游代理")
-        from local_proxy_forwarder import ensure_local_forwarder
-
-        forwarder_instance = f"xai-http-{os.getpid()}-{secrets.token_hex(3)}"
-        proxy, _ = ensure_local_forwarder(
-            proxy,
-            preferred_local_port=0,
-            instance_key=forwarder_instance,
-            parent_proxy_raw=parent_proxy,
-        )
-        logger("[HTTP] 已启用父代理链（本机转发 -> parent -> 上游）")
-    return proxy, forwarder_instance, selected_raw or selected
+    return selected, selected_raw or selected
 
 
 def _safe_call(fn, *args, **kwargs):
@@ -6063,9 +6037,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     def logger(message: str) -> None:
         print(message, flush=True)
 
-    forwarder_instance = ""
     try:
-        proxy, forwarder_instance, selected_raw = _resolve_runtime_proxy(args, logger)
+        proxy, selected_raw = _resolve_runtime_proxy(args)
 
         if args.command == "mail-probe":
             config: Dict[str, Any] = {}
@@ -6244,14 +6217,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except Exception as exc:  # pragma: no cover - CLI last-resort guard
         print(f"[!] 未处理异常: {_safe_error_text(exc)}", file=sys.stderr)
         return 3
-    finally:
-        if forwarder_instance:
-            try:
-                from local_proxy_forwarder import stop_local_forwarder
-
-                stop_local_forwarder(instance_key=forwarder_instance)
-            except Exception:
-                pass
 
 
 if __name__ == "__main__":  # pragma: no cover

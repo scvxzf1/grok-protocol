@@ -898,6 +898,18 @@ class XAIHttpFlowTests(unittest.TestCase):
         self.assertFalse(flow._proxy_has_embedded_auth("http://127.0.0.1:17890"))
         self.assertFalse(flow._proxy_has_embedded_auth("http://host:1000"))
 
+    def test_http_cli_has_no_parent_proxy_option(self):
+        parser = flow.build_parser()
+        subparsers = next(
+            action
+            for action in parser._actions
+            if isinstance(getattr(action, "choices", None), dict)
+            and "register" in action.choices
+        )
+        for command in ("credential", "register", "mail-probe", "turnstile-capture"):
+            destinations = {action.dest for action in subparsers.choices[command]._actions}
+            self.assertNotIn("proxy_parent", destinations)
+
     def test_prepare_browser_proxy_auth_uses_forwarder(self):
         logs = []
         with mock.patch(

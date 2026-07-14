@@ -283,6 +283,7 @@ class ServerMailSupervisorTests(unittest.TestCase):
             config_before = json.loads((root / "config.json").read_text(encoding="utf-8"))
             config_before.update(
                 {
+                    "proxy_parent": "http://127.0.0.1:7890",
                     "turnstile_proxy": "http://SOLVER_USER:SOLVER_PASSWORD@solver.example.test:9000",
                     "turnstile_proxy_file": "solver-proxies.txt",
                     "turnstile_proxy_enabled": True,
@@ -311,6 +312,7 @@ class ServerMailSupervisorTests(unittest.TestCase):
             self.assertTrue(disk_config["proxy_random"])
             self.assertTrue(disk_config["proxy_slot_sticky"])
             self.assertNotIn("proxy", disk_config)
+            self.assertNotIn("proxy_parent", disk_config)
             for removed in (
                 "turnstile_proxy",
                 "turnstile_proxy_file",
