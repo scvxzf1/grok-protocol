@@ -60,7 +60,7 @@ class HttpTuiLauncherTests(unittest.TestCase):
                 check=False,
             )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("运行模式: 模式1:注册+otp", result.stdout)
+        self.assertIn("运行模式: 同会话换凭证（PKCE，推荐）", result.stdout)
         self.assertIn("注册数量: 3", result.stdout)
         self.assertIn("并发数: 2", result.stdout)
         self.assertIn("HTTP 协议", result.stdout)
@@ -108,7 +108,7 @@ class HttpTuiLauncherTests(unittest.TestCase):
                 check=False,
             )
         self.assertEqual(dry_run.returncode, 0, dry_run.stderr)
-        self.assertIn("运行模式: 模式2:注册+sso转换", dry_run.stdout)
+        self.assertIn("运行模式: SSO 二次转换（Device Flow）", dry_run.stdout)
         self.assertIn("sso_to_auth_json", dry_run.stdout)
         self.assertNotIn("仍是占位", dry_run.stdout)
 
@@ -269,8 +269,10 @@ print('[HTTP] fake backend completed', flush=True)
             saved = json.loads(config_path.read_text(encoding="utf-8"))
             self.assertEqual(saved["register_count"], 7)
             self.assertEqual(saved["concurrent_workers"], 3)
-            self.assertEqual(saved["tui_run_mode"], "register_sso")
-            self.assertEqual(saved["tui_proxy_mode"], "pool")
+            self.assertEqual(saved["credential_flow"], "sso_device")
+            self.assertEqual(saved["proxy_mode"], "pool")
+            self.assertNotIn("tui_run_mode", saved)
+            self.assertNotIn("tui_proxy_mode", saved)
             self.assertTrue(str(saved["xai_oauth_output_dir"]).endswith("out_creds") or saved["xai_oauth_output_dir"] == "out_creds")
 
             # 再读回，确认 settings_from_args 会恢复
@@ -482,15 +484,21 @@ print('[HTTP] fake backend completed', flush=True)
             self.assertEqual(status["playwright_count"], 34)
             self.assertIn("chrome=12", tui.format_browser_health(status))
 
+            patterns = []
             result = tui.cleanup_browser_residues(
                 temp_root=root,
                 kill_playwright=True,
-                kill_all_chrome=False,
-                pkill_fn=lambda pattern: 3 if "ms-playwright" in pattern else 0,
+                kill_all_chrome=True,
+                pkill_fn=lambda pattern: patterns.append(pattern) or 3,
             )
-            self.assertEqual(result["killed_playwright"], 3)
-            self.assertEqual(result["removed_temp_dirs"], 4)
+            self.assertEqual(patterns, ["xai-ts-chrome-"])
+            self.assertEqual(result["killed_playwright"], 0)
+            self.assertEqual(result["killed_chrome"], 3)
+            self.assertEqual(result["removed_temp_dirs"], 1)
             self.assertFalse((root / "xai-ts-chrome-aaa").exists())
+            self.assertTrue((root / "xai-ts-probe-bbb").exists())
+            self.assertTrue((root / "xai-chrome-raw-ccc").exists())
+            self.assertTrue((root / "playwright_chromiumdev_profile-ddd").exists())
             self.assertTrue((root / "keep-me").exists())
             summary = tui.format_cleanup_result(result)
             self.assertIn("Playwright", summary)

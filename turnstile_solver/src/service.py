@@ -55,6 +55,8 @@ class SolverService:
                 "max_concurrency": self.config.max_concurrency,
                 "headless": self.config.headless,
                 "signup_url": self.config.signup_url,
+                "browser_solve_max_attempts": self.config.browser_solve_max_attempts,
+                "browser_retry_backoff_sec": self.config.browser_retry_backoff_sec,
             },
             "pool": self.pool.stats.to_dict(),
             "leases": {

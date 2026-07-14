@@ -2,6 +2,7 @@
 
 import unittest
 from unittest import mock
+from urllib.parse import urlparse
 
 import local_proxy_forwarder as forwarder
 
@@ -44,6 +45,9 @@ def _handler(upstream, parent=None):
 
 
 class LocalProxyForwarderParentChainTests(unittest.TestCase):
+    def tearDown(self):
+        forwarder.stop_local_forwarder()
+
     def test_parent_connect_precedes_authenticated_upstream_connect(self):
         parent = forwarder.UpstreamProxy(
             "http", "127.0.0.1", 7890, "parent-user", "parent-pass"
@@ -118,6 +122,26 @@ class LocalProxyForwarderParentChainTests(unittest.TestCase):
         self.assertTrue(inner.startswith(b"GET http://api.example/status HTTP/1.1\r\n"))
         self.assertIn(b"Proxy-Authorization: Basic dXAtdXNlcjp1cC1wYXNz", inner)
         self.assertNotIn(b"client-credentials", inner)
+
+    def test_concurrent_forwarders_never_share_listener_port(self):
+        first_url, first_used = forwarder.ensure_local_forwarder(
+            "upstream-a.example:8080:user-a:pass-a",
+            preferred_local_port=0,
+            instance_key="route-a",
+        )
+        first_port = int(urlparse(first_url).port or 0)
+        second_url, second_used = forwarder.ensure_local_forwarder(
+            "upstream-b.example:8080:user-b:pass-b",
+            preferred_local_port=first_port,
+            instance_key="route-b",
+        )
+        second_port = int(urlparse(second_url).port or 0)
+
+        self.assertTrue(first_used)
+        self.assertTrue(second_used)
+        self.assertGreater(first_port, 0)
+        self.assertGreater(second_port, 0)
+        self.assertNotEqual(first_port, second_port)
 
 
 if __name__ == "__main__":

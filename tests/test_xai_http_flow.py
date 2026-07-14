@@ -1,4 +1,7 @@
+import concurrent.futures
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -40,6 +43,10 @@ class DummySession:
 
 
 class XAIHttpFlowTests(unittest.TestCase):
+    def test_register_cli_defaults_to_five_submit_workers(self):
+        args = flow.build_parser().parse_args(["register", "--email", "user@example.test"])
+        self.assertEqual(args.submit_workers, 5)
+
     def test_normalize_authenticated_proxy_pool_line(self):
         self.assertEqual(
             flow.normalize_proxy("proxy.example.test:1000:user:name:with:colons"),
@@ -182,6 +189,287 @@ class XAIHttpFlowTests(unittest.TestCase):
             self.assertNotIn("a@hotmail.com", remaining)
             used = path.with_suffix(path.suffix + ".used").read_text(encoding="utf-8")
             self.assertIn("a@hotmail.com", used)
+
+    def test_ms_mail_claim_is_unique_across_threads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pool.txt"
+            client_id = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
+            expected = {f"worker{index}@hotmail.com" for index in range(12)}
+            path.write_text(
+                "".join(
+                    f"worker{index}@hotmail.com----pw----{client_id}----M.Ctoken{index}\n"
+                    for index in range(12)
+                ),
+                encoding="utf-8",
+            )
+
+            def claim_one(_index):
+                mailbox = flow.MicrosoftGraphMailbox(str(path), mark_used=True)
+                return mailbox._claim_account()["email"]
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=12) as executor:
+                claimed = list(executor.map(claim_one, range(12)))
+
+            self.assertEqual(len(claimed), len(set(claimed)))
+            self.assertEqual(set(claimed), expected)
+            self.assertEqual(path.read_text(encoding="utf-8"), "")
+            used_lines = path.with_suffix(".txt.used").read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(used_lines), 12)
+
+    def test_ms_mail_claim_is_unique_across_processes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pool.txt"
+            client_id = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
+            path.write_text(
+                "".join(
+                    f"process{index}@hotmail.com----pw----{client_id}----M.Ctoken{index}\n"
+                    for index in range(4)
+                ),
+                encoding="utf-8",
+            )
+            script = (
+                "import sys\n"
+                "from xai_http_flow import MicrosoftGraphMailbox\n"
+                "account = MicrosoftGraphMailbox(sys.argv[1], mark_used=True)._claim_account()\n"
+                "sys.stdout.write(account['email'])\n"
+            )
+            root = Path(flow.__file__).resolve().parent
+            processes = [
+                subprocess.Popen(
+                    [sys.executable, "-c", script, str(path)],
+                    cwd=str(root),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                for _ in range(4)
+            ]
+            claimed = []
+            for process in processes:
+                stdout, stderr = process.communicate(timeout=30)
+                self.assertEqual(process.returncode, 0, msg=stderr)
+                claimed.append(stdout.strip())
+
+            self.assertEqual(len(claimed), len(set(claimed)))
+            self.assertEqual(
+                set(claimed),
+                {f"process{index}@hotmail.com" for index in range(4)},
+            )
+
+    def test_ms_mail_claim_skips_durable_used_entry_left_in_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pool.txt"
+            used_path = path.with_suffix(".txt.used")
+            client_id = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
+            first = f"first@hotmail.com----pw----{client_id}----M.Cold"
+            second = f"second@hotmail.com----pw----{client_id}----M.Cnew"
+            # Models an interruption after the ledger commit but before the
+            # source pool replace.
+            path.write_text(first + "\n" + second + "\n", encoding="utf-8")
+            used_path.write_text(first + "\n", encoding="utf-8")
+
+            claimed = flow.MicrosoftGraphMailbox(
+                str(path), mark_used=True
+            )._claim_account()
+
+            self.assertEqual(claimed["email"], "second@hotmail.com")
+            self.assertEqual(path.read_text(encoding="utf-8"), "")
+            used = used_path.read_text(encoding="utf-8")
+            self.assertEqual(used.count("first@hotmail.com"), 1)
+            self.assertEqual(used.count("second@hotmail.com"), 1)
+
+    def test_ms_mail_claim_survives_source_replace_interruption(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pool.txt"
+            client_id = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
+            path.write_text(
+                f"first@hotmail.com----pw----{client_id}----M.Cfirst\n"
+                f"second@hotmail.com----pw----{client_id}----M.Csecond\n",
+                encoding="utf-8",
+            )
+            original_write = flow._atomic_write_utf8_lines
+
+            def interrupt_source_replace(target, lines):
+                if Path(target) == path.resolve():
+                    raise PermissionError("simulated source replace interruption")
+                return original_write(target, lines)
+
+            with mock.patch.object(
+                flow,
+                "_atomic_write_utf8_lines",
+                side_effect=interrupt_source_replace,
+            ):
+                first = flow.MicrosoftGraphMailbox(
+                    str(path), mark_used=True
+                )._claim_account()
+
+            self.assertEqual(first["email"], "first@hotmail.com")
+            self.assertIn("first@hotmail.com", path.read_text(encoding="utf-8"))
+            second = flow.MicrosoftGraphMailbox(
+                str(path), mark_used=True
+            )._claim_account()
+            self.assertEqual(second["email"], "second@hotmail.com")
+            self.assertEqual(path.read_text(encoding="utf-8"), "")
+
+    def test_ms_mail_refresh_updates_merge_under_pool_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pool.txt"
+            client_id = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
+            path.write_text(
+                f"a@hotmail.com----pw----{client_id}----M.ColdA\n"
+                f"b@hotmail.com----pw----{client_id}----M.ColdB\n",
+                encoding="utf-8",
+            )
+            mailboxes = [
+                flow.MicrosoftGraphMailbox(str(path), mark_used=True)
+                for _ in range(2)
+            ]
+            accounts = [mailbox._claim_account() for mailbox in mailboxes]
+            accounts[0]["refresh_token"] = "M.CnewA"
+            accounts[1]["refresh_token"] = "M.CnewB"
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                list(
+                    executor.map(
+                        lambda pair: pair[0]._update_used_account(pair[1]),
+                        zip(mailboxes, accounts),
+                    )
+                )
+
+            used = path.with_suffix(".txt.used").read_text(encoding="utf-8")
+            self.assertIn("M.CnewA", used)
+            self.assertIn("M.CnewB", used)
+            self.assertNotIn("M.ColdA", used)
+            self.assertNotIn("M.ColdB", used)
+
+    def test_ms_mail_transient_refresh_retries_same_claim_then_succeeds(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pool.txt"
+            client_id = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
+            path.write_text(
+                f"first@hotmail.com----pw----{client_id}----M.Cfirst\n"
+                f"second@hotmail.com----pw----{client_id}----M.Csecond\n",
+                encoding="utf-8",
+            )
+            mailbox = flow.MicrosoftGraphMailbox(
+                str(path),
+                mark_used=True,
+                transport_backoff_base=0,
+            )
+            responses = [
+                flow.requests.exceptions.SSLError("synthetic TLS EOF"),
+                DummyResponse(
+                    status_code=200,
+                    json_data={"access_token": "access-value", "expires_in": 3600},
+                ),
+            ]
+
+            with mock.patch.object(mailbox, "_request", side_effect=responses) as request:
+                email, token = mailbox.create()
+
+            self.assertEqual(email, "first@hotmail.com")
+            self.assertEqual(token, "access-value")
+            self.assertEqual(request.call_count, 2)
+            remaining = path.read_text(encoding="utf-8").splitlines()
+            used = path.with_suffix(".txt.used").read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(remaining), 1)
+            self.assertIn("second@hotmail.com", remaining[0])
+            self.assertEqual(len(used), 1)
+            self.assertIn("first@hotmail.com", used[0])
+
+    def test_ms_mail_exhausted_transient_refresh_consumes_only_one_claim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pool.txt"
+            client_id = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
+            path.write_text(
+                f"first@hotmail.com----pw----{client_id}----M.Cfirst\n"
+                f"second@hotmail.com----pw----{client_id}----M.Csecond\n",
+                encoding="utf-8",
+            )
+            mailbox = flow.MicrosoftGraphMailbox(
+                str(path),
+                mark_used=True,
+                transport_max_attempts=3,
+                transport_backoff_base=0,
+            )
+
+            with mock.patch.object(
+                mailbox,
+                "_request",
+                side_effect=flow.requests.exceptions.SSLError("synthetic TLS EOF"),
+            ) as request:
+                with self.assertRaises(flow.MicrosoftGraphTransportError) as raised:
+                    mailbox.create()
+
+            self.assertIn("3 次尝试", str(raised.exception))
+            self.assertEqual(request.call_count, 3)
+            remaining = path.read_text(encoding="utf-8").splitlines()
+            used = path.with_suffix(".txt.used").read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(remaining), 1)
+            self.assertIn("second@hotmail.com", remaining[0])
+            self.assertEqual(len(used), 1)
+            self.assertIn("first@hotmail.com", used[0])
+
+    def test_ms_mail_only_invalid_grant_advances_to_next_claim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pool.txt"
+            client_id = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
+            path.write_text(
+                f"first@hotmail.com----pw----{client_id}----M.Cfirst\n"
+                f"second@hotmail.com----pw----{client_id}----M.Csecond\n",
+                encoding="utf-8",
+            )
+            mailbox = flow.MicrosoftGraphMailbox(
+                str(path), mark_used=True, transport_backoff_base=0
+            )
+            responses = [
+                DummyResponse(
+                    status_code=400,
+                    json_data={"error": "invalid_grant", "error_description": "expired"},
+                ),
+                DummyResponse(
+                    status_code=200,
+                    json_data={"access_token": "second-access", "expires_in": 3600},
+                ),
+            ]
+
+            with mock.patch.object(mailbox, "_request", side_effect=responses), mock.patch(
+                "builtins.print"
+            ):
+                email, token = mailbox.create()
+
+            self.assertEqual(email, "second@hotmail.com")
+            self.assertEqual(token, "second-access")
+            self.assertEqual(path.read_text(encoding="utf-8"), "")
+            used = path.with_suffix(".txt.used").read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(used), 2)
+
+    def test_ms_mail_non_invalid_grant_oauth_error_keeps_next_claim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pool.txt"
+            client_id = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
+            path.write_text(
+                f"first@hotmail.com----pw----{client_id}----M.Cfirst\n"
+                f"second@hotmail.com----pw----{client_id}----M.Csecond\n",
+                encoding="utf-8",
+            )
+            mailbox = flow.MicrosoftGraphMailbox(str(path), mark_used=True)
+            response = DummyResponse(
+                status_code=400,
+                json_data={"error": "invalid_client", "error_description": "bad app"},
+            )
+
+            with mock.patch.object(mailbox, "_request", return_value=response) as request:
+                with self.assertRaises(flow.MicrosoftGraphOAuthError):
+                    mailbox.create()
+
+            self.assertEqual(request.call_count, 1)
+            remaining = path.read_text(encoding="utf-8").splitlines()
+            used = path.with_suffix(".txt.used").read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(remaining), 1)
+            self.assertIn("second@hotmail.com", remaining[0])
+            self.assertEqual(len(used), 1)
+            self.assertIn("first@hotmail.com", used[0])
 
     def test_grpc_unary_reads_status_from_http_headers_when_body_empty(self):
         class HeaderOnlyResponse:
@@ -396,6 +684,11 @@ class XAIHttpFlowTests(unittest.TestCase):
         self.assertIn("--no-sandbox", fake.args)
         self.assertIn("--headless=new", fake.args)
         self.assertNotIn("--disable-background-networking", fake.args)
+        self.assertIn("--disable-extensions", fake.args)
+        self.assertNotIn("--renderer-process-limit=2", fake.args)
+        self.assertIn("--disk-cache-size=16777216", fake.args)
+        self.assertNotIn("--disable-gpu", fake.args)
+        self.assertIn("--window-size=1280,800", fake.args)
         self.assertTrue(any("headless" in message.lower() for message in logs))
 
         bare = FakeOptions()
@@ -408,6 +701,8 @@ class XAIHttpFlowTests(unittest.TestCase):
             log_callback=bare_logs.append,
         )
         self.assertEqual(bare.user_agent, "")
+        self.assertNotIn("--disable-background-networking", bare.args)
+        self.assertNotIn("--renderer-process-limit=2", bare.args)
         self.assertTrue(any("直连" in message for message in bare_logs))
 
     def test_capture_turnstile_token_fast_fails_on_hard_block(self):
@@ -618,27 +913,10 @@ class XAIHttpFlowTests(unittest.TestCase):
         self.assertGreaterEqual(page.calls, 2)
 
 
-    def test_resolve_local_browser_mode_prefers_virtual_headed(self):
-        with mock.patch.object(flow, "_virtual_display_available", return_value=True):
-            mode, use_headless = flow._resolve_local_browser_mode(want_headless=True)
-        self.assertEqual(mode, "virtual-headed")
-        self.assertFalse(use_headless)
-
-    def test_resolve_local_browser_mode_falls_back_to_headless_new(self):
-        with mock.patch.object(flow, "_virtual_display_available", return_value=False), mock.patch.object(
-            flow, "_display_env_available", return_value=False
-        ):
-            mode, use_headless = flow._resolve_local_browser_mode(want_headless=True)
+    def test_resolve_local_browser_mode_uses_native_headless(self):
+        mode, use_headless = flow._resolve_local_browser_mode(want_headless=True)
         self.assertEqual(mode, "headless-new")
         self.assertTrue(use_headless)
-
-    def test_resolve_local_browser_mode_maps_headless_to_headed_without_xvfb(self):
-        with mock.patch.object(flow, "_virtual_display_available", return_value=False), mock.patch.object(
-            flow, "_display_env_available", return_value=True
-        ):
-            mode, use_headless = flow._resolve_local_browser_mode(want_headless=True)
-        self.assertEqual(mode, "headed")
-        self.assertFalse(use_headless)
 
     def test_resolve_local_browser_mode_headed(self):
         mode, use_headless = flow._resolve_local_browser_mode(want_headless=False)
@@ -987,6 +1265,26 @@ class XAIHttpFlowTests(unittest.TestCase):
         prepare.assert_called_once()
         stop_fwd.assert_called_once()
         self.assertEqual(stop_fwd.call_args.kwargs.get("instance_key"), "fwd-1")
+class IndexedProxyPoolTests(unittest.TestCase):
+    def test_index_parser_ignores_comments_quotes_and_duplicate_rows(self):
+        with tempfile.TemporaryDirectory() as d:
+            pool = Path(d) / "pool.txt"
+            pool.write_text(
+                "# label\n"
+                "'127.0.0.1:9001'\n"
+                "\n"
+                "127.0.0.1:9001\n"
+                '"127.0.0.1:9002"\n',
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                flow._proxy_file_entries(pool),
+                ["127.0.0.1:9001", "127.0.0.1:9002"],
+            )
+            self.assertEqual(
+                flow.choose_proxy(proxy_file=str(pool), index=1),
+                "http://127.0.0.1:9002",
+            )
 
 
 if __name__ == "__main__":

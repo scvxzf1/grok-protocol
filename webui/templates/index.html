@@ -31,8 +31,8 @@
       <form id="cfgForm" class="form">
         <label>模式
           <select name="run_mode">
-            <option value="register_otp">模式1:注册+otp</option>
-            <option value="register_sso">模式2:注册+sso转换</option>
+            <option value="register_otp">同会话换凭证（PKCE，推荐）</option>
+            <option value="register_sso">SSO 二次转换（Device Flow）</option>
           </select>
         </label>
         <label>Turnstile
@@ -43,7 +43,7 @@
             <option value="yescaptcha">YesCaptcha</option>
           </select>
         </label>
-        <label class="check"><input type="checkbox" name="turnstile_headless" /> 无头(local→Xvfb virtual-headed)</label>
+        <label class="check"><input type="checkbox" name="turnstile_headless" /> 真无头（Chrome 原生 headless=new）</label>
         <label>目标模式
           <select name="target_mode" id="targetMode">
             <option value="count">固定数量</option>

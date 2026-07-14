@@ -85,7 +85,6 @@ function fill(data) {
   set("proxy", f.proxy || "");
   set("proxy_file", f.proxy_file || "proxies.txt");
   set("proxy_subscription_url", f.proxy_subscription_url || "");
-  set("proxy_subscription_local_http", f.proxy_subscription_local_http || "");
   set("embedded_proxy_enabled", !!f.embedded_proxy_enabled, true);
   set("embedded_proxy_binary", f.embedded_proxy_binary || "");
   set("embedded_proxy_base_port", f.embedded_proxy_base_port == null ? 28000 : f.embedded_proxy_base_port);
@@ -96,7 +95,6 @@ function fill(data) {
     "embedded_proxy_probe_timeout_sec",
     f.embedded_proxy_probe_timeout_sec == null ? 5 : f.embedded_proxy_probe_timeout_sec
   );
-  set("proxy_parent", f.proxy_parent || "");
   set("local_proxy_port", f.local_proxy_port || 17890);
   set("proxy_random", !!f.proxy_random, true);
   set("proxy_rotate_session", !!f.proxy_rotate_session, true);
@@ -155,7 +153,6 @@ function collectFields() {
     proxy: g("proxy"),
     proxy_file: g("proxy_file"),
     proxy_subscription_url: g("proxy_subscription_url"),
-    proxy_subscription_local_http: g("proxy_subscription_local_http"),
     embedded_proxy_enabled: g("embedded_proxy_enabled", true),
     embedded_proxy_binary: g("embedded_proxy_binary"),
     embedded_proxy_base_port: Number(g("embedded_proxy_base_port") || 28000),
@@ -163,7 +160,6 @@ function collectFields() {
     embedded_proxy_probe_host: g("embedded_proxy_probe_host"),
     embedded_proxy_probe_port: Number(g("embedded_proxy_probe_port") || 443),
     embedded_proxy_probe_timeout_sec: Number(g("embedded_proxy_probe_timeout_sec") || 5),
-    proxy_parent: g("proxy_parent"),
     local_proxy_port: Number(g("local_proxy_port") || 17890),
     proxy_random: g("proxy_random", true),
     proxy_rotate_session: g("proxy_rotate_session", true),
@@ -238,7 +234,7 @@ function renderSubImport(data) {
   lines.push(`订阅: ${data.url || "-"}`);
   lines.push(`格式: ${data.body_kind || "-"} | 节点: ${data.node_count || 0} | 可用HTTP: ${data.usable_http_count || 0} | 跳过: ${data.skipped_count || 0}`);
   lines.push(`协议统计: ${schemeText}`);
-  lines.push(`代理模式: ${data.proxy_mode || "-"} | 直连代理: ${data.proxy || "-"} | 本地回退: ${data.applied_local_http ? "是" : "否"}`);
+  lines.push(`代理模式: ${data.proxy_mode || "-"} | 直连代理: ${data.proxy || "-"}`);
   if ((data.warnings || []).length) {
     lines.push("");
     lines.push("警告:");
@@ -263,7 +259,7 @@ $("btnImportSub").onclick = async () => {
     $("proxyTestResult").textContent = "拉取订阅中…";
     $("btnImportSub").disabled = true;
 
-    // 先把当前表单字段落盘，保证订阅 URL / 本地 HTTP 入口被记住。
+    // 先把当前表单字段落盘，保证订阅 URL 被记住。
     const saved = await api("/api/config-center", {
       method: "PUT",
       body: JSON.stringify({
@@ -275,15 +271,12 @@ $("btnImportSub").onclick = async () => {
     fill(saved);
 
     const subUrl = (fieldEl("proxy_subscription_url") || {}).value || "";
-    const localHttp = (fieldEl("proxy_subscription_local_http") || {}).value || "";
     const data = await api("/api/proxy-pool/import-subscription", {
       method: "POST",
       body: JSON.stringify({
         url: subUrl,
         proxy_subscription_url: subUrl,
-        proxy_subscription_local_http: localHttp,
         write_pool: true,
-        use_local_http_if_empty: true,
         timeout: 20,
       }),
     });
@@ -307,8 +300,6 @@ $("btnImportSub").onclick = async () => {
       setMsg(`订阅导入完成：可用 HTTP ${usable}/${total}`);
     } else if (embeddedOn && (data.vless_for_embedded || vlessCount > 0)) {
       setMsg(`已识别 ${vlessCount || total} 个 VLESS 节点。请到下方“内嵌代理内核”点启动/重载，再预检`, true);
-    } else if (data.applied_local_http) {
-      setMsg(`订阅无 HTTP 节点，已回退本地入口（节点 ${total}）`, true);
     } else {
       setMsg(`订阅已拉取，但无可用 HTTP 节点（节点 ${total}）`, true);
     }

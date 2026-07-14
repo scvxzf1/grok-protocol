@@ -34,7 +34,7 @@ def build_parser() -> argparse.ArgumentParser:
     solve.add_argument(
         "--parent-proxy",
         default="",
-        help="Optional parent proxy (e.g. Clash http://127.0.0.1:7890)",
+        help=argparse.SUPPRESS,
     )
     solve.add_argument("--page-url", default="", help="Signup page URL")
     solve.add_argument("--timeout-sec", type=int, default=0)

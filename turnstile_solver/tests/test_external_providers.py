@@ -69,16 +69,19 @@ class ExternalProviderPayloadTests(unittest.TestCase):
                 self.assertNotIn("proxyPassword", task)
                 self.assertNotIn("local-secret", repr(task))
 
-    def test_capsolver_remains_proxyless_and_forwards_metadata(self):
+    def test_capsolver_uses_authenticated_proxy_and_forwards_metadata(self):
         task = _build_task(
             _broker_request("capsolver", "http://proxy-user:proxy-secret@8.8.8.8:8080"),
             "capsolver",
         )
 
-        self.assertEqual(task["type"], "AntiTurnstileTaskProxyLess")
+        self.assertEqual(task["type"], "AntiTurnstileTask")
+        self.assertEqual(task["proxyType"], "http")
+        self.assertEqual(task["proxyAddress"], "8.8.8.8")
+        self.assertEqual(task["proxyPort"], 8080)
+        self.assertEqual(task["proxyLogin"], "proxy-user")
+        self.assertEqual(task["proxyPassword"], "proxy-secret")
         self.assertEqual(task["metadata"], {"action": "signup", "cdata": "opaque-cdata"})
-        self.assertNotIn("proxy", task)
-        self.assertNotIn("proxy-secret", repr(task))
 
     def test_unexpected_failure_does_not_expose_api_key_or_proxy_credentials(self):
         api_key = "private-provider-key"

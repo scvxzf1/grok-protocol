@@ -187,8 +187,8 @@ class ProtocolTui:
             ("并发数", str(self.settings.workers)),
             ("OAuth 输出", str(self.settings.output_dir)),
             ("代理", _proxy_mode_label(proxy_value)),
-            ("SSO重试", f"{self.settings.sso_convert_retries} 次（模式2转换）"),
-            ("SSO冷却", f"{self.settings.sso_convert_cooldown} 秒（模式2转换）"),
+            ("SSO重试", f"{self.settings.sso_convert_retries} 次（仅 Device Flow）"),
+            ("SSO冷却", f"{self.settings.sso_convert_cooldown} 秒（仅 Device Flow）"),
             ("浏览器状态", format_browser_health()),
             ("清理残留", "清 Playwright + /tmp 临时浏览器目录"),
             ("重载配置", "重新读取服务商、邮箱和默认值"),
@@ -507,7 +507,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--mode",
         default=None,
         choices=list(RUN_MODE_ORDER),
-        help="运行模式：register_otp=模式1注册+otp；register_sso=模式2注册+sso转换(Device Flow)；默认读配置",
+        help="凭证方式：register_otp=同会话 PKCE；register_sso=SSO Device Flow；默认读配置",
     )
     parser.add_argument("--count", type=int, default=None, help="注册任务数量")
     parser.add_argument("--workers", "--concurrency", dest="workers", type=int, default=None, help="最大并发数")

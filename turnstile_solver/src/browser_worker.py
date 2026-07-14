@@ -20,6 +20,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from turnstile_broker import build_chrome_brand_version_list
+
 
 CLICK_EMAIL_JS = r"""
 function isVisible(node) {
@@ -193,6 +195,7 @@ return {
   tokenLen: token.length,
   turnstileApiType: typeof window.turnstile,
   turnstileRespLen: turnstileResp.length,
+  turnstileError: String(window.__xaiTsLastError || ''),
   sitekeys,
   sitekeyCount: sitekeys.length,
   iframeCount: iframes.length,
@@ -252,7 +255,7 @@ function doRender() {{
   const opts = {{
     sitekey,
     callback:onToken,
-    'error-callback':function(code){{ window.__xaiTsLastError = String(code || 'error'); }},
+    'error-callback':function(code){{ window.__xaiTsLastError = String(code || 'error'); return true; }},
     'expired-callback':function(){{ window.__xaiTsToken = ''; try {{ ensureHiddenInput().value = ''; }} catch (e) {{}} }},
     'timeout-callback':function(){{ window.__xaiTsLastError = 'timeout'; }},
     size:'normal',
@@ -263,7 +266,6 @@ function doRender() {{
   if (cdata) opts.cData = cdata;
   try {{
     window.__xaiTsWidgetId = turnstile.render(host, opts);
-    try {{ if (typeof turnstile.execute === 'function') turnstile.execute(window.__xaiTsWidgetId); }} catch (e) {{}}
     return {{ok:true, reason:'rendered', widgetId:window.__xaiTsWidgetId, tokenLen:(window.__xaiTsToken||'').length}};
   }} catch (e) {{
     return {{ok:false, reason:'render-error', error:String(e)}};
@@ -336,35 +338,9 @@ def _ensure_injected_turnstile_widget(
 def _nudge_turnstile_widget(page: Any, *, log_callback: LogFn = None) -> str:
     actions: List[str] = []
     try:
-        clicked = page.run_js(
-            """
-const nodes = Array.from(document.querySelectorAll(
-  '#xai-local-ts-host, #xai-local-ts-host iframe, .cf-turnstile, [data-sitekey], #cf-turnstile, #turnstile-wrapper, iframe[src*="turnstile"], iframe[src*="challenges.cloudflare"]'
-));
-let count = 0;
-for (const node of nodes) {
-  try { node.scrollIntoView({block:'center', inline:'center'}); } catch (e) {}
-  try { node.click(); count += 1; } catch (e) {}
-  try {
-    const rect = node.getBoundingClientRect();
-    const x = rect.left + Math.min(Math.max(rect.width * 0.2, 8), 40);
-    const y = rect.top + rect.height / 2;
-    for (const type of ['pointerdown', 'mousedown', 'mouseup', 'click']) {
-      node.dispatchEvent(new MouseEvent(type, {bubbles:true, clientX:x, clientY:y, view:window}));
-    }
-  } catch (e) {}
-}
-return count;
-"""
-        )
-        if int(clicked or 0) > 0:
-            actions.append(f"dom:{clicked}")
-    except Exception:
-        pass
-    try:
         api_result = page.run_js(
             """
-const out = {executed:false, tokenLen:0, error:''};
+const out = {tokenLen:0, error:''};
 try {
   if (window.turnstile && window.__xaiTsWidgetId != null) {
     try {
@@ -376,20 +352,12 @@ try {
         if (input) input.value = token;
       }
     } catch (e) {}
-    try {
-      if (typeof turnstile.execute === 'function') {
-        turnstile.execute(window.__xaiTsWidgetId);
-        out.executed = true;
-      }
-    } catch (e) { out.error = String(e); }
   }
 } catch (e) { out.error = String(e); }
 return out;
 """
         )
         if isinstance(api_result, dict):
-            if api_result.get("executed"):
-                actions.append("api-execute")
             if int(api_result.get("tokenLen") or 0) >= 80:
                 actions.append(f"api-token:{api_result.get('tokenLen')}")
     except Exception:
@@ -652,7 +620,9 @@ def _default_platform_version(client_hint_platform: str) -> str:
         return "10.15.7"
     if platform == "android":
         return "10.0.0"
-    return "0.0.0"
+    # Chromium reports an empty Linux platformVersion.  "0.0.0" is a common
+    # synthetic fingerprint artifact and diverges from the real binary.
+    return "" if platform == "linux" else "0.0.0"
 
 
 def build_cdp_user_agent_metadata(
@@ -672,12 +642,15 @@ def build_cdp_user_agent_metadata(
         raise RuntimeError("缺少 expected_client_hint_platform")
     return {
         "brands": [
-            {"brand": "Not.A/Brand", "version": "99"},
-            {"brand": "Chromium", "version": str(major)},
+            {"brand": brand, "version": version}
+            for brand, version in build_chrome_brand_version_list(str(major))
         ],
         "fullVersionList": [
-            {"brand": "Not.A/Brand", "version": "99.0.0.0"},
-            {"brand": "Chromium", "version": full_version},
+            {"brand": brand, "version": version}
+            for brand, version in build_chrome_brand_version_list(
+                full_version,
+                full_version=True,
+            )
         ],
         "platform": platform,
         "platformVersion": _default_platform_version(platform),
@@ -687,6 +660,22 @@ def build_cdp_user_agent_metadata(
         "mobile": False,
         "wow64": False,
     }
+
+
+def _navigator_accept_language(value: str) -> str:
+    """Return CDP language tokens without HTTP q-values.
+
+    Passing a weighted HTTP header directly to CDP makes navigator.languages
+    contain values such as ``zh;q=0.9``.  Real Chrome exposes plain language
+    tags there, while the weighted header is installed separately below.
+    """
+
+    languages: List[str] = []
+    for item in str(value or "").split(","):
+        tag = item.split(";", 1)[0].strip()
+        if tag and tag not in languages:
+            languages.append(tag)
+    return ",".join(languages)
 
 
 def apply_cdp_fingerprint_override(
@@ -739,10 +728,26 @@ def apply_cdp_fingerprint_override(
         run_cdp(
             "Emulation.setUserAgentOverride",
             userAgent=user_agent,
-            acceptLanguage=accept_language,
+            acceptLanguage=_navigator_accept_language(accept_language),
             platform=navigator_platform,
             userAgentMetadata=metadata,
         )
+        # Keep the actual request header weighted while navigator.languages
+        # remains a list of valid language tags.
+        run_cdp(
+            "Network.setExtraHTTPHeaders",
+            headers={"Accept-Language": accept_language},
+        )
+        if bool(request.headless):
+            run_cdp(
+                "Emulation.setDeviceMetricsOverride",
+                width=1280,
+                height=800,
+                deviceScaleFactor=1,
+                mobile=False,
+                screenWidth=1280,
+                screenHeight=800,
+            )
     except Exception as exc:
         if strict:
             raise RuntimeError(f"Emulation.setUserAgentOverride failed: {exc}") from exc
@@ -776,6 +781,7 @@ def _summarize_diag(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
         "token_len_last": token_lens[-1] if token_lens else 0,
         "token_seen_nonzero": any(x > 0 for x in token_lens),
         "turnstile_resp_len_max": max(resp_lens) if resp_lens else 0,
+        "turnstile_error_last": str(last.get("turnstileError") or ""),
         "sitekeys": sitekeys,
         "sitekey_count": len(sitekeys),
         "has_cf_input_last": bool(last.get("hasCfInput")),
@@ -796,6 +802,7 @@ def _summarize_diag(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
                 "turnstileIframeCount": s.get("turnstileIframeCount"),
                 "sitekeyCount": s.get("sitekeyCount"),
                 "challengeLike": s.get("challengeLike"),
+                "turnstileError": s.get("turnstileError"),
             }
             for s in samples
         ],
@@ -917,6 +924,7 @@ class BrowserWorker:
         strict = bool((request.metadata or {}).get("strict_fingerprint", self.config.strict_fingerprint))
         samples: List[Dict[str, Any]] = []
         token = ""
+        challenge_error = ""
         fingerprint = FingerprintSnapshot()
         try:
             cdp_metadata = apply_cdp_fingerprint_override(
@@ -954,11 +962,22 @@ class BrowserWorker:
 
             next_diag_at = 0.0
             next_inject_at = time.monotonic() + 4.0
-            next_nudge_at = time.monotonic() + 2.0
+            # Give the managed challenge time to complete naturally before one
+            # cautious interaction.  Repeated execute/click loops are both
+            # noisy and commonly end in Cloudflare 300*/600* failures.
+            next_nudge_at = time.monotonic() + 18.0
             while time.monotonic() < deadline:
                 now = time.monotonic()
                 token = read_turnstile_token_from_page(page)
                 if len(token) >= min_len:
+                    break
+                try:
+                    challenge_error = str(
+                        page.run_js("return String(window.__xaiTsLastError || '')") or ""
+                    ).strip()
+                except Exception:
+                    challenge_error = ""
+                if challenge_error.startswith(("300", "600")):
                     break
                 if sitekey and now >= next_inject_at:
                     _ensure_injected_turnstile_widget(
@@ -973,7 +992,7 @@ class BrowserWorker:
                     next_inject_at = now + 4.0
                 if now >= next_nudge_at:
                     _nudge_turnstile_widget(page, log_callback=self.log_callback)
-                    next_nudge_at = now + 3.0
+                    next_nudge_at = now + 12.0
                 if diagnose and now >= next_diag_at:
                     snap = diagnose_page(page)
                     if isinstance(snap, dict):
@@ -1010,6 +1029,7 @@ class BrowserWorker:
                 "language": fingerprint.navigator_language,
                 "cdp_user_agent_metadata": cdp_metadata,
                 "browser_version": browser_version,
+                "turnstile_error": challenge_error,
             }
             if len(token) < min_len:
                 # 超时/空 token 时，空 UAData 往往只是错误页副作用，不要盖住真正原因。
@@ -1032,7 +1052,11 @@ class BrowserWorker:
                     page_url=page_url,
                     user_agent=fingerprint.user_agent,
                     elapsed_ms=elapsed_ms,
-                    error=f"在 {timeout}s 内未捕获到可用 Turnstile token (len={len(token)}, min={min_len})",
+                    error=(
+                        f"Turnstile challenge error {challenge_error}"
+                        if challenge_error
+                        else f"在 {timeout}s 内未捕获到可用 Turnstile token (len={len(token)}, min={min_len})"
+                    ),
                     extras=extras,
                     fingerprint=fingerprint,
                 )

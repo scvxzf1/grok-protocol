@@ -14,9 +14,16 @@ accounts_*.txt
 mail_credentials.txt
 xai_credentials/
 http_runs/
+/exports/
 xai-*.json
+/测试用配置/
 proxies.txt
 *.log
+*.state.json
+*.state.json.lock
+*.txt.lock
+*.tmp
+*.tmp.*
 .grok_proxy_health.json
 .grok_register_stats.json
 .grok_register_worker_state/

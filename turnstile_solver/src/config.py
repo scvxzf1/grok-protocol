@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
@@ -10,13 +12,47 @@ from typing import Any, Dict, Optional, Union
 DEFAULT_SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
 
 
+def _config_bool(value: Any, *, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    text = str(value).strip().lower()
+    if not text:
+        return default
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"无效布尔配置值: {value!r}")
+
+
 def detect_system_chrome_path() -> str:
     """Best-effort discovery of a local Chrome/Chromium binary."""
     env = str(os.environ.get("TURNSTILE_BROWSER_PATH") or "").strip()
     candidates = []
     if env:
         candidates.append(env)
-    # Common Linux/mac locations first; Windows later if present.
+
+    # Chrome is normally not added to PATH on Windows.  Probe its standard
+    # per-machine and per-user install roots before falling back to command
+    # lookup.  Keep these candidates Chrome-only: the canonical HTTP/browser
+    # fingerprint currently advertises the Google Chrome product brand, so
+    # silently selecting Edge or an unbranded Chromium binary would recreate
+    # the very product/UA mismatch this discovery is intended to prevent.
+    windows_roots = []
+    for name in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+        value = str(os.environ.get(name) or "").strip()
+        if value and value not in windows_roots:
+            windows_roots.append(value)
+    for root in windows_roots:
+        candidates.append(
+            str(Path(root) / "Google" / "Chrome" / "Application" / "chrome.exe")
+        )
+
+    # Common Linux/mac locations.
     candidates.extend(
         [
             "/usr/bin/google-chrome-stable",
@@ -58,15 +94,80 @@ def detect_system_chrome_path() -> str:
     return ""
 
 
-def detect_chrome_major(browser_path: str = "") -> str:
-    """Read Chrome major version from browser_path --version output."""
+def _windows_file_version(browser_path: str) -> str:
+    """Read a Windows executable's fixed file version without launching it."""
+
+    if os.name != "nt":
+        return ""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        version = ctypes.windll.version
+        handle = wintypes.DWORD(0)
+        size = int(
+            version.GetFileVersionInfoSizeW(
+                str(browser_path),
+                ctypes.byref(handle),
+            )
+        )
+        if size <= 0:
+            return ""
+        buffer = ctypes.create_string_buffer(size)
+        if not version.GetFileVersionInfoW(str(browser_path), 0, size, buffer):
+            return ""
+
+        value = ctypes.c_void_p()
+        value_len = wintypes.UINT(0)
+        if not version.VerQueryValueW(
+            buffer,
+            "\\",
+            ctypes.byref(value),
+            ctypes.byref(value_len),
+        ):
+            return ""
+
+        class VS_FIXEDFILEINFO(ctypes.Structure):
+            _fields_ = [
+                ("dwSignature", wintypes.DWORD),
+                ("dwStrucVersion", wintypes.DWORD),
+                ("dwFileVersionMS", wintypes.DWORD),
+                ("dwFileVersionLS", wintypes.DWORD),
+                ("dwProductVersionMS", wintypes.DWORD),
+                ("dwProductVersionLS", wintypes.DWORD),
+                ("dwFileFlagsMask", wintypes.DWORD),
+                ("dwFileFlags", wintypes.DWORD),
+                ("dwFileOS", wintypes.DWORD),
+                ("dwFileType", wintypes.DWORD),
+                ("dwFileSubtype", wintypes.DWORD),
+                ("dwFileDateMS", wintypes.DWORD),
+                ("dwFileDateLS", wintypes.DWORD),
+            ]
+
+        info = ctypes.cast(value, ctypes.POINTER(VS_FIXEDFILEINFO)).contents
+        if int(info.dwSignature) != 0xFEEF04BD:
+            return ""
+        parts = (
+            int(info.dwFileVersionMS) >> 16,
+            int(info.dwFileVersionMS) & 0xFFFF,
+            int(info.dwFileVersionLS) >> 16,
+            int(info.dwFileVersionLS) & 0xFFFF,
+        )
+        return ".".join(str(part) for part in parts)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return ""
+
+
+def detect_chrome_full_version(browser_path: str = "") -> str:
+    """Read the four-part Chrome version without starting a GUI on Windows."""
+
     path = str(browser_path or detect_system_chrome_path() or "").strip()
     if not path:
         return ""
+    file_version = _windows_file_version(path)
+    if re.fullmatch(r"\d+\.\d+\.\d+\.\d+", file_version):
+        return file_version
     try:
-        import re
-        import subprocess
-
         output = subprocess.check_output(
             [path, "--version"],
             stderr=subprocess.STDOUT,
@@ -75,10 +176,15 @@ def detect_chrome_major(browser_path: str = "") -> str:
         )
     except Exception:
         return ""
-    match = re.search(r"(\d+)\.\d+\.\d+\.\d+", str(output or ""))
-    if not match:
-        match = re.search(r"(\d+)\.", str(output or ""))
+    match = re.search(r"(\d+\.\d+\.\d+\.\d+)", str(output or ""))
     return str(match.group(1)) if match else ""
+
+
+def detect_chrome_major(browser_path: str = "") -> str:
+    """Read Chrome's major version from its executable metadata/version output."""
+
+    full_version = detect_chrome_full_version(browser_path)
+    return full_version.split(".", 1)[0] if full_version else ""
 
 
 
@@ -97,14 +203,20 @@ class SolverConfig:
     local_proxy_port: int = 0
     user_agent: str = ""
     enable_metrics: bool = True
-    browser_max_tasks: int = 25
-    browser_max_age_sec: int = 1800
-    browser_idle_ttl_sec: int = 600
+    browser_max_tasks: int = 12
+    browser_max_age_sec: int = 900
+    browser_idle_ttl_sec: int = 90
     browser_maintenance_interval_sec: float = 5.0
     # Chrome process-tree RSS; shared pages may be counted in multiple children.
-    # 2048 MiB is a conservative default rather than a per-process hard limit.
-    browser_max_rss_mb: int = 2048
+    # 1024 MiB keeps a bloated slot from lingering while leaving enough room for
+    # Chrome's shared pages being counted once per child by the simple RSS sum.
+    browser_max_rss_mb: int = 1024
     browser_max_consecutive_failures: int = 2
+    # A 300*/600* Turnstile callback is explicitly retryable.  Retry inside
+    # the broker's original deadline so callers do not have to spend another
+    # mailbox/registration attempt merely to obtain a fresh browser context.
+    browser_solve_max_attempts: int = 2
+    browser_retry_backoff_sec: float = 1.25
     lease_ttl_sec: int = 240
     queue_timeout_sec: int = 180
     strict_fingerprint: bool = True
@@ -122,7 +234,14 @@ class SolverConfig:
         return cls(
             host=str(data.get("host") or "127.0.0.1"),
             port=int(data.get("port") or 8787),
-            max_concurrency=max(1, int(data.get("max_concurrency") or 2)),
+            max_concurrency=max(
+                1,
+                int(
+                    data.get("max_concurrency")
+                    or data.get("local_turnstile_max_workers")
+                    or 2
+                ),
+            ),
             browser_timeout_sec=max(
                 5,
                 int(
@@ -133,22 +252,64 @@ class SolverConfig:
             ),
             token_min_length=max(20, int(data.get("token_min_length") or 80)),
             signup_url=str(data.get("signup_url") or DEFAULT_SIGNUP_URL),
-            headless=bool(data.get("headless") or False),
+            # The parent project calls this setting turnstile_headless.  Accept
+            # both names so a standalone broker and the in-process path agree.
+            headless=_config_bool(
+                data.get("headless", data.get("turnstile_headless")), default=False
+            ),
             proxy=str(data.get("proxy") or ""),
-            parent_proxy=str(data.get("parent_proxy") or data.get("proxy_parent") or ""),
+            # Parent chaining is request-scoped and injected only for a leased
+            # embedded mihomo listener.  Retired file-config values are ignored.
+            parent_proxy="",
             proxy_file=str(data.get("proxy_file") or ""),
             local_proxy_port=int(data.get("local_proxy_port") or 0),
             user_agent=str(data.get("user_agent") or ""),
-            enable_metrics=bool(data.get("enable_metrics", True)),
-            browser_max_tasks=max(1, int(data.get("browser_max_tasks") or 25)),
-            browser_max_age_sec=max(60, int(data.get("browser_max_age_sec") or 1800)),
-            browser_idle_ttl_sec=max(0, int(data.get("browser_idle_ttl_sec") or 600)),
+            enable_metrics=_config_bool(data.get("enable_metrics"), default=True),
+            browser_max_tasks=max(1, int(data.get("browser_max_tasks") or 12)),
+            browser_max_age_sec=max(60, int(data.get("browser_max_age_sec") or 900)),
+            browser_idle_ttl_sec=max(
+                0,
+                int(
+                    90
+                    if data.get("browser_idle_ttl_sec") in (None, "")
+                    else data.get("browser_idle_ttl_sec")
+                ),
+            ),
             browser_maintenance_interval_sec=max(
                 0.05, float(data.get("browser_maintenance_interval_sec") or 5.0)
             ),
-            browser_max_rss_mb=max(0, int(data.get("browser_max_rss_mb") or 2048)),
+            browser_max_rss_mb=max(
+                0,
+                int(
+                    1024
+                    if data.get("browser_max_rss_mb") in (None, "")
+                    else data.get("browser_max_rss_mb")
+                ),
+            ),
             browser_max_consecutive_failures=max(
                 1, int(data.get("browser_max_consecutive_failures") or 2)
+            ),
+            browser_solve_max_attempts=max(
+                1,
+                min(
+                    4,
+                    int(
+                        2
+                        if data.get("browser_solve_max_attempts") in (None, "")
+                        else data.get("browser_solve_max_attempts")
+                    ),
+                ),
+            ),
+            browser_retry_backoff_sec=max(
+                0.0,
+                min(
+                    10.0,
+                    float(
+                        1.25
+                        if data.get("browser_retry_backoff_sec") in (None, "")
+                        else data.get("browser_retry_backoff_sec")
+                    ),
+                ),
             ),
             lease_ttl_sec=max(1, min(240, int(data.get("lease_ttl_sec") or 240))),
             queue_timeout_sec=max(
@@ -159,7 +320,7 @@ class SolverConfig:
                     or 90
                 ),
             ),
-            strict_fingerprint=bool(data.get("strict_fingerprint", True)),
+            strict_fingerprint=_config_bool(data.get("strict_fingerprint"), default=True),
             locale=str(data.get("locale") or ""),
             accept_language=str(data.get("accept_language") or ""),
             external_provider_workers=max(1, int(data.get("external_provider_workers") or 20)),
@@ -169,7 +330,7 @@ class SolverConfig:
                 1, int(data.get("submit_permit_lease_sec") or 120)
             ),
             browser_path=str(data.get("browser_path") or ""),
-            no_sandbox=bool(data.get("no_sandbox", False)),
+            no_sandbox=_config_bool(data.get("no_sandbox"), default=False),
         )
 
     def resolved_browser_path(self) -> str:

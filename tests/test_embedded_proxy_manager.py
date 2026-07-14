@@ -84,7 +84,11 @@ class LifecycleTests(unittest.TestCase):
     def test_find_binary_prefers_explicit_then_path(self):
         from embedded_proxy_manager import find_mihomo_binary
 
-        self.assertEqual(find_mihomo_binary("/usr/bin/verge-mihomo"), "/usr/bin/verge-mihomo")
+        fake_binary = str((Path.cwd() / "verge-mihomo").resolve())
+        with mock.patch.object(Path, "is_file", return_value=True), mock.patch(
+            "embedded_proxy_manager.os.access", return_value=True
+        ):
+            self.assertEqual(find_mihomo_binary(fake_binary), fake_binary)
 
     def test_probe_marks_healthy(self):
         from embedded_proxy_manager import EmbeddedProxyConfig, EmbeddedProxyManager, NodeSlot
@@ -141,8 +145,9 @@ class LifecycleTests(unittest.TestCase):
                 params={"security": "tls", "sni": "jp.example", "type": "tcp"},
             )
         ]
+        fake_binary = str((Path.cwd() / "verge-mihomo").resolve())
         cfg = EmbeddedProxyConfig(
-            binary_path="/usr/bin/verge-mihomo",
+            binary_path=fake_binary,
             base_port=28000,
             listen_host="127.0.0.1",
         )
@@ -155,19 +160,28 @@ class LifecycleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             with mock.patch.object(m, "_project_root", return_value=root):
-                with mock.patch("embedded_proxy_manager.subprocess.Popen", return_value=fake_proc) as popen:
-                    with mock.patch.object(m, "_wait_port_open", return_value=True):
-                        info = m.start(nodes, cfg)
+                with mock.patch(
+                    "embedded_proxy_manager.find_mihomo_binary",
+                    return_value=fake_binary,
+                ):
+                    with mock.patch("embedded_proxy_manager.subprocess.Popen", return_value=fake_proc) as popen:
+                        with mock.patch.object(m, "_wait_port_open", return_value=True):
+                            info = m.start(nodes, cfg)
 
-            config_path = root / ".embedded_mihomo" / "config.yaml"
-            self.assertTrue(config_path.is_file())
-            self.assertTrue(m._running)
-            self.assertTrue(info.get("running"))
-            popen.assert_called_once()
-            args = popen.call_args[0][0]
-            self.assertEqual(args[0], "/usr/bin/verge-mihomo")
-            self.assertIn("-f", args)
-            self.assertIn("-d", args)
+            try:
+                config_path = root / ".embedded_mihomo" / "config.yaml"
+                self.assertTrue(config_path.is_file())
+                self.assertTrue(m._running)
+                self.assertTrue(info.get("running"))
+                popen.assert_called_once()
+                args = popen.call_args[0][0]
+                self.assertEqual(args[0], fake_binary)
+                self.assertIn("-f", args)
+                self.assertIn("-d", args)
+            finally:
+                # Windows keeps the log file locked while its handle is open;
+                # stop also exercises the manager's normal handle cleanup.
+                m.stop()
 
 
 class CooldownReviveTests(unittest.TestCase):
@@ -209,4 +223,3 @@ class CooldownReviveTests(unittest.TestCase):
         mgr._running = True
         st = mgr.status()
         self.assertEqual(st["healthy"], 1)
-

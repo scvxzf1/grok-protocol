@@ -107,8 +107,8 @@
         <label class="check">
           <input type="checkbox" name="turnstile_headless" />
           <span class="field-title">
-            Turnstile 无头
-            <button type="button" class="help-tip" aria-label="说明" data-tip="本地求解时尽量不弹窗（需 Xvfb 环境）">?</button>
+            Turnstile 真无头
+            <button type="button" class="help-tip" aria-label="说明" data-tip="本地求解使用 Chrome 原生 headless=new，不启动 Xvfb 或可见窗口">?</button>
           </span>
         </label>
         <label>
@@ -208,23 +208,9 @@
         <label>
           <span class="field-title">
             订阅链接
-            <button type="button" class="help-tip" aria-label="说明" data-tip="支持 base64/明文订阅。HTTP 代理会写入池；VLESS/SS 等会解析并提示需本地客户端">?</button>
+            <button type="button" class="help-tip" aria-label="说明" data-tip="支持 base64/明文订阅。HTTP 代理会写入池；VLESS 节点可由项目内置 mihomo 使用">?</button>
           </span>
           <input name="proxy_subscription_url" form="cfgCenterForm" type="text" placeholder="https://example.com/api/v1/sub?token=..." />
-        </label>
-        <label>
-          <span class="field-title">
-            订阅本地 HTTP 入口
-            <button type="button" class="help-tip" aria-label="说明" data-tip="当订阅全是 VLESS/SS 时，填写本地 Clash/V2Ray 的 HTTP 端口，如 http://127.0.0.1:7890">?</button>
-          </span>
-          <input name="proxy_subscription_local_http" form="cfgCenterForm" type="text" placeholder="http://127.0.0.1:7890" />
-        </label>
-        <label>
-          <span class="field-title">
-            上游父代理
-            <button type="button" class="help-tip" aria-label="说明" data-tip="先经本地 Clash 等再上认证代理（可选）">?</button>
-          </span>
-          <input name="proxy_parent" form="cfgCenterForm" type="text" />
         </label>
         <label>
           <span class="field-title">

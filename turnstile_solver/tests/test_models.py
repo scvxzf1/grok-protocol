@@ -18,7 +18,66 @@ from src.service import SolverService
 
 class SolverScaffoldTests(unittest.TestCase):
     def test_default_browser_tree_rss_budget_is_conservative(self):
-        self.assertEqual(SolverConfig().browser_max_rss_mb, 2048)
+        self.assertEqual(SolverConfig().browser_max_tasks, 12)
+        self.assertEqual(SolverConfig().browser_max_age_sec, 900)
+        self.assertEqual(SolverConfig().browser_idle_ttl_sec, 90)
+        self.assertEqual(SolverConfig().browser_max_rss_mb, 1024)
+        self.assertEqual(SolverConfig().browser_solve_max_attempts, 2)
+        self.assertEqual(SolverConfig().browser_retry_backoff_sec, 1.25)
+
+    def test_parent_headless_alias_and_disabled_recycle_limits(self):
+        config = SolverConfig.from_dict(
+            {
+                "turnstile_headless": True,
+                "browser_idle_ttl_sec": 0,
+                "browser_max_rss_mb": 0,
+            }
+        )
+        self.assertTrue(config.headless)
+        self.assertEqual(config.browser_idle_ttl_sec, 0)
+        self.assertEqual(config.browser_max_rss_mb, 0)
+
+    def test_string_boolean_config_values_are_parsed_explicitly(self):
+        config = SolverConfig.from_dict(
+            {
+                "turnstile_headless": "false",
+                "enable_metrics": "0",
+                "strict_fingerprint": "no",
+                "no_sandbox": "true",
+            }
+        )
+        self.assertFalse(config.headless)
+        self.assertFalse(config.enable_metrics)
+        self.assertFalse(config.strict_fingerprint)
+        self.assertTrue(config.no_sandbox)
+
+    def test_browser_challenge_retry_config_is_bounded(self):
+        config = SolverConfig.from_dict(
+            {
+                "browser_solve_max_attempts": 99,
+                "browser_retry_backoff_sec": 99,
+            }
+        )
+        self.assertEqual(config.browser_solve_max_attempts, 4)
+        self.assertEqual(config.browser_retry_backoff_sec, 10.0)
+
+        disabled_backoff = SolverConfig.from_dict(
+            {
+                "browser_solve_max_attempts": 0,
+                "browser_retry_backoff_sec": 0,
+            }
+        )
+        self.assertEqual(disabled_backoff.browser_solve_max_attempts, 1)
+        self.assertEqual(disabled_backoff.browser_retry_backoff_sec, 0.0)
+
+    def test_parent_local_worker_cap_is_solver_concurrency_fallback(self):
+        config = SolverConfig.from_dict({"local_turnstile_max_workers": 5})
+        self.assertEqual(config.max_concurrency, 5)
+
+        explicit = SolverConfig.from_dict(
+            {"local_turnstile_max_workers": 5, "max_concurrency": 3}
+        )
+        self.assertEqual(explicit.max_concurrency, 3)
 
     def test_normalize_proxy_host_port_user_pass(self):
         self.assertEqual(

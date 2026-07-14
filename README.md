@@ -109,8 +109,10 @@ cp config.example.json config.json
 | --- | --- |
 | `email_provider` | 邮箱服务商：`duckmail`、`yyds`、`cloudflare` |
 | `register_count` | 本次目标注册数量 |
-| `proxy` | 代理地址，可留空 |
-| `proxy_parent` | 可选父 HTTP 代理；设置后本地转发器会先经它 CONNECT 到认证上游，例如 Clash `http://127.0.0.1:7890` |
+| `proxy_mode` | `auto`、`none`、`direct` 或 `pool` |
+| `proxy` | `direct` 模式使用的单个代理 URL |
+| `proxy_file` | `pool` 模式使用的代理列表文件 |
+| `embedded_proxy_enabled` | 可选；由项目内置 mihomo 节点接管任务出口 |
 | `enable_nsfw` | 注册后是否尝试开启 NSFW |
 | `cloudflare_api_base` | Cloudflare 临时邮箱 API 地址 |
 | `cloudflare_api_key` | Cloudflare 临时邮箱接口密钥；默认匿名模式留空，admin 模式填 `ADMIN_PASSWORD` |
@@ -247,10 +249,10 @@ python grok_register_ttk.py http credential --sso-file sso.txt --output-dir xai_
 # 探测邮箱（不注册）
 python grok_register_ttk.py http mail-probe --mail-config config.json
 
-# 推荐：captcha 服务 + 邮箱配置，无浏览器
+# 代理池 + captcha 服务 + 邮箱配置
 python grok_register_ttk.py http register \
-  --proxy-file proxies.txt --proxy-random \
-  --proxy-parent http://127.0.0.1:7890 \
+  --proxy-file proxies.txt \
+  --proxy-random \
   --mail-config config.json \
   --turnstile-provider yescaptcha \
   --turnstile-api-key "$YESCAPTCHA_KEY" \
@@ -387,8 +389,8 @@ Thanks to [linux.do](https://linux.do) — a vibrant tech community where this p
 
 <a href="https://www.star-history.com/?repos=AaronL725%2Fgrok-register&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=AaronL725/grok-register&type=date&theme=dark&legend=top-left&sealed_token=uCM--S2xEp0n8rFUZHUg6wUJOgYcfO4XEVCIF9UZAT04YjL9YsMEOVOGAOlQfqwsoS7cQef0Rwc1cYCY4lAmTuMmcg-hKzNnx1A7KNekuCXQotFd4YifLIkvJWOEy5vxiREJX80Mwxbr8F-3GfCv0utIsQz_iq19nS57svUqwv0mSosV8OTxqXTLjmsI" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=AaronL725/grok-register&type=date&legend=top-left&sealed_token=uCM--S2xEp0n8rFUZHUg6wUJOgYcfO4XEVCIF9UZAT04YjL9YsMEOVOGAOlQfqwsoS7cQef0Rwc1cYCY4lAmTuMmcg-hKzNnx1A7KNekuCXQotFd4YifLIkvJWOEy5vxiREJX80Mwxbr8F-3GfCv0utIsQz_iq19nS57svUqwv0mSosV8OTxqXTLjmsI" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=AaronL725/grok-register&type=date&legend=top-left&sealed_token=uCM--S2xEp0n8rFUZHUg6wUJOgYcfO4XEVCIF9UZAT04YjL9YsMEOVOGAOlQfqwsoS7cQef0Rwc1cYCY4lAmTuMmcg-hKzNnx1A7KNekuCXQotFd4YifLIkvJWOEy5vxiREJX80Mwxbr8F-3GfCv0utIsQz_iq19nS57svUqwv0mSosV8OTxqXTLjmsI" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=AaronL725/grok-register&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=AaronL725/grok-register&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=AaronL725/grok-register&type=date&legend=top-left" />
  </picture>
 </a>

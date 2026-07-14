@@ -100,10 +100,11 @@ class ProxySubscriptionServiceTests(unittest.TestCase):
             text = pool_path.read_text(encoding="utf-8")
             self.assertIn("1.1.1.1:8080:u:p", text)
             disk = json.loads(cfg.read_text(encoding="utf-8"))
-            self.assertEqual(disk.get("tui_proxy_mode"), "pool")
+            self.assertEqual(disk.get("proxy_mode"), "pool")
+            self.assertNotIn("tui_proxy_mode", disk)
             self.assertEqual(disk.get("proxy_subscription_url"), "https://example.test/sub")
 
-    def test_service_local_http_fallback_for_vless_only(self):
+    def test_service_vless_never_falls_back_to_external_local_http(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             cfg = root / "config.json"
@@ -130,13 +131,15 @@ class ProxySubscriptionServiceTests(unittest.TestCase):
                     local_http="http://127.0.0.1:7890",
                 )
             self.assertEqual(data["usable_http_count"], 0)
-            self.assertTrue(data["applied_local_http"])
-            self.assertEqual(data["proxy_mode"], "direct")
+            self.assertFalse(data["applied_local_http"])
+            self.assertEqual(data["proxy_mode"], "none")
             text = (root / "proxies.txt").read_text(encoding="utf-8")
-            self.assertIn("http://127.0.0.1:7890", text)
+            self.assertNotIn("http://127.0.0.1:7890", text)
             disk = json.loads(cfg.read_text(encoding="utf-8"))
-            self.assertEqual(disk.get("proxy"), "http://127.0.0.1:7890")
-            self.assertEqual(disk.get("tui_proxy_mode"), "direct")
+            self.assertNotIn("proxy", disk)
+            self.assertEqual(disk.get("proxy_mode"), "none")
+            self.assertNotIn("proxy_subscription_local_http", disk)
+            self.assertNotIn("tui_proxy_mode", disk)
 
     def test_webui_import_subscription_api(self):
         with tempfile.TemporaryDirectory() as d:

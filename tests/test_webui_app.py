@@ -11,6 +11,13 @@ import webui_app
 
 
 class WebUIAppTests(unittest.TestCase):
+    def test_parser_accepts_local_config_path(self):
+        args = webui_app.build_parser().parse_args(
+            ["--config", "config.local.json", "--port", "33844"]
+        )
+        self.assertEqual(args.config, "config.local.json")
+        self.assertEqual(args.port, 33844)
+
     def _service(self, root: Path) -> svc.BatchService:
         cfg = root / "config.json"
         cfg.write_text(
@@ -41,12 +48,32 @@ class WebUIAppTests(unittest.TestCase):
             self.assertEqual(s.status_code, 200)
             body = s.json()
             self.assertEqual(body["count"], 2)
-            self.assertEqual(body["config"]["turnstile_api_key"], "***")
-            self.assertEqual(body["config"]["yyds_api_key"], "***")
+            self.assertNotIn("config", body)
+            self.assertNotIn("turnstile_api_key", body)
+            self.assertNotIn("yyds_api_key", body)
             center = client.get("/api/config-center").json()
             # config-center intentionally exposes plaintext keys for local editing
             self.assertEqual(center["fields"]["yyds_api_key"], "secret-key")
             self.assertEqual(center["fields"]["turnstile_api_key"], "CAP-SECRET")
+
+    def test_run_page_keeps_upstream_layout_with_backend_feature_controls(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            service = self._service(root)
+            app = webui_app.create_app(service=service)
+            client = TestClient(app)
+
+            page = client.get("/")
+            self.assertEqual(page.status_code, 200)
+            self.assertIn("同会话换凭证（PKCE，推荐）", page.text)
+            self.assertIn("SSO 二次转换（Device Flow）", page.text)
+            self.assertIn('name="turnstile_provider"', page.text)
+            self.assertIn('name="turnstile_headless"', page.text)
+            self.assertIn("Chrome 原生 headless=new", page.text)
+            self.assertNotIn("virtual-headed", page.text)
+            self.assertIn('<option value="direct">直连代理</option>', page.text)
+            self.assertIn('<option value="pool">代理池</option>', page.text)
+            self.assertIn('name="output_dir"', page.text)
 
     def test_start_run_conflict(self):
         with tempfile.TemporaryDirectory() as d:
@@ -103,6 +130,11 @@ class WebUIAppTests(unittest.TestCase):
             self.assertIn('href="/credentials"', page.text)
             self.assertIn('name="local_turnstile_max_workers"', page.text)
             self.assertIn('name="submit_workers"', page.text)
+            self.assertIn('<option value="direct">直连代理</option>', page.text)
+            self.assertIn('<option value="pool">代理池</option>', page.text)
+            self.assertIn("Chrome 原生 headless=new", page.text)
+            self.assertNotIn("virtual-headed", page.text)
+            self.assertIn("http://user:pass@host:port", page.text)
             self.assertIn('name="yyds_create_spacing_sec"', page.text)
             self.assertIn('class="help-tip"', page.text)
             self.assertIn('data-tip="选临时邮箱服务商，决定用哪套邮箱配置"', page.text)
@@ -147,6 +179,31 @@ class WebUIAppTests(unittest.TestCase):
             self.assertEqual(r.json()["ok"], 1)
             page = client.get("/config")
             self.assertIn("随机测试5条", page.text)
+
+    def test_subscription_import_ignores_retired_local_fallback_payload(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            service = self._service(root)
+            app = webui_app.create_app(service=service)
+            client = TestClient(app)
+            expected = {"url": "https://sub.example/nodes", "node_count": 2}
+            with mock.patch.object(service, "import_proxy_subscription", return_value=expected) as imported:
+                response = client.post(
+                    "/api/proxy-pool/import-subscription",
+                    json={
+                        "url": "https://sub.example/nodes",
+                        "local_http": "http://127.0.0.1:7890",
+                        "proxy_subscription_local_http": "http://127.0.0.1:7890",
+                    },
+                )
+            self.assertEqual(response.status_code, 200)
+            imported.assert_called_once_with(
+                url="https://sub.example/nodes",
+                write_pool=True,
+                timeout=20.0,
+                use_local_http_if_empty=False,
+                local_http="",
+            )
 
     def test_embedded_proxy_status_and_reload_guard(self):
         with tempfile.TemporaryDirectory() as d:

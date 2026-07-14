@@ -13,13 +13,14 @@ Supports:
 An optional parent HTTP proxy can be used for chained routing.  In that mode
 the local forwarder first opens a CONNECT tunnel through the parent to the
 configured upstream proxy, then speaks the normal upstream proxy protocol
-inside that tunnel.  This is useful when an authenticated residential/upstream
-proxy must itself be reached through a local proxy such as Clash.
+inside that tunnel.  Production callers use this only with a worker listener
+owned by the project's embedded mihomo process.
 """
 
 from __future__ import annotations
 
 import base64
+import os
 import select
 import socket
 import socketserver
@@ -345,8 +346,20 @@ class _ProxyHandler(socketserver.BaseRequestHandler):
 
 
 class ThreadingTCPServer(socketserver.ThreadingTCPServer):
-    allow_reuse_address = True
+    # A proxy listener is route-affine: two forwarders must never share one
+    # port, otherwise Windows may distribute connections across different
+    # upstream proxy sessions.  Favor an exclusive bind over fast port reuse.
+    allow_reuse_address = False
     daemon_threads = True
+
+    def server_bind(self):
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(
+                socket.SOL_SOCKET,
+                socket.SO_EXCLUSIVEADDRUSE,
+                1,
+            )
+        return super().server_bind()
 
 
 class LocalProxyForwarder:
@@ -469,10 +482,10 @@ def ensure_local_forwarder(
     instance_key: concurrent workers should pass distinct keys (e.g. worker-0)
     so they do not stomp each other's forwarders.
 
-    parent_proxy_raw: Optional HTTP proxy URL/string for a chained route.  The
-    local forwarder CONNECTs to the selected upstream through this proxy first,
-    e.g. ``http://127.0.0.1:7890`` for a local Clash HTTP listener.  Parent
-    credentials are supported and are used only on the outer CONNECT.
+    parent_proxy_raw: Internal embedded-mihomo HTTP listener for a chained
+    route.  The local forwarder CONNECTs to the selected upstream through this
+    listener first.  Parent credentials are supported by the low-level
+    transport and are used only on the outer CONNECT.
     """
     raw = str(proxy_raw or "").strip()
     ikey = str(instance_key or _DEFAULT_INSTANCE)
@@ -517,7 +530,13 @@ def ensure_local_forwarder(
             _FORWARDER_UPSTREAM_KEYS.pop(ikey, None)
 
         # prefer fixed port for default instance; workers use preferred+offset or free port
-        port = int(preferred_local_port or DEFAULT_LOCAL_PORT)
+        # ``0`` intentionally asks the OS for a unique free port.  The default
+        # argument remains 17890 for callers that omit this parameter.
+        port = (
+            DEFAULT_LOCAL_PORT
+            if preferred_local_port is None
+            else int(preferred_local_port)
+        )
         try:
             fwd = LocalProxyForwarder(
                 up,

@@ -14,16 +14,20 @@ import random
 import queue
 import shutil
 import re
+import secrets
+import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unicodedata
 import urllib.error
 import urllib.request
 from collections import deque
-from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple
 
@@ -43,13 +47,21 @@ CIRCUIT_FAIL_RATE = 0.8
 CIRCUIT_PAUSE_SEC = 30.0
 PROXY_HEALTH_CHECK_INTERVAL_SEC = 15.0
 PROXY_DEAD_PAUSE_SEC = 15.0
+STATIC_PROXY_HEALTH_TIMEOUT_SEC = 12.0
+STATIC_PROXY_HEALTH_PROBE_WORKERS = 2
+STATIC_PROXY_HEALTH_ATTEMPTS = 3
+STATIC_PROXY_HEALTH_BACKOFF_SEC = 0.35
+STATIC_PROXY_SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
+STATIC_PROXY_MS_TOKEN_URL = (
+    "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
+)
 RECENT_WORKER_WINDOW = 200
 MAX_WORKERS = 32
-MAX_LOCAL_TURNSTILE_WORKERS = 3  # default local Turnstile concurrency cap
+MAX_LOCAL_TURNSTILE_WORKERS = 5  # default local browser cap; one slot per proxy port
 MIN_LOCAL_TURNSTILE_WORKERS = 1
 ABS_MAX_LOCAL_TURNSTILE_WORKERS = 6666
 DEFAULT_TURNSTILE_QUEUE_SIZE = 64
-DEFAULT_SUBMIT_WORKERS = 4
+DEFAULT_SUBMIT_WORKERS = 5
 MAX_LOG_LINES = 700
 DEFAULT_SSO_CONVERT_RETRIES = 5
 DEFAULT_SSO_CONVERT_COOLDOWN = 3
@@ -81,14 +93,22 @@ TURNSTILE_PROVIDER_LABELS = {
     "local": "本地浏览器仅求解",
 }
 
-# 运行链路模式：模式1 是现有注册链路，模式2 仅做占位。
+# 两条链路都会完成邮箱 OTP 注册并取得 SSO，差别只在凭证产出方式。
+# 内部 run_mode 值保留，兼容既有 CLI/API；磁盘配置统一写 credential_flow。
 RUN_MODE_REGISTER_OTP = "register_otp"
 RUN_MODE_REGISTER_SSO = "register_sso"
 DEFAULT_RUN_MODE = RUN_MODE_REGISTER_OTP
 RUN_MODE_ORDER = [RUN_MODE_REGISTER_OTP, RUN_MODE_REGISTER_SSO]
 RUN_MODE_LABELS = {
-    RUN_MODE_REGISTER_OTP: "模式1:注册+otp",
-    RUN_MODE_REGISTER_SSO: "模式2:注册+sso转换",
+    RUN_MODE_REGISTER_OTP: "同会话换凭证（PKCE，推荐）",
+    RUN_MODE_REGISTER_SSO: "SSO 二次转换（Device Flow）",
+}
+CREDENTIAL_FLOW_PKCE = "pkce"
+CREDENTIAL_FLOW_SSO_DEVICE = "sso_device"
+DEFAULT_CREDENTIAL_FLOW = CREDENTIAL_FLOW_PKCE
+CREDENTIAL_FLOW_LABELS = {
+    CREDENTIAL_FLOW_PKCE: RUN_MODE_LABELS[RUN_MODE_REGISTER_OTP],
+    CREDENTIAL_FLOW_SSO_DEVICE: RUN_MODE_LABELS[RUN_MODE_REGISTER_SSO],
 }
 RUN_MODE_ALIASES = {
     "1": RUN_MODE_REGISTER_OTP,
@@ -102,6 +122,11 @@ RUN_MODE_ALIASES = {
     "register_sso": RUN_MODE_REGISTER_SSO,
     "register+sso": RUN_MODE_REGISTER_SSO,
     "sso_convert": RUN_MODE_REGISTER_SSO,
+    "pkce": RUN_MODE_REGISTER_OTP,
+    "same_session": RUN_MODE_REGISTER_OTP,
+    "sso_device": RUN_MODE_REGISTER_SSO,
+    "device": RUN_MODE_REGISTER_SSO,
+    "device_flow": RUN_MODE_REGISTER_SSO,
 }
 
 
@@ -110,7 +135,41 @@ class TuiConfigError(RuntimeError):
 
 
 def _pgrep_count(pattern: str) -> int:
-    """Count processes matching pattern via pgrep -c -f."""
+    """Count matching processes on POSIX and Windows.
+
+    ``pgrep`` is not present on a normal Windows installation.  The old
+    implementation therefore reported ``chrome=0`` even when project Chrome
+    trees were still alive.  Use psutil on Windows, while retaining the small
+    POSIX helper for installations that do not yet have psutil available.
+    """
+    if os.name == "nt":
+        try:
+            import psutil
+        except Exception:
+            return 0
+        needle = str(pattern or "").lower().replace("\\", "/")
+        count = 0
+        for process in psutil.process_iter(["name", "exe", "cmdline"]):
+            try:
+                info = process.info
+                name = str(info.get("name") or "").lower()
+                exe = str(info.get("exe") or "").lower()
+                cmdline = (
+                    " ".join(str(x) for x in (info.get("cmdline") or ()))
+                    .lower()
+                    .replace("\\", "/")
+                )
+            except (psutil.Error, OSError, ValueError, TypeError):
+                continue
+            if needle == "chrome":
+                # Avoid counting PowerShell/test commands that merely mention
+                # the word "chrome" in their arguments.
+                executable = Path(exe or name).name.lower()
+                if executable in _CHROMIUM_PROCESS_NAMES:
+                    count += 1
+            elif needle and needle in cmdline:
+                count += 1
+        return count
     try:
         result = subprocess.run(
             ["pgrep", "-c", "-f", pattern],
@@ -149,12 +208,164 @@ def format_browser_health(status: Optional[Dict[str, int]] = None) -> str:
     return f"{level} | chrome={chrome} | playwright={playwright}"
 
 
-_TEMP_DIR_GLOBS = (
-    "xai-ts-chrome-*",
-    "xai-ts-probe*",
-    "xai-chrome-raw-*",
-    "playwright_chromiumdev_profile-*",
+_PROJECT_CHROME_PROFILE_PREFIX = "xai-ts-chrome-"
+_PROJECT_CHROME_MARKER = _PROJECT_CHROME_PROFILE_PREFIX
+_CHROMIUM_PROCESS_NAMES = frozenset(
+    {
+        "chrome",
+        "chrome.exe",
+        "chromium",
+        "chromium.exe",
+        "chromium-browser",
+        "chromium-browser.exe",
+        "google-chrome",
+        "google-chrome.exe",
+        "google-chrome-stable",
+        "google-chrome-stable.exe",
+    }
 )
+
+
+def _process_info_value(process, name: str, default=None):
+    info = getattr(process, "info", None)
+    if isinstance(info, dict) and name in info:
+        return info.get(name)
+    value = getattr(process, name, default)
+    try:
+        return value() if callable(value) else value
+    except Exception:
+        return default
+
+
+def _is_project_chrome_process(process) -> bool:
+    """Return true only for Chromium using our marked ``--user-data-dir``."""
+    name = str(_process_info_value(process, "name", "") or "").strip().lower()
+    exe = str(_process_info_value(process, "exe", "") or "").strip().lower()
+    executable = Path(exe or name).name.lower()
+    if executable not in _CHROMIUM_PROCESS_NAMES:
+        return False
+    raw_cmdline = _process_info_value(process, "cmdline", ()) or ()
+    if isinstance(raw_cmdline, str):
+        args = [raw_cmdline]
+    else:
+        try:
+            args = [str(item) for item in raw_cmdline]
+        except TypeError:
+            args = []
+    for index, raw_arg in enumerate(args):
+        arg = raw_arg.strip().strip('"')
+        lowered = arg.lower()
+        value = ""
+        if lowered.startswith("--user-data-dir="):
+            value = arg.split("=", 1)[1]
+        elif lowered == "--user-data-dir" and index + 1 < len(args):
+            value = args[index + 1]
+        if not value:
+            continue
+        value = value.strip().strip('"').rstrip("/\\")
+        if Path(value).name.lower().startswith(_PROJECT_CHROME_PROFILE_PREFIX):
+            return True
+    return False
+
+
+def _terminate_project_browser_trees(
+    *,
+    process_iter=None,
+    wait_timeout_sec: float = 2.0,
+) -> int:
+    """Terminate only Chromium trees launched with ``xai-ts-chrome-*``.
+
+    The marker is required on a Chromium executable before its descendants are
+    selected.  This prevents a cleanup pass from touching the user's normal
+    Chrome profile or an unrelated command whose text happens to mention the
+    marker.
+    """
+    try:
+        import psutil
+    except Exception:
+        return 0
+
+    if process_iter is None:
+        process_iter = lambda: psutil.process_iter(
+            ["pid", "ppid", "name", "exe", "cmdline"]
+        )
+    try:
+        candidates = list(process_iter())
+    except Exception:
+        return 0
+
+    selected: Dict[int, object] = {}
+    for process in candidates:
+        try:
+            if not _is_project_chrome_process(process):
+                continue
+            pid = int(_process_info_value(process, "pid", 0) or 0)
+            if pid > 0:
+                selected[pid] = process
+            for child in process.children(recursive=True):
+                child_name = str(_process_info_value(child, "name", "") or "").lower()
+                child_exe = str(_process_info_value(child, "exe", "") or "").lower()
+                if Path(child_exe or child_name).name.lower() not in _CHROMIUM_PROCESS_NAMES:
+                    continue
+                child_pid = int(_process_info_value(child, "pid", 0) or 0)
+                if child_pid > 0:
+                    selected[child_pid] = child
+        except (psutil.Error, OSError, ValueError, TypeError):
+            continue
+
+    if not selected:
+        return 0
+
+    processes = list(selected.values())
+    for process in processes:
+        try:
+            process.terminate()
+        except (psutil.Error, OSError):
+            pass
+    try:
+        gone, alive = psutil.wait_procs(
+            processes,
+            timeout=max(0.05, float(wait_timeout_sec)),
+        )
+    except Exception:
+        gone, alive = [], processes
+    for process in alive:
+        try:
+            process.kill()
+        except (psutil.Error, OSError):
+            pass
+    if alive:
+        try:
+            psutil.wait_procs(alive, timeout=max(0.05, float(wait_timeout_sec)))
+        except Exception:
+            pass
+    return len(selected)
+
+
+def _managed_broker_creation_flags(platform_name: Optional[str] = None) -> int:
+    """Give a Windows broker its own console process group for CTRL_BREAK."""
+    platform_name = os.name if platform_name is None else str(platform_name)
+    if platform_name == "nt":
+        return int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) or 0)
+    return 0
+
+
+def _request_graceful_broker_shutdown(
+    process: subprocess.Popen,
+    *,
+    platform_name: Optional[str] = None,
+) -> None:
+    """Ask uvicorn to run its lifespan shutdown before using a hard kill."""
+    platform_name = os.name if platform_name is None else str(platform_name)
+    if platform_name == "nt":
+        ctrl_break = getattr(signal, "CTRL_BREAK_EVENT", None)
+        if ctrl_break is not None:
+            try:
+                process.send_signal(ctrl_break)
+                return
+            except (OSError, ValueError):
+                pass
+    process.terminate()
 
 
 def cleanup_browser_residues(
@@ -164,47 +375,43 @@ def cleanup_browser_residues(
     kill_all_chrome: bool = False,
     pkill_fn=None,
 ) -> Dict[str, int]:
-    """Clean Playwright/Chrome residues that commonly block headed Turnstile launches.
+    """Reap project Chrome trees and profile dirs using one strict marker.
 
-    Default is conservative:
-      - kill Playwright Chromium leftovers
-      - remove this project's temp Chrome profile dirs
-      - do NOT kill every Chrome process unless explicitly requested
+    ``kill_playwright`` and ``kill_all_chrome`` remain accepted for older
+    callers, but broad process killing is deliberately disabled.  Production
+    cleanup only selects Chromium processes whose command line owns an
+    ``xai-ts-chrome-*`` profile.
     """
+    del kill_playwright, kill_all_chrome
     if pkill_fn is None:
-        def pkill_fn(pattern: str) -> int:
-            before = _pgrep_count(pattern)
-            if before <= 0:
-                return 0
-            subprocess.run(
-                ["pkill", "-f", pattern],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            # Give the kernel a moment to reap.
-            time.sleep(0.2)
-            after = _pgrep_count(pattern)
-            return max(0, before - after)
+        killed_chrome = _terminate_project_browser_trees()
+    else:
+        # Backward-compatible injection point for deterministic unit tests.
+        # The only pattern ever sent is the project-owned profile marker.
+        killed_chrome = int(pkill_fn(_PROJECT_CHROME_MARKER))
+    killed_playwright = 0
 
-    killed_playwright = int(pkill_fn("ms-playwright/chromium") if kill_playwright else 0)
-    # Always reap this project's headless profiles; do not touch the user's daily Chrome.
-    killed_project_chrome = int(pkill_fn("xai-ts-chrome-") + pkill_fn("xai-chrome-raw-"))
-    killed_chrome = int(pkill_fn("chrome") if kill_all_chrome else 0) + killed_project_chrome
-
-    root = Path(temp_root or "/tmp")
+    root = Path(temp_root) if temp_root is not None else Path(tempfile.gettempdir())
+    try:
+        root = root.resolve(strict=False)
+    except OSError:
+        pass
     removed = 0
-    for pattern in _TEMP_DIR_GLOBS:
-        for path in root.glob(pattern):
-            try:
-                if path.is_dir():
-                    shutil.rmtree(path, ignore_errors=True)
-                    removed += 1
-                elif path.exists():
-                    path.unlink(missing_ok=True)
-                    removed += 1
-            except OSError:
+    for path in root.glob(f"{_PROJECT_CHROME_PROFILE_PREFIX}*"):
+        try:
+            resolved = path.resolve(strict=False)
+            if resolved.parent != root or not path.name.startswith(_PROJECT_CHROME_PROFILE_PREFIX):
                 continue
+            if path.is_symlink():
+                path.unlink(missing_ok=True)
+            elif path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+            elif path.exists():
+                path.unlink(missing_ok=True)
+            if not path.exists():
+                removed += 1
+        except OSError:
+            continue
 
     return {
         "killed_playwright": killed_playwright,
@@ -274,6 +481,14 @@ class RunPlan:
     target_mode: str = TARGET_MODE_COUNT
     target_success: int = 0
     continuous_max_runtime_min: int = 0
+    # Static proxy-pool slot coordination.  These fields stay opt-in so old
+    # configs keep their original random/fixed-index behaviour.
+    proxy_slot_sticky: bool = False
+    proxy_pool_size: int = 0
+    # Canonical proxy rows captured when the plan is built.  BatchRunner writes
+    # these rows to a private per-run snapshot before it launches workers, so a
+    # live edit of the source pool cannot remap an active numeric slot.
+    proxy_pool_entries: Tuple[str, ...] = field(default_factory=tuple)
 
 
 @dataclass
@@ -286,11 +501,25 @@ class WorkerState:
     accounts_path: Optional[Path] = None
     last_log: str = "等待空闲槽位"
     return_code: Optional[int] = None
+    # Reader state and the last meaningful failure are kept separately from
+    # ``last_log``.  The child may exit just before the UI tick consumes its
+    # final stdout line; keeping the reader handle/detail prevents the generic
+    # return-code message from hiding the actual cause.
+    reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
+    failure_category: str = ""
+    error_detail: str = ""
     proxy_node_id: Optional[str] = None
     proxy_node_name: str = ""
     proxy_local_http: str = ""
     tried_node_ids: List[str] = field(default_factory=list)
     proxy_attempt: int = 0
+    # Zero-based index into proxy_file.  A BatchRunner leases this index for
+    # the lifetime of the registration subprocess so concurrent workers do
+    # not accidentally select the same proxy when proxy_random is enabled.
+    proxy_slot_index: Optional[int] = None
+    # Challenge failures belong to this registration route only when the
+    # Turnstile solver did not receive a separate proxy.
+    uses_independent_turnstile_proxy: bool = False
 
 
 def _char_width(char: str) -> int:
@@ -341,6 +570,23 @@ def _proxy_mode_label(mode: str) -> str:
     return PROXY_MODE_LABELS.get(mode, mode)
 
 
+def _normalize_proxy_mode(value: object) -> str:
+    """Normalize proxy mode and migrate retired external-chain aliases."""
+    raw = str(value or "auto").strip().lower().replace("-", "_")
+    aliases = {
+        "off": "none",
+        "disabled": "none",
+        "single": "direct",
+        "chain": "pool",
+        "chain_pool": "pool",
+        "chained_pool": "pool",
+    }
+    mode = aliases.get(raw, raw)
+    if mode not in PROXY_MODE_LABELS:
+        return "auto"
+    return mode
+
+
 PROXY_FAILURE_MARKERS = (
     "CONNECT tunnel failed",
     "ProxyError",
@@ -352,8 +598,6 @@ PROXY_FAILURE_MARKERS = (
     "OPENSSL_internal",
     "Tunnel connection failed",
     "407 Proxy Authentication Required",
-    "未捕获到可用 Turnstile token",
-    "Turnstile broker 求解失败",
     "Read timed out",
 )
 
@@ -364,13 +608,23 @@ def _looks_like_proxy_failure(text: str) -> bool:
     if not blob:
         return False
     lower = blob.lower()
+    # Challenge failures are not transport failures.  The caller decides
+    # whether to move a route after checking if solver and registration share it.
+    if (
+        "category=turnstile_challenge_transient" in lower
+        or re.search(r"turnstile\s+challenge\s+error\s+(?:300|600)\d*", lower)
+    ):
+        return False
     if "没有可用的内嵌代理节点" in blob or "内嵌代理已启用但管理器未就绪" in blob:
         return True
     for marker in PROXY_FAILURE_MARKERS:
         if marker.lower() in lower:
             return True
-    # Broad but still useful under embedded mode.
-    if "turnstile" in lower and ("timeout" in lower or "超时" in blob or "token" in lower and "0" in blob):
+    if "turnstile" in lower and (
+        "turnstile timeout" in lower
+        or "求解超时" in blob
+        or "未捕获到可用 turnstile token" in lower
+    ):
         return True
     if "tls" in lower and ("error" in lower or "connect" in lower):
         return True
@@ -419,6 +673,34 @@ def _normalize_run_mode(value: object) -> str:
     return mode
 
 
+def credential_flow_from_run_mode(value: object) -> str:
+    """Return the compact, user-facing credential flow for an internal mode."""
+    mode = _normalize_run_mode(value)
+    if mode == RUN_MODE_REGISTER_SSO:
+        return CREDENTIAL_FLOW_SSO_DEVICE
+    return CREDENTIAL_FLOW_PKCE
+
+
+def run_mode_from_credential_flow(value: object) -> str:
+    """Map canonical credential_flow (and legacy aliases) to an internal mode."""
+    raw = str(value or DEFAULT_CREDENTIAL_FLOW).strip().lower().replace("-", "_")
+    if raw in {CREDENTIAL_FLOW_PKCE, "inline_pkce", "same_session"}:
+        return RUN_MODE_REGISTER_OTP
+    if raw in {CREDENTIAL_FLOW_SSO_DEVICE, "device", "device_flow"}:
+        return RUN_MODE_REGISTER_SSO
+    # Accept old run_mode values on the same input boundary.
+    return _normalize_run_mode(raw)
+
+
+def _config_run_mode(config: Dict[str, object]) -> str:
+    """Resolve one run mode from canonical config plus read-only legacy aliases."""
+    if "credential_flow" in config:
+        return run_mode_from_credential_flow(config.get("credential_flow"))
+    if "run_mode" in config:
+        return _normalize_run_mode(config.get("run_mode"))
+    return _normalize_run_mode(config.get("tui_run_mode") or DEFAULT_RUN_MODE)
+
+
 def _sso_converter_path() -> Path:
     return ROOT_DIR / "sso_to_auth_json.py"
 
@@ -426,18 +708,18 @@ def _sso_converter_path() -> Path:
 def _ensure_mode2_ready() -> None:
     converter = _sso_converter_path()
     if not converter.is_file():
-        raise TuiConfigError(f"模式2 缺少转换脚本: {converter}")
+        raise TuiConfigError(f"SSO Device Flow 缺少转换脚本: {converter}")
     try:
         import curl_cffi  # noqa: F401
     except ImportError as exc:  # pragma: no cover - depends on local env
         raise TuiConfigError(
-            "模式2 需要 curl_cffi（sso_to_auth_json Device Flow）。"
+            "SSO Device Flow 需要 curl_cffi（sso_to_auth_json）。"
             f"当前 Python={sys.executable} 未安装 curl_cffi。"
             f"请执行: {sys.executable} -m pip install -r requirements.txt"
         ) from exc
     except Exception as exc:  # pragma: no cover - depends on local env
         raise TuiConfigError(
-            "模式2 依赖 curl_cffi 但当前环境导入异常: "
+            "SSO Device Flow 依赖 curl_cffi 但当前环境导入异常: "
             f"Python={sys.executable} err={exc}"
         ) from exc
 
@@ -597,7 +879,7 @@ def _load_runtime_fields(settings: Settings) -> None:
     settings.count = _positive_int(config.get("register_count", 1), "注册数量", MAX_COUNT)
     settings.workers = _positive_int(config.get("concurrent_workers", 1), "并发数", MAX_WORKERS)
     settings.target_mode = _normalize_target_mode(
-        config.get("run_target_mode") or config.get("target_mode") or TARGET_MODE_COUNT
+        config.get("target_mode") or config.get("run_target_mode") or TARGET_MODE_COUNT
     )
     settings.target_success = _bounded_int(
         config.get("target_success"),
@@ -624,13 +906,13 @@ def _load_runtime_fields(settings: Settings) -> None:
     else:
         settings.output_dir = DEFAULT_OUTPUT_DIR.resolve()
 
-    settings.run_mode = _normalize_run_mode(
-        config.get("tui_run_mode") or config.get("run_mode") or DEFAULT_RUN_MODE
-    )
+    settings.run_mode = _config_run_mode(config)
 
-    proxy_mode = str(config.get("tui_proxy_mode") or config.get("proxy_mode") or "auto").strip().lower()
-    if proxy_mode not in PROXY_MODE_LABELS:
-        proxy_mode = "auto"
+    proxy_mode = _normalize_proxy_mode(
+        config.get("proxy_mode")
+        if "proxy_mode" in config
+        else config.get("tui_proxy_mode") or "auto"
+    )
     # Keep "none" as a real mode. Older code rewrote it to "auto", which made
     # build_plan re-enable proxies.txt even after the UI selected "不使用".
     settings.proxy_mode = proxy_mode
@@ -647,14 +929,18 @@ def _load_runtime_fields(settings: Settings) -> None:
         ),
     )
     settings.sso_convert_retries = _bounded_int(
-        config.get("tui_sso_convert_retries", config.get("sso_convert_retries")),
+        config.get("sso_convert_retries")
+        if "sso_convert_retries" in config
+        else config.get("tui_sso_convert_retries"),
         "SSO转换重试次数",
         minimum=1,
         maximum=MAX_SSO_CONVERT_RETRIES,
         default=DEFAULT_SSO_CONVERT_RETRIES,
     )
     settings.sso_convert_cooldown = _bounded_int(
-        config.get("tui_sso_convert_cooldown", config.get("sso_convert_cooldown")),
+        config.get("sso_convert_cooldown")
+        if "sso_convert_cooldown" in config
+        else config.get("tui_sso_convert_cooldown"),
         "SSO转换冷却秒数",
         minimum=0,
         maximum=MAX_SSO_CONVERT_COOLDOWN,
@@ -663,23 +949,75 @@ def _load_runtime_fields(settings: Settings) -> None:
 
 
 def persist_settings(settings: Settings) -> None:
-    """把当前 TUI 运行设置写回配置文件。"""
+    """Persist one canonical config shape and remove legacy UI aliases."""
     config = dict(settings.config or {})
     config["register_count"] = int(settings.count)
     config["concurrent_workers"] = int(settings.workers)
-    config["run_target_mode"] = _normalize_target_mode(settings.target_mode)
-    config["target_success"] = int(settings.target_success)
-    config["continuous_max_runtime_min"] = int(settings.continuous_max_runtime_min)
-    config["tui_run_mode"] = _normalize_run_mode(settings.run_mode)
-    config["tui_proxy_mode"] = "none" if settings.no_proxy else str(settings.proxy_mode or "auto")
+    target_mode = _normalize_target_mode(settings.target_mode)
+    config["target_mode"] = target_mode
+    if target_mode == TARGET_MODE_CONTINUOUS:
+        config["target_success"] = int(settings.target_success)
+        if int(settings.continuous_max_runtime_min) > 0:
+            config["continuous_max_runtime_min"] = int(settings.continuous_max_runtime_min)
+        else:
+            config.pop("continuous_max_runtime_min", None)
+    else:
+        config.pop("target_success", None)
+        config.pop("continuous_max_runtime_min", None)
+    credential_flow = credential_flow_from_run_mode(settings.run_mode)
+    config["credential_flow"] = credential_flow
+    config["proxy_mode"] = _normalize_proxy_mode(
+        "none" if settings.no_proxy else settings.proxy_mode or "auto"
+    )
+    if config["proxy_mode"] == "none":
+        # A clean direct route does not need static-pool, external-chain, or
+        # dedicated-solver knobs. Direct/pool modes retain their own settings.
+        for key in (
+            "proxy_file",
+            "proxy_random",
+            "proxy_rotate_session",
+            "proxy_slot_sticky",
+            "solver_slots",
+            "turnstile_proxy_enabled",
+            "turnstile_proxy_mode",
+            "turnstile_proxy",
+            "turnstile_proxy_file",
+            "turnstile_proxy_random",
+            "local_proxy_port",
+        ):
+            config.pop(key, None)
     config["xai_oauth_output_dir"] = _config_path_value(
         settings.output_dir, settings.config_path.parent
     )
-    config["tui_sso_convert_retries"] = int(settings.sso_convert_retries)
-    config["tui_sso_convert_cooldown"] = int(settings.sso_convert_cooldown)
+    if (
+        credential_flow == CREDENTIAL_FLOW_SSO_DEVICE
+        or int(settings.sso_convert_retries) != DEFAULT_SSO_CONVERT_RETRIES
+        or int(settings.sso_convert_cooldown) != DEFAULT_SSO_CONVERT_COOLDOWN
+    ):
+        config["sso_convert_retries"] = int(settings.sso_convert_retries)
+        config["sso_convert_cooldown"] = int(settings.sso_convert_cooldown)
+    else:
+        config.pop("sso_convert_retries", None)
+        config.pop("sso_convert_cooldown", None)
     config["turnstile_provider"] = _normalize_turnstile_provider(settings.turnstile_provider)
     config["turnstile_headless"] = bool(settings.turnstile_headless)
     config["submit_workers"] = int(settings.submit_workers)
+
+    # Read compatibility remains in _load_runtime_fields; disk output stays small.
+    for legacy_key in (
+        "run_target_mode",
+        "tui_run_mode",
+        "run_mode",
+        "tui_proxy_mode",
+        "tui_sso_convert_retries",
+        "tui_sso_convert_cooldown",
+        "tui_output_dir",
+        # External local-client chaining was retired.  The only parent hop is
+        # now a worker listener owned by this project's embedded mihomo.
+        "proxy_parent",
+        "proxy_subscription_local_http",
+    ):
+        config.pop(legacy_key, None)
     _write_config(settings.config_path, config)
     settings.config = config
 
@@ -722,8 +1060,47 @@ def refresh_settings_config(settings: Settings, *, reset_defaults: bool = True) 
         _load_runtime_fields(settings)
 
 
+def _canonical_proxy_file_entries(path: Path) -> List[str]:
+    """Return the de-duplicated rows that numeric proxy indexes can address."""
+    try:
+        text_value = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    entries: List[str] = []
+    seen: set[str] = set()
+    for line in text_value.splitlines():
+        item = str(line or "").strip()
+        if not item or item.startswith("#"):
+            continue
+        if (item.startswith('"') and item.endswith('"')) or (
+            item.startswith("'") and item.endswith("'")
+        ):
+            item = item[1:-1].strip()
+        if item and item not in seen:
+            seen.add(item)
+            entries.append(item)
+    return entries
+
+
+def _proxy_pool_entries(settings: Settings) -> List[str]:
+    """Return the effective proxy-file rows used by indexed pool workers.
+
+    Keep this parser aligned with ``xai_http_flow._resolve_runtime_proxy``:
+    blank/comment rows are ignored and an accidental pair of surrounding
+    quotes is removed.  De-duplication is deliberate here: two identical rows
+    are one real egress resource and must not be advertised as two unique
+    sticky slots.
+    """
+    raw = str((settings.config or {}).get("proxy_file") or "").strip()
+    if not raw:
+        return []
+    return _canonical_proxy_file_entries(
+        _absolute_path(raw, settings.config_path.parent)
+    )
+
+
 def _resolve_proxy_args(settings: Settings) -> Tuple[str, List[str]]:
-    mode = str(settings.proxy_mode or "").strip().lower()
+    mode = _normalize_proxy_mode(settings.proxy_mode)
     if settings.no_proxy or mode == "none":
         return "none", []
 
@@ -737,7 +1114,7 @@ def _resolve_proxy_args(settings: Settings) -> Tuple[str, List[str]]:
     args: List[str] = []
     if mode == "direct":
         if not direct_proxy:
-            raise TuiConfigError("代理模式为直连，但 config.proxy 为空")
+            raise TuiConfigError("代理模式为直连代理，但 config.proxy 为空")
         args.extend(["--proxy", direct_proxy])
     elif mode == "pool":
         if not proxy_file or not proxy_file.is_file():
@@ -748,9 +1125,6 @@ def _resolve_proxy_args(settings: Settings) -> Tuple[str, List[str]]:
     elif mode != "none":
         raise TuiConfigError(f"不支持的代理模式: {mode}")
 
-    parent_proxy = str(config.get("proxy_parent") or "").strip()
-    if mode != "none" and parent_proxy:
-        args.extend(["--proxy-parent", parent_proxy])
     return mode, args
 
 
@@ -765,7 +1139,11 @@ def _normalize_target_mode(value: object) -> str:
 
 def build_plan(settings: Settings) -> RunPlan:
     config = settings.config
-    target_mode = _normalize_target_mode(getattr(settings, "target_mode", None) or config.get("run_target_mode"))
+    target_mode = _normalize_target_mode(
+        getattr(settings, "target_mode", None)
+        or config.get("target_mode")
+        or config.get("run_target_mode")
+    )
     target_success = _bounded_int(
         getattr(settings, "target_success", None)
         if getattr(settings, "target_success", None) is not None
@@ -830,7 +1208,7 @@ def build_plan(settings: Settings) -> RunPlan:
         )
         if turnstile_headless:
             warnings.append(
-                "本地无头会映射为 virtual-headed（Xvfb）；"
+                "本地无头使用 Chrome 原生 headless=new（不启动 Xvfb/可见窗口）；"
                 f"Turnstile 浏览器并发独立限制为 {local_cap}"
                 "（配置 local_turnstile_max_workers）。"
             )
@@ -844,8 +1222,10 @@ def build_plan(settings: Settings) -> RunPlan:
     is_graph = email_provider in {"msgraph", "microsoft", "hotmail", "outlook"}
     has_mail_file = bool(str(config.get("ms_mail_file") or "").strip())
     if workers > 1 and (is_graph or has_mail_file):
-        workers = 1
-        warnings.append("Outlook/Graph 邮箱池会强制单并发，避免重复领取邮箱。")
+        warnings.append(
+            "Outlook/Graph 邮箱池使用跨进程文件锁与已用记录并行领取，"
+            "不同任务不会重复领取同一邮箱。"
+        )
     if workers > 1 and (
         os.environ.get("XAI_CASTLE_EMAIL_TOKEN") or os.environ.get("XAI_CASTLE_REGISTER_TOKEN")
     ):
@@ -860,6 +1240,34 @@ def build_plan(settings: Settings) -> RunPlan:
         )
 
     proxy_mode, proxy_args = _resolve_proxy_args(settings)
+    proxy_pool_entries = (
+        tuple(_proxy_pool_entries(settings)) if proxy_mode == "pool" else tuple()
+    )
+    proxy_pool_size = len(proxy_pool_entries)
+    embedded_proxy_enabled = _as_bool(config.get("embedded_proxy_enabled"))
+    proxy_slot_sticky = bool(
+        proxy_mode == "pool"
+        and not embedded_proxy_enabled
+        and _as_bool(config.get("proxy_slot_sticky"))
+    )
+    if (
+        embedded_proxy_enabled
+        and proxy_mode == "pool"
+        and _as_bool(config.get("proxy_slot_sticky"))
+    ):
+        warnings.append("内嵌代理已接管任务出口，静态代理池固定槽位本批次不参与调度。")
+    if proxy_slot_sticky and proxy_pool_size <= 0:
+        proxy_slot_sticky = False
+        warnings.append("代理池固定槽位未启用：代理池没有有效条目。")
+    elif proxy_slot_sticky:
+        if workers > proxy_pool_size:
+            workers = proxy_pool_size
+            warnings.append(
+                f"代理池固定槽位把账号并发收敛到 {proxy_pool_size}，避免活动任务共用同一出口。"
+            )
+        warnings.append(
+            f"代理池固定槽位已启用：{proxy_pool_size} 个出口按活动任务一对一租用，任务结束后回收。"
+        )
     local_cap = resolve_local_turnstile_max_workers(config, strict=False)
     requested_turnstile_workers = int(
         settings.turnstile_workers
@@ -869,6 +1277,16 @@ def build_plan(settings: Settings) -> RunPlan:
     turnstile_workers = max(1, min(MAX_WORKERS, requested_turnstile_workers))
     if provider == "local":
         turnstile_workers = min(turnstile_workers, local_cap)
+        if (
+            str(config.get("solver_slots") or "").strip().lower() == "auto_by_proxy"
+            and proxy_mode == "pool"
+            and proxy_pool_size > 0
+            and not embedded_proxy_enabled
+        ):
+            turnstile_workers = max(1, min(local_cap, proxy_pool_size))
+            warnings.append(
+                f"本地 Turnstile 自动按代理池启用 {turnstile_workers} 个求解槽位。"
+            )
     turnstile_queue_size = max(
         1,
         int(
@@ -909,10 +1327,9 @@ def build_plan(settings: Settings) -> RunPlan:
     if run_mode == RUN_MODE_REGISTER_SSO:
         _ensure_mode2_ready()
         warnings.append(
-            "模式2：注册成功后用 sso_to_auth_json 转换；"
+            "SSO 二次转换：注册成功后用 sso_to_auth_json Device Flow 换凭证；"
             f"失败最多重试 {sso_convert_retries} 次，冷却 {sso_convert_cooldown}s。"
         )
-    embedded_proxy_enabled = _as_bool(config.get("embedded_proxy_enabled"))
     embedded_proxy_max_node_retries = _bounded_int(
         config.get("embedded_proxy_max_node_retries"),
         "内嵌代理节点重试次数",
@@ -953,6 +1370,9 @@ def build_plan(settings: Settings) -> RunPlan:
         target_mode=target_mode,
         target_success=target_success,
         continuous_max_runtime_min=continuous_max_runtime_min,
+        proxy_slot_sticky=proxy_slot_sticky,
+        proxy_pool_size=proxy_pool_size,
+        proxy_pool_entries=proxy_pool_entries,
     )
 
 
@@ -991,7 +1411,9 @@ def describe_plan(plan: RunPlan, *, dry_run: bool = False) -> str:
 FAILURE_CATEGORIES = (
     "yyds_rate_limit",
     "email_domain_rejected",
+    "region_blocked",
     "turnstile_hard_block",
+    "turnstile_challenge_transient",
     "turnstile_timeout",
     "tls_error",
     "proxy_error",
@@ -1014,8 +1436,24 @@ def classify_failure_text(text: str) -> str:
         or "account:email-domain-rejected" in t
     ):
         return "email_domain_rejected"
+    if (
+        "this service is not available in your region" in t
+        or "service is not available in your region" in t
+        or "not available in your region" in t
+        or "unavailable in your region" in t
+        or "region unavailable" in t
+        or "unsupported region" in t
+        or "region is not supported" in t
+    ):
+        return "region_blocked"
     if "cloudflare_hard_block" in t or "hard_block" in t or "硬拦截" in raw:
         return "turnstile_hard_block"
+    if (
+        "category=turnstile_challenge_transient" in t
+        or "failure_category=turnstile_challenge_transient" in t
+        or re.search(r"turnstile\s+challenge\s+error\s+(?:300|600)\d*", t)
+    ):
+        return "turnstile_challenge_transient"
     if (
         "curl: (35)" in t
         or "tls connect error" in t
@@ -1047,6 +1485,35 @@ def classify_failure_text(text: str) -> str:
     if ("注册" in raw and "失败" in raw) or "register" in t and "fail" in t:
         return "register_failed"
     return "unknown"
+
+
+def _extract_failure_detail(text: object) -> str:
+    """Return the last diagnostic-looking line from a worker output tail."""
+    raw = str(text or "")
+    lines = [line for line in raw.replace("\r", "").splitlines() if line.strip()]
+    for line in reversed(lines):
+        clean = _safe_text(line)
+        if clean and classify_failure_text(clean) != "unknown":
+            return clean
+    markers = (
+        "[!]",
+        "error",
+        "exception",
+        "traceback",
+        "failed",
+        "failure",
+        "http 4",
+        "http 5",
+        "失败",
+        "错误",
+        "异常",
+    )
+    for line in reversed(lines):
+        clean = _safe_text(line)
+        lowered = clean.lower()
+        if clean and any(marker in lowered or marker in clean for marker in markers):
+            return clean
+    return ""
 
 
 class BatchRunner:
@@ -1090,6 +1557,19 @@ class BatchRunner:
         self.circuit_open = False
         self._last_proxy_health_check_at: float = 0.0
         self._proxy_unhealthy = False
+        # slot index -> logical worker index.  Static proxy pools do not have a
+        # lease API of their own, so BatchRunner owns this tiny in-memory lease
+        # table for the duration of one run.
+        self._proxy_slot_leases: Dict[int, int] = {}
+        self._proxy_pool_snapshot_path: Optional[Path] = None
+        # ``None`` means the target-aware batch preflight has not run yet and
+        # preserves compatibility for callers that construct/use a runner
+        # directly.  Once preflight runs, only indexes in this set may be
+        # leased.  The source snapshot itself is never rewritten, so numeric
+        # indexes remain stable in worker commands and diagnostics.
+        self._healthy_static_proxy_slots: Optional[set[int]] = None
+        self._static_proxy_health: Dict[int, Dict[str, object]] = {}
+        self._isolated_static_proxy_reasons: Dict[int, str] = {}
 
     @staticmethod
     def _free_loopback_port() -> int:
@@ -1156,6 +1636,7 @@ class BatchRunner:
                 stderr=subprocess.STDOUT,
                 text=False,
                 env=broker_env,
+                creationflags=_managed_broker_creation_flags(),
             )
         finally:
             log_handle.close()
@@ -1182,7 +1663,7 @@ class BatchRunner:
                 last_error = str(exc)
             time.sleep(0.15)
         try:
-            process.terminate()
+            _request_graceful_broker_shutdown(process)
             process.wait(timeout=3)
         except Exception:
             try:
@@ -1201,8 +1682,11 @@ class BatchRunner:
             return
         self.owns_broker = False
         try:
-            process.terminate()
-            process.wait(timeout=5)
+            if process.poll() is None:
+                _request_graceful_broker_shutdown(process)
+            # Uvicorn's signal handler now reaches the FastAPI lifespan
+            # shutdown, which closes every BrowserSlot before Python exits.
+            process.wait(timeout=8)
         except Exception:
             try:
                 process.kill()
@@ -1218,6 +1702,453 @@ class BatchRunner:
     def active(self) -> List[WorkerState]:
         # 注册中 + 后台 SSO 转换中都占并发槽，保证每个 worker 一对一跟随转换。
         return [worker for worker in self.workers if worker.status in {"running", "converting"}]
+
+    def _uses_static_proxy_slots(self) -> bool:
+        return bool(
+            self.plan.proxy_mode == "pool"
+            and getattr(self.plan, "proxy_slot_sticky", False)
+            and int(getattr(self.plan, "proxy_pool_size", 0) or 0) > 0
+            and not self.plan.embedded_proxy_enabled
+        )
+
+    def _prepare_static_proxy_snapshot(self) -> None:
+        """Freeze the indexed pool for this batch in a private run file."""
+        if not self._uses_static_proxy_slots():
+            return
+        entries = list(getattr(self.plan, "proxy_pool_entries", ()) or ())
+        if not entries:
+            # Compatibility for callers that construct RunPlan directly rather
+            # than through build_plan().  Read the source exactly once here.
+            try:
+                arg_index = self.plan.proxy_args.index("--proxy-file")
+                source_path = Path(self.plan.proxy_args[arg_index + 1])
+            except (ValueError, IndexError):
+                source_path = Path()
+            if source_path.is_file():
+                entries = _canonical_proxy_file_entries(source_path)
+        if not entries:
+            raise TuiConfigError("代理池固定槽位缺少可快照的有效代理条目")
+        if len(entries) != int(self.plan.proxy_pool_size or 0):
+            raise TuiConfigError(
+                "代理池固定槽位数量与启动快照不一致，请重新生成运行计划"
+            )
+
+        target = self.run_dir / "proxy_pool.snapshot.txt"
+        temp = target.with_name(
+            f".{target.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+        )
+        fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write("\n".join(entries) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp, target)
+            try:
+                os.chmod(target, 0o600)
+            except OSError:
+                pass
+        finally:
+            try:
+                temp.unlink()
+            except FileNotFoundError:
+                pass
+        self._proxy_pool_snapshot_path = target
+
+    def _perform_static_proxy_health_request(
+        self,
+        proxy_url: str,
+        target: str,
+    ) -> Tuple[int, str]:
+        """Perform one target-aware request through an already prepared route.
+
+        The Microsoft endpoint intentionally receives an invalid, inert token
+        request.  Its normal HTTP 400 response proves that the TLS/proxy route
+        reached the real token service without consuming a mailbox credential.
+        """
+        from curl_cffi import requests as curl_requests
+
+        proxies = {"http": proxy_url, "https": proxy_url}
+        common = {
+            "proxies": proxies,
+            "timeout": STATIC_PROXY_HEALTH_TIMEOUT_SEC,
+            # Match the registration flow's current TLS/browser fingerprint so
+            # the gate does not approve a route under an older curl profile.
+            "impersonate": "chrome136",
+            "allow_redirects": False,
+        }
+        if target == "signup":
+            response = curl_requests.get(STATIC_PROXY_SIGNUP_URL, **common)
+        elif target == "ms_token":
+            response = curl_requests.post(
+                STATIC_PROXY_MS_TOKEN_URL,
+                data={
+                    "client_id": "PROXY_HEALTH_CHECK",
+                    "grant_type": "refresh_token",
+                    "refresh_token": "PROXY_HEALTH_CHECK",
+                },
+                **common,
+            )
+        else:  # pragma: no cover - internal programming error
+            raise ValueError(f"unknown proxy health target: {target}")
+        return (
+            int(getattr(response, "status_code", 0) or 0),
+            str(getattr(response, "text", "") or "")[:4096],
+        )
+
+    @staticmethod
+    def _static_proxy_transport_reason(exc: BaseException) -> str:
+        text_value = f"{type(exc).__name__}: {exc}".lower()
+        if any(
+            marker in text_value
+            for marker in (
+                "curl: (35)",
+                "tls connect",
+                "ssl connect",
+                "openssl",
+                "unexpected eof",
+                "certificate verify",
+            )
+        ):
+            return "curl_tls_error"
+        if any(
+            marker in text_value
+            for marker in (
+                "curl: (5)",
+                "curl: (6)",
+                "curl: (7)",
+                "curl: (28)",
+                "curl: (56)",
+                "proxy",
+                "connect",
+                "timeout",
+                "timed out",
+            )
+        ):
+            return "proxy_transport_error"
+        return "target_transport_error"
+
+    @staticmethod
+    def _classify_static_proxy_target(
+        target: str,
+        status_code: int,
+        body: str,
+    ) -> Tuple[bool, str]:
+        status = int(status_code or 0)
+        lowered = str(body or "").lower()
+        region_markers = (
+            "unsupported region",
+            "unsupported_region",
+            "restricted region",
+            "restricted_region",
+            "not available in your region",
+            "not available in your country",
+            "unsupported country",
+            "unsupported_country",
+            "country_block",
+            "cf_country",
+            "geo_block",
+        )
+        if target == "signup":
+            # A 403 from the sign-up origin is unusable for registration.  Keep
+            # the stable region code even when the edge sends an empty body.
+            if status == 403 or (status == 451 and any(x in lowered for x in region_markers)):
+                return False, "signup_region_403"
+            if 200 <= status < 400:
+                return True, "ok"
+            return False, f"signup_http_{status or 0}"
+        if target == "ms_token":
+            # Invalid dummy grants normally return 400.  Other application-level
+            # 4xx responses still prove transport reachability, except statuses
+            # that indicate blocking, proxy auth, or exit throttling.
+            if 200 <= status < 500 and status not in {403, 407, 429}:
+                return True, "ok"
+            return False, f"ms_token_http_{status or 0}"
+        return False, "unknown_target"
+
+    def _probe_static_proxy_slot(
+        self,
+        slot_index: int,
+        proxy_raw: str,
+        _retired_parent_proxy: str = "",
+    ) -> Dict[str, object]:
+        """Probe both registration dependencies for one immutable pool index."""
+        del _retired_parent_proxy
+        forwarder_key = (
+            f"batch-proxy-health-{self.run_id}-{int(slot_index)}-"
+            f"{secrets.token_hex(3)}"
+        )
+        target_results: Dict[str, Dict[str, object]] = {}
+        try:
+            from local_proxy_forwarder import ensure_local_forwarder
+
+            proxy_url, _ = ensure_local_forwarder(
+                proxy_raw,
+                preferred_local_port=0,
+                instance_key=forwarder_key,
+                parent_proxy_raw="",
+            )
+        except Exception as exc:
+            reason = self._static_proxy_transport_reason(exc)
+            try:
+                from local_proxy_forwarder import stop_local_forwarder
+
+                stop_local_forwarder(instance_key=forwarder_key)
+            except Exception:
+                pass
+            return {
+                "index": int(slot_index),
+                "ok": False,
+                "reason": reason,
+                "targets": target_results,
+            }
+
+        try:
+            # Always test both targets.  A failed signup request does not hide a
+            # separate Microsoft route problem (and vice versa).
+            for target in ("signup", "ms_token"):
+                for attempt in range(1, STATIC_PROXY_HEALTH_ATTEMPTS + 1):
+                    try:
+                        status, body = self._perform_static_proxy_health_request(
+                            proxy_url,
+                            target,
+                        )
+                        ok, reason = self._classify_static_proxy_target(
+                            target,
+                            status,
+                            body,
+                        )
+                        target_results[target] = {
+                            "ok": ok,
+                            "status_code": status,
+                            "reason": reason,
+                            "attempts": attempt,
+                        }
+                    except Exception as exc:
+                        reason = self._static_proxy_transport_reason(exc)
+                        target_results[target] = {
+                            "ok": False,
+                            "status_code": None,
+                            "reason": reason,
+                            "attempts": attempt,
+                        }
+                    item = target_results[target]
+                    if item.get("ok"):
+                        break
+                    # Region/proxy-auth/application responses are stable for the
+                    # current exit.  Retry only transport noise and throttling/
+                    # upstream 5xx so a single parent-hop reset does not falsely
+                    # quarantine an otherwise healthy port.
+                    reason = str(item.get("reason") or "")
+                    retryable = reason in {
+                        "curl_tls_error",
+                        "proxy_transport_error",
+                        "target_transport_error",
+                    } or reason.endswith("_429") or bool(
+                        re.search(r"_http_5\d\d$", reason)
+                    )
+                    if not retryable or attempt >= STATIC_PROXY_HEALTH_ATTEMPTS:
+                        break
+                    time.sleep(
+                        STATIC_PROXY_HEALTH_BACKOFF_SEC * attempt
+                        + min(0.2, int(slot_index) * 0.04)
+                    )
+        finally:
+            try:
+                from local_proxy_forwarder import stop_local_forwarder
+
+                stop_local_forwarder(instance_key=forwarder_key)
+            except Exception:
+                pass
+
+        failures = [
+            str(item.get("reason") or "target_probe_failed")
+            for item in target_results.values()
+            if not item.get("ok")
+        ]
+        return {
+            "index": int(slot_index),
+            "ok": not failures and len(target_results) == 2,
+            "reason": ",".join(dict.fromkeys(failures)) if failures else "ok",
+            "targets": target_results,
+        }
+
+    def _probe_static_proxy_slots(self) -> None:
+        """Parallel batch gate for all frozen slots, immediately before spawn."""
+        if not self._uses_static_proxy_slots():
+            return
+        entries = list(getattr(self.plan, "proxy_pool_entries", ()) or ())
+        if not entries and self._proxy_pool_snapshot_path is not None:
+            entries = _canonical_proxy_file_entries(self._proxy_pool_snapshot_path)
+        if len(entries) != int(self.plan.proxy_pool_size or 0):
+            raise TuiConfigError("代理池目标探测缺少完整的启动快照")
+
+        results: Dict[int, Dict[str, object]] = {}
+        with ThreadPoolExecutor(
+            # Probe in a small wave so the gate measures each upstream slot
+            # without turning the health check itself into a traffic spike.
+            max_workers=max(
+                1,
+                min(len(entries), STATIC_PROXY_HEALTH_PROBE_WORKERS),
+            ),
+            thread_name_prefix="static-proxy-health",
+        ) as executor:
+            futures = {
+                executor.submit(
+                    self._probe_static_proxy_slot,
+                    index,
+                    raw,
+                ): index
+                for index, raw in enumerate(entries)
+            }
+            for future in as_completed(futures):
+                index = int(futures[future])
+                try:
+                    results[index] = dict(future.result())
+                except Exception as exc:  # keep one broken probe from hiding peers
+                    results[index] = {
+                        "index": index,
+                        "ok": False,
+                        "reason": self._static_proxy_transport_reason(exc),
+                        "targets": {},
+                    }
+
+        self._static_proxy_health = results
+        self._healthy_static_proxy_slots = {
+            index for index, item in results.items() if bool(item.get("ok"))
+        }
+        self._isolated_static_proxy_reasons = {
+            index: str(item.get("reason") or "target_probe_failed")
+            for index, item in results.items()
+            if not item.get("ok")
+        }
+        healthy = len(self._healthy_static_proxy_slots)
+        total = len(entries)
+        isolated = sorted(set(range(total)) - self._healthy_static_proxy_slots)
+        for index in isolated:
+            self._log(
+                "SYSTEM",
+                f"[Proxy] 槽位 #{index + 1} 已隔离: "
+                f"{self._isolated_static_proxy_reasons.get(index, 'target_probe_failed')}",
+            )
+        suffix = ""
+        if isolated:
+            suffix = "；隔离 " + ", ".join(f"#{index + 1}" for index in isolated)
+        self._log(
+            "SYSTEM",
+            f"[Proxy] 双目标启动探测完成: 健康 {healthy}/{total}；"
+            f"本批次活动并发上限 {healthy}{suffix}",
+        )
+        if healthy <= 0:
+            raise TuiConfigError("代理池全部槽位未通过注册页与邮箱令牌端点探测")
+
+    def _healthy_static_slot_indexes(self) -> Tuple[int, ...]:
+        total = int(self.plan.proxy_pool_size or 0)
+        if self._healthy_static_proxy_slots is None:
+            return tuple(range(total))
+        return tuple(
+            index
+            for index in range(total)
+            if index in self._healthy_static_proxy_slots
+        )
+
+    def _isolate_static_proxy_slot(self, worker: WorkerState, reason: str) -> bool:
+        """Remove a runtime-bad slot from the current batch's lease domain.
+
+        The worker's slot pointer is cleared so a retry can lease another
+        healthy fixed index while the immutable proxy snapshot stays intact.
+        Returns True only for the first diagnostic that isolates this slot.
+        """
+        if not self._uses_static_proxy_slots() or worker.proxy_slot_index is None:
+            return False
+        slot = int(worker.proxy_slot_index)
+        if self._healthy_static_proxy_slots is None:
+            self._healthy_static_proxy_slots = set(range(int(self.plan.proxy_pool_size)))
+        first = slot in self._healthy_static_proxy_slots
+        self._healthy_static_proxy_slots.discard(slot)
+        self._proxy_slot_leases.pop(slot, None)
+        worker.proxy_slot_index = None
+        if first:
+            clean_reason = str(reason or "runtime_target_failure")[:120]
+            self._isolated_static_proxy_reasons[slot] = clean_reason
+            self._log(
+                "SYSTEM",
+                f"[Proxy] 槽位 #{slot + 1} 运行期隔离: {clean_reason}；"
+                f"剩余健康槽位 {len(self._healthy_static_proxy_slots)}",
+            )
+        if not self._healthy_static_proxy_slots:
+            self.phase = "draining"
+            self._log("SYSTEM", "[Proxy] 当前批次健康槽位已耗尽，停止补货并收尾")
+        return first
+
+    def _acquire_static_proxy_slot(self, worker: WorkerState) -> bool:
+        """Lease one unique proxy-file index to a registration worker."""
+        if not self._uses_static_proxy_slots():
+            return True
+        total = int(self.plan.proxy_pool_size)
+        healthy_indexes = self._healthy_static_slot_indexes()
+        current = worker.proxy_slot_index
+        if current is not None:
+            owner = self._proxy_slot_leases.get(int(current))
+            if int(current) in healthy_indexes and owner in {None, worker.index}:
+                self._proxy_slot_leases[int(current)] = worker.index
+                return True
+
+        # Keep the intuitive worker/index mapping when that slot is free.  On
+        # uneven task completion, take another free slot rather than collide
+        # with a still-running worker or leave available capacity idle.
+        preferred = (int(worker.index) - 1) % total
+        candidates = (
+            ([preferred] if preferred in healthy_indexes else [])
+            + [idx for idx in healthy_indexes if idx != preferred]
+        )
+        selected = next((idx for idx in candidates if idx not in self._proxy_slot_leases), None)
+        if selected is None:
+            worker.last_log = "没有空闲的代理池固定槽位"
+            return False
+        worker.proxy_slot_index = int(selected)
+        self._proxy_slot_leases[int(selected)] = worker.index
+        self._log(
+            f"W{worker.index:02d}",
+            f"[Proxy] 固定槽位 #{int(selected) + 1}/{total} 已分配",
+        )
+        return True
+
+    def _release_static_proxy_slot(self, worker: WorkerState) -> None:
+        slot = worker.proxy_slot_index
+        if slot is None:
+            return
+        if self._proxy_slot_leases.get(int(slot)) == worker.index:
+            self._proxy_slot_leases.pop(int(slot), None)
+
+    def _proxy_args_for_worker(self, worker: WorkerState) -> List[str]:
+        args = list(self.plan.proxy_args)
+        if not self._uses_static_proxy_slots():
+            return args
+        if self._proxy_pool_snapshot_path is not None:
+            try:
+                file_index = args.index("--proxy-file")
+                args[file_index + 1] = str(self._proxy_pool_snapshot_path)
+            except (ValueError, IndexError) as exc:
+                raise TuiConfigError("代理池固定槽位命令缺少 --proxy-file") from exc
+        if worker.proxy_slot_index is None and not self._acquire_static_proxy_slot(worker):
+            raise TuiConfigError(worker.last_log or "没有空闲的代理池固定槽位")
+        # proxy_random and proxy_index are mutually exclusive.  Strip either
+        # legacy choice and append the exact leased index for this subprocess.
+        cleaned: List[str] = []
+        idx = 0
+        while idx < len(args):
+            item = args[idx]
+            if item == "--proxy-random":
+                idx += 1
+                continue
+            if item == "--proxy-index":
+                idx += 2
+                continue
+            cleaned.append(item)
+            idx += 1
+        cleaned.extend(["--proxy-index", str(int(worker.proxy_slot_index or 0))])
+        return cleaned
 
     @property
     def completed(self) -> int:
@@ -1257,6 +2188,7 @@ class BatchRunner:
             self._maybe_trip_circuit()
         elif status == "stopped":
             self.stopped_count += 1
+        self._release_static_proxy_slot(worker)
         # Keep a compact recent window for UI; full history stays on disk logs.
         self.recent_workers.append(worker)
 
@@ -1305,6 +2237,12 @@ class BatchRunner:
                 os.chmod(directory, 0o700)
             except OSError:
                 pass
+        self._prepare_static_proxy_snapshot()
+        # Probe every immutable slot on every new batch.  This happens after
+        # the snapshot is frozen and before any registration/broker worker is
+        # spawned, so a 30-minute upstream rotation is observed by the next
+        # batch without remapping fixed indexes in the current one.
+        self._probe_static_proxy_slots()
         if self.plan.provider == "local":
             cleanup = cleanup_browser_residues(kill_playwright=True, kill_all_chrome=False)
             self._log("SYSTEM", f"启动前清理浏览器残留: {format_cleanup_result(cleanup)}")
@@ -1356,8 +2294,8 @@ class BatchRunner:
         command.extend(["--turnstile-solve-retries", str(solve_retries)])
         if self.plan.turnstile_broker_url:
             command.extend(["--turnstile-broker-url", self.plan.turnstile_broker_url])
-        # 模式1：仓库内 PKCE OAuth。
-        # 模式2：显式传空 output-dir，关闭注册内置换票，改由 sso_to_auth_json 一对一转换。
+        # PKCE: 注册进程内直接换凭证。
+        # SSO Device Flow: 注册只取 SSO，随后一对一转换。
         if self.plan.run_mode == RUN_MODE_REGISTER_OTP:
             command.extend(["--output-dir", str(self.plan.output_dir)])
         else:
@@ -1365,7 +2303,7 @@ class BatchRunner:
         if self.plan.embedded_proxy_enabled and worker.proxy_local_http:
             command.extend(["--proxy", worker.proxy_local_http])
         else:
-            command.extend(self.plan.proxy_args)
+            command.extend(self._proxy_args_for_worker(worker))
         # Independent Turnstile solve proxy (optional).
         try:
             ts_proxy = pick_turnstile_proxy(
@@ -1374,6 +2312,7 @@ class BatchRunner:
             )
         except Exception:
             ts_proxy = ""
+        worker.uses_independent_turnstile_proxy = bool(ts_proxy)
         if ts_proxy:
             command.extend(["--turnstile-proxy", ts_proxy])
         return command
@@ -1854,12 +2793,21 @@ class BatchRunner:
             if worker.proxy_node_id:
                 self._release_embedded_proxy(worker, failed=False)
 
+    def _release_all_static_proxy_slots(self) -> None:
+        for worker in self.workers:
+            self._release_static_proxy_slot(worker)
+        self._proxy_slot_leases.clear()
+
     def _spawn_one(self, worker: WorkerState, *, acquire_proxy: bool = True) -> bool:
         """Try to launch one worker process.
 
         Returns True only when the subprocess is actually running.
         Resource shortages (no proxy node) return False without counting failure.
         """
+        worker.reader_thread = None
+        worker.return_code = None
+        worker.failure_category = ""
+        worker.error_detail = ""
         worker.accounts_path = self.run_dir / f"accounts_{worker.index:03d}.txt"
         worker.log_path = self.run_dir / f"worker_{worker.index:03d}.log"
         if acquire_proxy and self.plan.embedded_proxy_enabled:
@@ -1868,6 +2816,10 @@ class BatchRunner:
                     worker.last_log = "没有可用的内嵌代理节点"
                 # Do not mark failed / do not write failure counters.
                 return False
+        if acquire_proxy and not self._acquire_static_proxy_slot(worker):
+            if not worker.last_log:
+                worker.last_log = "没有空闲的代理池固定槽位"
+            return False
         command = self._command_for(worker)
         log_handle = None
         try:
@@ -1885,6 +2837,7 @@ class BatchRunner:
         except OSError as exc:
             self._mark_terminal(worker, "failed")
             worker.last_log = f"无法启动进程: {exc}"
+            self._release_static_proxy_slot(worker)
             self._release_embedded_proxy(worker, failed=True)
             self._record_failure(worker, worker.last_log)
             self._log(f"W{worker.index:02d}", worker.last_log)
@@ -1908,6 +2861,11 @@ class BatchRunner:
                         log_handle.write(line)
                     except OSError:
                         pass
+                    detail = _extract_failure_detail(line)
+                    if detail:
+                        # Record before enqueueing so process-exit handling can
+                        # still see the diagnostic if the UI queue lags behind.
+                        worker.error_detail = detail
                     self.events.put((worker.index, line))
             finally:
                 try:
@@ -1919,7 +2877,12 @@ class BatchRunner:
                 except OSError:
                     pass
 
-        threading.Thread(target=copy_and_queue, daemon=True).start()
+        worker.reader_thread = threading.Thread(
+            target=copy_and_queue,
+            name=f"http-worker-output-{worker.index}",
+            daemon=True,
+        )
+        worker.reader_thread.start()
         return True
 
     def _spawn_available(self) -> None:
@@ -1941,7 +2904,10 @@ class BatchRunner:
             return
 
         # Hard cap attempts in one tick: never create more than worker slots.
-        slots = max(0, int(self.plan.workers) - len(self.active))
+        capacity = int(self.plan.workers)
+        if self._uses_static_proxy_slots():
+            capacity = min(capacity, len(self._healthy_static_slot_indexes()))
+        slots = max(0, capacity - len(self.active))
         attempts = 0
         while slots > 0 and attempts < int(self.plan.workers) and self._should_refill():
             if self._refill_pause_active():
@@ -1956,7 +2922,7 @@ class BatchRunner:
             launched = self._spawn_one(worker)
             if launched:
                 self.started_tasks += 1
-                slots = max(0, int(self.plan.workers) - len(self.active))
+                slots = max(0, capacity - len(self.active))
                 continue
             # Launch failed without becoming active.
             reason = worker.last_log or "启动失败"
@@ -1965,6 +2931,7 @@ class BatchRunner:
             resource_shortage = (
                 "没有可用的内嵌代理节点" in reason
                 or "内嵌代理已启用但管理器未就绪" in reason
+                or "没有空闲的代理池固定槽位" in reason
             )
             if resource_shortage:
                 # Remove non-started worker so it does not pollute active/queues.
@@ -1980,7 +2947,7 @@ class BatchRunner:
                 self._mark_terminal(worker, "failed")
                 self._record_failure(worker, reason)
             # Still respect one-tick budget; avoid tight-loop storm.
-            slots = max(0, int(self.plan.workers) - len(self.active))
+            slots = max(0, capacity - len(self.active))
             # brief pause after hard spawn errors too
             self._pause_refill(reason, seconds=min(DEFAULT_REFILL_PAUSE_SEC, 1.0))
             break
@@ -1991,7 +2958,11 @@ class BatchRunner:
                 worker_index, message = self.events.get_nowait()
             except queue.Empty:
                 return
-            worker = self.worker_by_index.get(worker_index) or self.workers[worker_index - 1]
+            worker = self.worker_by_index.get(worker_index)
+            if worker is None:
+                # A very late reader event may arrive after an old terminal
+                # worker was pruned from the bounded UI window.
+                continue
             raw = str(message or "")
             if raw.startswith("__CONVERT_DONE__|"):
                 parts = raw.split("|", 2)
@@ -2004,11 +2975,57 @@ class BatchRunner:
                     self._mark_terminal(worker, "succeeded" if ok else "failed")
                 worker.last_log = msg
                 if worker.status == "failed":
+                    worker.error_detail = _extract_failure_detail(msg) or _safe_text(msg)
                     self._record_failure(worker, msg)
                 self._log(f"W{worker_index:02d}", worker.last_log)
                 continue
-            worker.last_log = _safe_text(raw)
+            clean = _safe_text(raw)
+            detail = _extract_failure_detail(raw)
+            if detail:
+                worker.error_detail = detail
+            if worker.status == "failed" and worker.return_code is not None:
+                # Preserve the return-code suffix if an output event crossed
+                # the process-exit/UI-tick boundary.
+                exit_note = f"协议任务退出，退出码 {worker.return_code}"
+                worker.last_log = (
+                    _safe_text(f"{detail} | {exit_note}", 800)
+                    if detail
+                    else worker.last_log
+                )
+            else:
+                worker.last_log = clean
             self._log(f"W{worker_index:02d}", raw)
+
+    def _flush_worker_output(self, worker: WorkerState) -> None:
+        """Synchronize a terminated child with its stdout reader and UI queue."""
+        reader = worker.reader_thread
+        if reader is not None:
+            # A terminated process normally closes the pipe immediately.  Keep
+            # a finite wait for descendants that inherited stdout by mistake.
+            reader.join(timeout=1.0)
+            if not reader.is_alive():
+                worker.reader_thread = None
+        self._drain_events()
+        # The log is also a durable fallback when the reader finished between
+        # queue drains or its final event was delayed.
+        if worker.log_path and worker.log_path.is_file():
+            try:
+                tail = worker.log_path.read_text(
+                    encoding="utf-8", errors="replace"
+                )[-8000:]
+            except OSError:
+                tail = ""
+            detail = _extract_failure_detail(tail)
+            if detail:
+                worker.error_detail = detail
+
+    @staticmethod
+    def _worker_exit_reason(worker: WorkerState, return_code: int) -> str:
+        exit_note = f"协议任务退出，退出码 {return_code}"
+        detail = worker.error_detail or _extract_failure_detail(worker.last_log)
+        if not detail:
+            return exit_note
+        return _safe_text(f"{detail} | {exit_note}", 800)
 
     def _check_processes(self) -> None:
         for worker in list(self.workers):
@@ -2018,13 +3035,19 @@ class BatchRunner:
             if return_code is None:
                 continue
             worker.return_code = return_code
+            self._flush_worker_output(worker)
             worker.process = None
             if self.stopping:
+                self._release_static_proxy_slot(worker)
                 self._mark_terminal(worker, "stopped")
                 worker.last_log = "已被操作者停止"
                 self._release_embedded_proxy(worker, failed=False)
                 self._log(f"W{worker.index:02d}", worker.last_log)
             elif return_code == 0:
+                # Registration and its Turnstile solve have both ended.  SSO
+                # conversion, when selected, is a separate stage and needs no
+                # registration proxy slot.
+                self._release_static_proxy_slot(worker)
                 self._release_embedded_proxy(worker, failed=False)
                 if self.plan.run_mode == RUN_MODE_REGISTER_SSO:
                     self._start_sso_convert(worker)
@@ -2033,7 +3056,7 @@ class BatchRunner:
                     worker.last_log = "协议任务已完成"
                     self._log(f"W{worker.index:02d}", worker.last_log)
             else:
-                reason = f"协议任务退出，退出码 {return_code}"
+                reason = self._worker_exit_reason(worker, return_code)
                 worker.last_log = reason
                 if self._maybe_retry_proxy_node(worker, reason):
                     # either respawned (running) or already marked terminal inside helper
@@ -2041,6 +3064,31 @@ class BatchRunner:
                         continue
                     self._log(f"W{worker.index:02d}", worker.last_log)
                     continue
+                category = classify_failure_text(reason)
+                worker.failure_category = category
+                worker.error_detail = worker.error_detail or reason
+                isolate_shared_route = category in {
+                    "region_blocked",
+                    "tls_error",
+                    "proxy_error",
+                } or (
+                    category == "turnstile_challenge_transient"
+                    and not worker.uses_independent_turnstile_proxy
+                )
+                if isolate_shared_route and self._isolate_static_proxy_slot(worker, category):
+                    # This first failure diagnoses a bad fixed route rather
+                    # than a failed registration.  Remove it from the healthy
+                    # slot set and let the normal refill path replace the
+                    # logical task on another route.
+                    worker.last_log = _safe_text(
+                        f"{reason} | 代理槽已隔离，任务将重排", 800
+                    )
+                    self._mark_terminal(worker, "stopped")
+                    self.started_tasks = max(0, int(self.started_tasks) - 1)
+                    self._release_embedded_proxy(worker, failed=False)
+                    self._log(f"W{worker.index:02d}", worker.last_log)
+                    continue
+                self._release_static_proxy_slot(worker)
                 self._mark_terminal(worker, "failed")
                 self._release_embedded_proxy(worker, failed=False)
                 self._record_failure(worker, worker.last_log)
@@ -2078,6 +3126,7 @@ class BatchRunner:
                 f"批量完成: 成功={self.succeeded}, 失败={self.failed}, 账号数={self.account_count}",
             )
         finally:
+            self._release_all_static_proxy_slots()
             self._release_all_embedded_proxies()
             self._stop_shared_broker()
             self.phase = "done"
@@ -2125,13 +3174,30 @@ class BatchRunner:
     def _record_failure(self, worker: WorkerState, reason_text: str = "") -> None:
         if worker.index in self._failure_recorded:
             return
-        blob_parts = [reason_text, worker.last_log]
+        blob_parts = [worker.error_detail, reason_text, worker.last_log]
+        log_tail = ""
         if worker.log_path and worker.log_path.is_file():
             try:
-                blob_parts.append(worker.log_path.read_text(encoding="utf-8", errors="replace")[-4000:])
+                log_tail = worker.log_path.read_text(
+                    encoding="utf-8", errors="replace"
+                )[-8000:]
+                blob_parts.append(log_tail)
             except OSError:
                 pass
-        category = classify_failure_text("\n".join(str(p) for p in blob_parts if p))
+        detail = (
+            worker.error_detail
+            or _extract_failure_detail(reason_text)
+            or _extract_failure_detail(log_tail)
+            or _safe_text(reason_text or worker.last_log)
+        )
+        detail_category = classify_failure_text(detail)
+        category = (
+            detail_category
+            if detail_category != "unknown"
+            else classify_failure_text("\n".join(str(p) for p in blob_parts if p))
+        )
+        worker.error_detail = detail
+        worker.failure_category = category
         self.failure_counts[category] = int(self.failure_counts.get(category) or 0) + 1
         self._failure_recorded.add(worker.index)
 
@@ -2201,6 +3267,13 @@ class BatchRunner:
                     "status": worker.status,
                     "last_log": worker.last_log,
                     "return_code": worker.return_code,
+                    "failure_category": worker.failure_category,
+                    "error_detail": worker.error_detail,
+                    "proxy_slot": (
+                        int(worker.proxy_slot_index) + 1
+                        if worker.proxy_slot_index is not None
+                        else None
+                    ),
                 }
                 for worker in shown_workers
             ],
@@ -2313,7 +3386,10 @@ def _mask_config_dict(config: Dict[str, object]) -> Dict[str, object]:
 
 
 def _settings_to_public_dict(settings: Settings) -> Dict[str, object]:
-    config = _mask_config_dict(dict(settings.config or {}))
+    config = dict(settings.config or {})
+    proxy_mode = _normalize_proxy_mode(
+        "none" if settings.no_proxy else settings.proxy_mode or "auto"
+    )
     return {
         "config_path": str(settings.config_path),
         "count": settings.count,
@@ -2323,14 +3399,17 @@ def _settings_to_public_dict(settings: Settings) -> Dict[str, object]:
         "continuous_max_runtime_min": int(getattr(settings, "continuous_max_runtime_min", 0) or 0),
         "output_dir": str(settings.output_dir),
         "run_mode": settings.run_mode,
-        "proxy_mode": "none" if settings.no_proxy or str(settings.proxy_mode or "").strip().lower() == "none" else str(settings.proxy_mode or "auto"),
-        "no_proxy": bool(settings.no_proxy or str(settings.proxy_mode or "").strip().lower() == "none"),
+        "credential_flow": credential_flow_from_run_mode(settings.run_mode),
+        "proxy_mode": proxy_mode,
+        "no_proxy": proxy_mode == "none",  # legacy API compatibility; derived only
         "turnstile_provider": settings.turnstile_provider,
         "turnstile_headless": settings.turnstile_headless,
+        "local_turnstile_max_workers": resolve_local_turnstile_max_workers(
+            config, strict=False
+        ),
         "sso_convert_retries": settings.sso_convert_retries,
         "sso_convert_cooldown": settings.sso_convert_cooldown,
         "email_provider": str(config.get("email_provider") or ""),
-        "config": config,
     }
 
 
@@ -2653,6 +3732,11 @@ def read_proxy_pool_text(settings: Settings) -> Dict[str, object]:
 
 
 def write_proxy_pool_text(settings: Settings, text_value: str, *, sync_proxies_array: bool = True) -> Dict[str, object]:
+    """Write the proxy pool file, which is the canonical pool data source.
+
+    ``sync_proxies_array`` is retained as a call/API compatibility flag; it now
+    synchronizes only the file path and removes the former duplicate array.
+    """
     path = _proxy_file_path(settings)
     path.parent.mkdir(parents=True, exist_ok=True)
     content = str(text_value or "")
@@ -2665,7 +3749,7 @@ def write_proxy_pool_text(settings: Settings, text_value: str, *, sync_proxies_a
     lines = [ln.strip() for ln in content.splitlines() if ln.strip() and not ln.strip().startswith("#")]
     if sync_proxies_array:
         cfg = dict(settings.config or {})
-        cfg["proxies"] = lines
+        cfg.pop("proxies", None)
         cfg["proxy_file"] = _config_path_value(path, settings.config_path.parent)
         settings.config = cfg
         # keep proxy_file path relative-friendly in config
@@ -2874,10 +3958,11 @@ def test_proxy_pool_sample(
     sample = random.sample(lines, n) if n else []
     results: List[Dict[str, object]] = []
     ok_count = 0
+    proxy_mode = _normalize_proxy_mode(settings.proxy_mode)
+    chain_enabled = False
     for idx, raw in enumerate(sample, start=1):
         item: Dict[str, object] = {
             "index": idx,
-            "proxy": raw,
             "display": _proxy_display_for_test(raw),
             "ok": False,
             "latency_ms": None,
@@ -2940,6 +4025,8 @@ def test_proxy_pool_sample(
         "source_path": source_path,
         "probe_url": url,
         "timeout_sec": timeout,
+        "proxy_mode": proxy_mode,
+        "chain_enabled": chain_enabled,
         "total_available": total,
         "tested": len(results),
         "ok": ok_count,
@@ -2953,12 +4040,12 @@ def build_config_center(settings: Settings) -> Dict[str, object]:
     secret_flags = {
         key: bool(str(raw.get(key) or "").strip()) for key in SENSITIVE_CONFIG_KEYS
     }
-    public = _settings_to_public_dict(settings)
     pool = read_proxy_pool_text(settings)
     ts_pool = read_turnstile_proxy_pool_text(settings)
     # Do not dump full proxy text into config blob twice; keep top-level pool.
     return {
-        **public,
+        "config_path": str(settings.config_path),
+        "configured_keys": sorted(str(key) for key in raw.keys()),
         "secret_flags": secret_flags,
         "proxy_pool": {
             "path": pool["path"],
@@ -2973,6 +4060,9 @@ def build_config_center(settings: Settings) -> Dict[str, object]:
             "text": ts_pool["text"],
         },
         "fields": {
+            "credential_flow": credential_flow_from_run_mode(settings.run_mode),
+            "sso_convert_retries": int(settings.sso_convert_retries),
+            "sso_convert_cooldown": int(settings.sso_convert_cooldown),
             "email_provider": str(raw.get("email_provider") or ""),
             "yyds_api_base": str(raw.get("yyds_api_base") or ""),
             # Local-only config center intentionally returns plaintext secrets so
@@ -3014,7 +4104,6 @@ def build_config_center(settings: Settings) -> Dict[str, object]:
             "proxy": str(raw.get("proxy") or ""),
             "proxy_file": str(raw.get("proxy_file") or "proxies.txt"),
             "proxy_subscription_url": str(raw.get("proxy_subscription_url") or ""),
-            "proxy_subscription_local_http": str(raw.get("proxy_subscription_local_http") or ""),
             "embedded_proxy_enabled": _as_bool(raw.get("embedded_proxy_enabled")),
             "embedded_proxy_binary": str(raw.get("embedded_proxy_binary") or ""),
             "embedded_proxy_listen_host": str(raw.get("embedded_proxy_listen_host") or "127.0.0.1") or "127.0.0.1",
@@ -3048,7 +4137,12 @@ def build_config_center(settings: Settings) -> Dict[str, object]:
                 maximum=20,
                 default=3,
             ),
-            "proxy_parent": str(raw.get("proxy_parent") or ""),
+            "solver_slots": (
+                "auto_by_proxy"
+                if str(raw.get("solver_slots") or "").strip().lower() == "auto_by_proxy"
+                else ""
+            ),
+            "proxy_slot_sticky": _as_bool(raw.get("proxy_slot_sticky")),
             "proxy_random": _as_bool(raw.get("proxy_random")),
             "proxy_rotate_session": _as_bool(raw.get("proxy_rotate_session")),
             "turnstile_proxy_enabled": _as_bool(raw.get("turnstile_proxy_enabled")),
@@ -3082,7 +4176,10 @@ class BatchService:
         self._runner: Optional[BatchRunner] = None
         self._listeners: List[Callable[[str], None]] = []
         self._log_cursor = 0
-        self._lock = threading.Lock()
+        # Poller and HTTP handlers share one mutable BatchRunner.  Serialize all
+        # runner transitions/snapshots; RLock also keeps helper calls such as
+        # is_busy() safe when invoked from start_run() while the lock is held.
+        self._lock = threading.RLock()
         self._embedded_proxy_manager = None
         self._embedded_proxy_last: Dict[str, object] = {"enabled": False}
         self._embedded_proxy_boot: Dict[str, object] = {
@@ -3099,41 +4196,12 @@ class BatchService:
         config = _read_config(self.config_path) if self.config_path.is_file() else {}
         settings = Settings(
             config_path=self.config_path,
-            count=_positive_int(config.get("register_count", 1), "注册数量", MAX_COUNT),
-            workers=_positive_int(config.get("concurrent_workers", 1), "并发数", MAX_WORKERS),
-            output_dir=_absolute_path(str(config.get("xai_oauth_output_dir") or DEFAULT_OUTPUT_DIR), self.root_dir),
-            run_mode=_normalize_run_mode(config.get("tui_run_mode") or DEFAULT_RUN_MODE),
-            proxy_mode=str(config.get("tui_proxy_mode") or "auto"),
-            no_proxy=str(config.get("tui_proxy_mode") or "auto").strip().lower() == "none",
-            turnstile_provider=_normalize_turnstile_provider(config.get("turnstile_provider") or "capsolver"),
-            turnstile_headless=_as_bool(config.get("turnstile_headless")),
-            submit_workers=max(
-                1,
-                min(
-                    MAX_WORKERS,
-                    _positive_int(
-                        config.get("submit_workers", DEFAULT_SUBMIT_WORKERS),
-                        "提交并发",
-                        MAX_WORKERS,
-                    ),
-                ),
-            ),
-            sso_convert_retries=_bounded_int(
-                config.get("tui_sso_convert_retries"),
-                "SSO转换重试",
-                minimum=1,
-                maximum=MAX_SSO_CONVERT_RETRIES,
-                default=DEFAULT_SSO_CONVERT_RETRIES,
-            ),
-            sso_convert_cooldown=_bounded_int(
-                config.get("tui_sso_convert_cooldown"),
-                "SSO转换冷却",
-                minimum=0,
-                maximum=MAX_SSO_CONVERT_COOLDOWN,
-                default=DEFAULT_SSO_CONVERT_COOLDOWN,
-            ),
+            count=1,
+            workers=1,
+            output_dir=DEFAULT_OUTPUT_DIR.resolve(),
             config=config,
         )
+        _load_runtime_fields(settings)
         return settings
 
     def get_settings(self) -> Settings:
@@ -3162,8 +4230,12 @@ class BatchService:
             self.settings.output_dir = _absolute_path(str(data.get("output_dir")), self.root_dir)
         if "run_mode" in data:
             self.settings.run_mode = _normalize_run_mode(data.get("run_mode"))
+        if "credential_flow" in data:
+            self.settings.run_mode = run_mode_from_credential_flow(
+                data.get("credential_flow")
+            )
         if "proxy_mode" in data:
-            mode = str(data.get("proxy_mode") or "auto").strip().lower()
+            mode = _normalize_proxy_mode(data.get("proxy_mode"))
             self.settings.proxy_mode = mode
             self.settings.no_proxy = mode == "none"
         if "turnstile_provider" in data:
@@ -3197,8 +4269,8 @@ class BatchService:
             self.settings.config = merged
         if persist:
             persist_settings(self.settings)
-            # re-read to keep memory aligned with disk
             self.settings.config = _read_config(self.settings.config_path)
+            _load_runtime_fields(self.settings)
         return self.settings
 
 
@@ -3212,17 +4284,50 @@ class BatchService:
         fields = dict(fields or {})
 
         # Runtime-facing fields.
+        if "credential_flow" in fields:
+            self.settings.run_mode = run_mode_from_credential_flow(
+                fields.get("credential_flow")
+            )
+        elif "run_mode" in fields:
+            self.settings.run_mode = _normalize_run_mode(fields.get("run_mode"))
+        if "sso_convert_retries" in fields:
+            self.settings.sso_convert_retries = _bounded_int(
+                fields.get("sso_convert_retries"),
+                "SSO转换重试",
+                minimum=1,
+                maximum=MAX_SSO_CONVERT_RETRIES,
+                default=DEFAULT_SSO_CONVERT_RETRIES,
+            )
+        if "sso_convert_cooldown" in fields:
+            self.settings.sso_convert_cooldown = _bounded_int(
+                fields.get("sso_convert_cooldown"),
+                "SSO转换冷却",
+                minimum=0,
+                maximum=MAX_SSO_CONVERT_COOLDOWN,
+                default=DEFAULT_SSO_CONVERT_COOLDOWN,
+            )
         if "proxy_mode" in fields:
-            mode = str(fields.get("proxy_mode") or "auto").strip().lower()
-            if mode not in PROXY_MODE_LABELS:
+            raw_mode = str(fields.get("proxy_mode") or "auto").strip().lower()
+            if raw_mode not in PROXY_MODE_LABELS and raw_mode not in {
+                "chain",
+                "chain_pool",
+                "chained_pool",
+            }:
                 raise TuiConfigError("代理模式无效，可选: auto/none/direct/pool")
+            mode = _normalize_proxy_mode(raw_mode)
             self.settings.proxy_mode = mode
             self.settings.no_proxy = mode == "none"
+            fields["proxy_mode"] = mode
         if "turnstile_proxy_mode" in fields:
             ts_mode = str(fields.get("turnstile_proxy_mode") or "pool").strip().lower()
             if ts_mode not in {"pool", "direct"}:
                 raise TuiConfigError("求解代理模式无效，可选: pool/direct")
             fields["turnstile_proxy_mode"] = ts_mode
+        if "solver_slots" in fields:
+            solver_slots = str(fields.get("solver_slots") or "").strip().lower()
+            if solver_slots not in {"", "auto_by_proxy"}:
+                raise TuiConfigError("求解槽位策略无效，可选: auto_by_proxy/空")
+            fields["solver_slots"] = solver_slots
         if "turnstile_provider" in fields:
             self.settings.turnstile_provider = _normalize_turnstile_provider(fields.get("turnstile_provider"))
         if "turnstile_headless" in fields:
@@ -3240,11 +4345,10 @@ class BatchService:
             "proxy",
             "proxy_file",
             "proxy_subscription_url",
-            "proxy_subscription_local_http",
             "embedded_proxy_binary",
             "embedded_proxy_listen_host",
             "embedded_proxy_probe_host",
-            "proxy_parent",
+            "solver_slots",
             "turnstile_proxy",
             "turnstile_proxy_file",
             "turnstile_proxy_mode",
@@ -3261,6 +4365,7 @@ class BatchService:
         bool_keys = [
             "proxy_random",
             "proxy_rotate_session",
+            "proxy_slot_sticky",
             "grok2api_auto_add_local",
             "grok2api_auto_add_remote",
             "enable_nsfw",
@@ -3474,47 +4579,37 @@ class BatchService:
         """Fetch a subscription URL and import usable HTTP proxies into the pool file."""
         from proxy_subscription import import_proxy_subscription
 
+        # Kept in the Python signature for older callers, but external local
+        # client ports are no longer an import fallback.  VLESS/VMess/SS/Trojan
+        # subscriptions are handled only by the embedded mihomo manager.
+        del use_local_http_if_empty, local_http
+
         cfg = dict(self.settings.config or {})
+        # Always migrate retired external-chain fields on the next config save,
+        # even when an older client still submits them.
+        cfg.pop("proxy_parent", None)
+        cfg.pop("proxy_subscription_local_http", None)
         sub_url = str(url or cfg.get("proxy_subscription_url") or "").strip()
         if not sub_url:
             raise TuiConfigError("请先填写 proxy_subscription_url 订阅链接")
         result = import_proxy_subscription(sub_url, timeout=timeout)
         data = result.to_dict()
         cfg["proxy_subscription_url"] = sub_url
-        # 若启用内嵌 mihomo 且主要是 VLESS，弱化“只能走 Clash”的通用警告。
+        # 若启用内嵌 mihomo 且主要是 VLESS，去掉重复的通用警告。
         if _as_bool(cfg.get("embedded_proxy_enabled")):
             vless_n = int((data.get("scheme_counts") or {}).get("vless") or 0)
             if vless_n > 0 and not result.usable_pool_lines:
                 filtered = []
                 for w in list(data.get("warnings") or []):
-                    if "需要先导入本地 Clash" in str(w) or "没有可直接用于注册机的 HTTP" in str(w):
+                    if "没有可直接用于注册机的 HTTP" in str(w):
                         continue
                     filtered.append(w)
                 data["warnings"] = filtered
 
-        local_http = str(local_http or cfg.get("proxy_subscription_local_http") or "").strip()
-        if local_http:
-            cfg["proxy_subscription_local_http"] = local_http
         pool_text_lines = list(result.pool_lines)
-        applied_local = False
         embedded_enabled = _as_bool(cfg.get("embedded_proxy_enabled"))
         vless_count = int((data.get("scheme_counts") or {}).get("vless") or 0)
-        # 内嵌 mihomo 开启时，VLESS 订阅走内嵌池，不应再强行回退本地 Clash 口。
-        if (
-            use_local_http_if_empty
-            and not result.usable_pool_lines
-            and local_http
-            and not (embedded_enabled and vless_count > 0)
-        ):
-            pool_text_lines.append(local_http)
-            applied_local = True
-            data.setdefault("warnings", []).append(
-                f"订阅无直连 HTTP 节点，已写入本地客户端入口: {local_http}"
-            )
-            self.settings.proxy_mode = "direct"
-            self.settings.no_proxy = False
-            cfg["proxy"] = local_http
-        elif not result.usable_pool_lines and embedded_enabled and vless_count > 0:
+        if not result.usable_pool_lines and embedded_enabled and vless_count > 0:
             data.setdefault("warnings", []).append(
                 f"订阅含 {vless_count} 个 VLESS 节点。HTTP 代理池不可直接使用它们；"
                 "请到“内嵌代理内核”点击启动/重载与预检。"
@@ -3535,13 +4630,8 @@ class BatchService:
             )
             cfg = dict(self.settings.config or {})
             cfg["proxy_subscription_url"] = sub_url
-            if local_http:
-                cfg["proxy_subscription_local_http"] = local_http
-            if applied_local:
-                cfg["proxy"] = local_http
-                cfg["tui_proxy_mode"] = "direct"
-            elif result.usable_pool_lines:
-                cfg["tui_proxy_mode"] = "pool"
+            if result.usable_pool_lines:
+                cfg["proxy_mode"] = "pool"
             self.settings.config = cfg
             persist_settings(self.settings)
             self.settings.config = _read_config(self.settings.config_path)
@@ -3558,7 +4648,7 @@ class BatchService:
             self.settings.config = _read_config(self.settings.config_path)
             _load_runtime_fields(self.settings)
 
-        data["applied_local_http"] = applied_local
+        data["applied_local_http"] = False
         data["proxy_mode"] = (
             "none"
             if self.settings.no_proxy
@@ -3960,16 +5050,29 @@ class BatchService:
             self._log_cursor += 1
 
     def is_busy(self) -> bool:
-        runner = self._runner
-        return bool(runner is not None and runner.started and not runner.done)
+        with self._lock:
+            runner = self._runner
+            return bool(runner is not None and runner.started and not runner.done)
 
     def start_run(self, overrides: Optional[Dict[str, object]] = None) -> Dict[str, object]:
         with self._lock:
             if self.is_busy():
                 raise BatchBusyError("当前已有批次在运行")
+            # Per-run overrides must not mutate the canonical settings shown by
+            # config-center or get written by a later save operation.
+            run_settings = replace(
+                self.settings,
+                config=dict(self.settings.config or {}),
+            )
             if overrides:
-                self.update_settings_from_mapping(overrides, persist=False)
-            plan = build_plan(self.settings)
+                canonical_settings = self.settings
+                try:
+                    self.settings = run_settings
+                    self.update_settings_from_mapping(overrides, persist=False)
+                    run_settings = self.settings
+                finally:
+                    self.settings = canonical_settings
+            plan = build_plan(run_settings)
             if plan.embedded_proxy_enabled:
                 self.ensure_embedded_proxy()
             runner = BatchRunner(plan)
@@ -3991,14 +5094,15 @@ class BatchService:
             return self._runner.snapshot()
 
     def current_snapshot(self) -> Optional[Dict[str, object]]:
-        if self._runner is None:
-            return None
-        return self._runner.snapshot()
+        with self._lock:
+            if self._runner is None:
+                return None
+            return self._runner.snapshot()
 
     def poll(self) -> None:
-        runner = self._runner
-        if runner is None:
-            return
-        runner.tick()
-        self._sync_logs()
-
+        with self._lock:
+            runner = self._runner
+            if runner is None:
+                return
+            runner.tick()
+            self._sync_logs()

@@ -50,6 +50,7 @@ class BrokerHttpTests(unittest.TestCase):
             provider="local",
             sitekey="sk",
             page_url="https://accounts.x.ai/sign-up",
+            parent_proxy="http://127.0.0.1:7890",
             fingerprint=fp,
             broker_url="http://127.0.0.1:8010",
             timeout_sec=30,
@@ -78,6 +79,7 @@ class BrokerHttpTests(unittest.TestCase):
             provider="local",
             sitekey="sk",
             page_url="https://accounts.x.ai/sign-up",
+            parent_proxy="http://127.0.0.1:7890",
             fingerprint=fp,
             broker_url="http://127.0.0.1:8010",
             timeout_sec=30,
@@ -110,8 +112,70 @@ class BrokerHttpTests(unittest.TestCase):
             result = asyncio.run(flow._solve_request_async(request, asyncio.sleep))
         self.assertIsInstance(captured["body"]["expected_browser_major"], int)
         self.assertEqual(captured["body"]["expected_browser_major"], int(fp.browser_major))
+        self.assertEqual(captured["body"]["parent_proxy"], "http://127.0.0.1:7890")
         self.assertNotIn("metadata", captured["body"])
         self.assertEqual(result.extras.get("lease_id"), "lease-1")
+
+    def test_broker_failure_surfaces_retry_diagnostics(self):
+        fp = build_canonical_fingerprint_profile()
+        request = SolveRequest(
+            provider="local",
+            sitekey="sk",
+            page_url="https://accounts.x.ai/sign-up",
+            fingerprint=fp,
+            broker_url="http://127.0.0.1:8010",
+            timeout_sec=90,
+        )
+
+        def fake_post(url, json_body=None, timeout=None, impersonate=""):
+            return _Resp(
+                200,
+                {
+                    "ok": False,
+                    "error": "Turnstile challenge error 600010",
+                    "extras": {
+                        "failure_category": "turnstile_challenge_transient",
+                        "error_code": "600010",
+                        "solve_attempt": 2,
+                        "solve_max_attempts": 2,
+                        "retry_count": 1,
+                    },
+                },
+            )
+
+        with mock.patch.object(flow, "_http_post_json", side_effect=fake_post):
+            with self.assertRaises(flow.VerificationRequiredError) as ctx:
+                asyncio.run(flow._solve_request_async(request, asyncio.sleep))
+
+        message = str(ctx.exception)
+        self.assertIn("category=turnstile_challenge_transient", message)
+        self.assertIn("code=600010", message)
+        self.assertIn("attempts=2/2", message)
+        self.assertIn("retries=1", message)
+
+    def test_direct_local_solver_receives_parent_proxy(self):
+        fp = build_canonical_fingerprint_profile()
+        request = SolveRequest(
+            provider="local",
+            sitekey="sk",
+            page_url="https://accounts.x.ai/sign-up",
+            proxy="upstream.example:8080:user:pass",
+            parent_proxy="http://127.0.0.1:7890",
+            fingerprint=fp,
+            timeout_sec=30,
+            headless=True,
+        )
+
+        with mock.patch.object(
+            flow, "_solve_turnstile_local", return_value="t" * 100
+        ) as solve:
+            result = asyncio.run(flow._solve_request_async(request, asyncio.sleep))
+
+        self.assertEqual(result.token, "t" * 100)
+        self.assertEqual(
+            solve.call_args.kwargs["parent_proxy"],
+            "http://127.0.0.1:7890",
+        )
 
 
 if __name__ == "__main__":

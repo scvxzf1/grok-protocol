@@ -235,7 +235,7 @@ def parse_share_link(raw: str) -> Optional[ParsedNode]:
             username=cred,
             name=name,
             usable_http=False,
-            note="VLESS 需本地客户端（Clash/V2Ray）承接，不能直接写入 HTTP 代理池",
+            note="VLESS 由项目内置 mihomo 承接，不直接写入 HTTP 代理池",
         )
 
     if lower.startswith("trojan://"):
@@ -349,8 +349,7 @@ def import_proxy_subscription(
     if not pool:
         result.warnings.append(
             "订阅已拉取，但没有可直接用于注册机的 HTTP 代理节点。"
-            "当前节点多为 VLESS/VMess/SS/Trojan，需要先导入本地 Clash/V2Ray，"
-            "再把本地 HTTP 端口填到“直连代理”或“上游父代理”。"
+            "当前节点多为 VLESS/VMess/SS/Trojan，请启用项目内置 mihomo 节点池。"
         )
     result.usable_pool_lines = list(pool)
     result.pool_lines = header + pool

@@ -409,19 +409,13 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
         url = str(data.get("url") or data.get("proxy_subscription_url") or "").strip()
         write_pool = True if data.get("write_pool") is None else bool(data.get("write_pool"))
         timeout = float(data.get("timeout") or 20)
-        use_local = True if data.get("use_local_http_if_empty") is None else bool(data.get("use_local_http_if_empty"))
-        local_http = str(
-            data.get("local_http")
-            or data.get("proxy_subscription_local_http")
-            or ""
-        ).strip()
         try:
             return get_service().import_proxy_subscription(
                 url=url,
                 write_pool=write_pool,
                 timeout=timeout,
-                use_local_http_if_empty=use_local,
-                local_http=local_http,
+                use_local_http_if_empty=False,
+                local_http="",
             )
         except TuiConfigError as exc:
             raise _err(exc, 400) from exc
@@ -732,6 +726,11 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="xAI HTTP 协议 WebUI（仅本机）")
+    parser.add_argument(
+        "--config",
+        default=os.environ.get("XAI_CONFIG_PATH", str(ROOT_DIR / "config.json")),
+        help="配置文件路径，例如 config.local.json",
+    )
     parser.add_argument("--host", default=os.environ.get("XAI_WEBUI_HOST", DEFAULT_WEBUI_HOST))
     parser.add_argument(
         "--port",
@@ -749,8 +748,10 @@ def main(argv: Optional[list] = None) -> int:
         # Soft guard: still allow override but warn loudly.
         print(f"[!] 警告: 绑定 {host} 会超出本机 loopback；规格默认仅 127.0.0.1")
     port = int(args.port or DEFAULT_WEBUI_PORT)
-    app = create_app()
-    print(f"xAI HTTP WebUI -> http://{host}:{port}")
+    config_path = Path(str(args.config or ROOT_DIR / "config.json")).expanduser().resolve()
+    service = BatchService(config_path=config_path, root_dir=ROOT_DIR)
+    app = create_app(service=service)
+    print(f"xAI HTTP WebUI -> http://{host}:{port} | config={config_path}")
     if args.open:
         try:
             import webbrowser

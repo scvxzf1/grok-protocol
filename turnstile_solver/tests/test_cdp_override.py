@@ -81,10 +81,12 @@ class CdpOverrideTests(unittest.TestCase):
             )
         self.assertTrue(result.ok)
         self.assertEqual(page.events[0][0:2], ("cdp", "Emulation.setUserAgentOverride"))
-        self.assertEqual(page.events[1][0], "get")
+        get_index = next(i for i, event in enumerate(page.events) if event[0] == "get")
+        self.assertGreater(get_index, 0)
         metadata = page.events[0][2]["userAgentMetadata"]
-        self.assertEqual(metadata["brands"][0], {"brand": "Not.A/Brand", "version": "99"})
-        self.assertEqual(metadata["fullVersionList"][1]["version"], "136.0.7103.92")
+        self.assertEqual(metadata["brands"][0], {"brand": "Chromium", "version": "136"})
+        self.assertEqual(metadata["brands"][1], {"brand": "Google Chrome", "version": "136"})
+        self.assertEqual(metadata["fullVersionList"][0]["version"], "136.0.7103.92")
         self.assertEqual(metadata["platform"], "Linux")
         self.assertEqual(metadata["architecture"], "x86")
         self.assertEqual(metadata["bitness"], "64")
@@ -97,12 +99,14 @@ class CdpOverrideTests(unittest.TestCase):
             browser_version="136.0.7103.92",
             client_hint_platform="Linux",
         )
-        self.assertEqual(metadata["brands"][1]["version"], "136")
-        self.assertEqual(metadata["fullVersionList"][0]["version"], "99.0.0.0")
+        self.assertEqual(metadata["brands"][0]["version"], "136")
+        self.assertEqual(metadata["fullVersionList"][2]["version"], "99.0.0.0")
 
     def test_browser_binary_major_mismatch_is_rejected(self):
-        completed = Mock(stdout="Google Chrome for Testing 135.0.7049.95", stderr="")
-        with patch("src.browser_runtime.subprocess.run", return_value=completed):
+        with patch(
+            "src.browser_runtime.detect_chrome_full_version",
+            return_value="135.0.7049.95",
+        ):
             with self.assertRaisesRegex(RuntimeError, "expected=136"):
                 _require_browser_version("/opt/chrome/chrome", 136)
 

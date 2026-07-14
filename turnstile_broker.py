@@ -27,7 +27,7 @@ class FingerprintProfile:
     client_hint_platform: str = ""
     browser_major: str = "136"
     sec_ch_ua: str = (
-        '"Not.A/Brand";v="99", "Chromium";v="136"'
+        '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"'
     )
 
 
@@ -43,6 +43,67 @@ def _normalize_browser_major(value: object, *, default: str = "136") -> str:
     if major <= 0:
         return str(default)
     return str(major)
+
+
+def build_chrome_brand_version_list(
+    browser_version: object,
+    *,
+    full_version: bool = False,
+    product_brand: str = "Google Chrome",
+) -> list[tuple[str, str]]:
+    """Reproduce Chromium's major-seeded UA-CH GREASE/list ordering."""
+
+    raw = str(browser_version or "").strip()
+    if not raw:
+        raise ValueError("browser_version is required")
+    try:
+        major = int(raw.split(".", 1)[0])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid browser_version: {raw!r}") from exc
+    if major <= 0:
+        raise ValueError(f"invalid browser_version: {raw!r}")
+
+    grease_chars = (" ", "(", ":", "-", ".", "/", ")", ";", "=", "?", "_")
+    grease_versions = ("8", "99", "24")
+    grease_brand = (
+        f"Not{grease_chars[major % len(grease_chars)]}"
+        f"A{grease_chars[(major + 1) % len(grease_chars)]}Brand"
+    )
+    grease_version = grease_versions[major % len(grease_versions)]
+    if full_version:
+        grease_version = f"{grease_version}.0.0.0"
+        chrome_version = raw if raw.count(".") == 3 else f"{major}.0.0.0"
+    else:
+        chrome_version = str(major)
+
+    values = [(grease_brand, grease_version), ("Chromium", chrome_version)]
+    brand = str(product_brand or "").strip()
+    if brand:
+        values.append((brand, chrome_version))
+
+    if len(values) == 2:
+        order = (major % 2, (major + 1) % 2)
+    else:
+        orders = (
+            (0, 1, 2),
+            (0, 2, 1),
+            (1, 0, 2),
+            (1, 2, 0),
+            (2, 0, 1),
+            (2, 1, 0),
+        )
+        order = orders[major % len(orders)]
+    shuffled: list[tuple[str, str]] = [("", "")] * len(values)
+    for index, target in enumerate(order):
+        shuffled[target] = values[index]
+    return shuffled
+
+
+def serialize_sec_ch_ua(browser_major: object) -> str:
+    return ", ".join(
+        f'"{brand}";v="{version}"'
+        for brand, version in build_chrome_brand_version_list(browser_major)
+    )
 
 
 def _supported_curl_cffi_impersonate_names() -> list[str]:
@@ -222,7 +283,7 @@ def build_canonical_fingerprint_profile(
         navigator_platform=navigator_platform,
         client_hint_platform=client_hint_platform,
         browser_major=major,
-        sec_ch_ua=f'"Not.A/Brand";v="99", "Chromium";v="{major}"',
+        sec_ch_ua=serialize_sec_ch_ua(major),
     )
 
 
@@ -233,6 +294,7 @@ class SolveRequest:
     page_url: str
     api_key: str = field(default="", repr=False)
     proxy: str = ""
+    parent_proxy: str = field(default="", repr=False)
     action: str = ""
     cdata: str = ""
     timeout_sec: int = 30
@@ -312,6 +374,12 @@ class TurnstileBroker:
         self._thread_lock = threading.Lock()
         self._ready = threading.Event()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        # Retain the loop published for the current startup generation until a
+        # later generation begins.  close() may clear _loop immediately after
+        # stopping the thread, while an already-running _ensure_loop() caller
+        # is still waking from _ready; this reference preserves that caller's
+        # successful initialization result.
+        self._published_loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
         self._provider_slots: Dict[str, asyncio.Semaphore] = {}
         self._pending = 0
@@ -331,6 +399,7 @@ class TurnstileBroker:
                 return self._loop
             if self._thread is None or not self._thread.is_alive():
                 self._ready.clear()
+                self._published_loop = None
 
                 def run() -> None:
                     loop = asyncio.new_event_loop()
@@ -341,6 +410,7 @@ class TurnstileBroker:
                             loop.close()
                             return
                         self._loop = loop
+                        self._published_loop = loop
                         self._pending_lock = asyncio.Lock()
                         self._ready.set()
                     try:
@@ -368,12 +438,17 @@ class TurnstileBroker:
                 self._thread.start()
         self._ready.wait(timeout=5.0)
         with self._thread_lock:
-            loop = self._loop
+            loop = self._loop or self._published_loop
             closed = self._closed
-        if closed:
-            raise RuntimeError("Turnstile broker is closed")
         if loop is None:
+            if closed:
+                raise RuntimeError("Turnstile broker is closed")
             raise RuntimeError("Turnstile broker event loop failed to start")
+        # This invocation began while the broker was open and observed a
+        # successfully published loop.  A concurrent close may already have
+        # queued loop.stop(); returning the published loop keeps initialization
+        # linearizable.  _submit() performs the final closed check while holding
+        # the same lock before it schedules any coroutine.
         return loop
 
     async def _solve_on_loop(
@@ -422,10 +497,16 @@ class TurnstileBroker:
     def _submit(self, request: SolveRequest, solver: AsyncSolver) -> concurrent.futures.Future[SolveResult]:
         loop = self._ensure_loop()
         deadline = time.monotonic() + max(1, int(request.timeout_sec or 180))
-        return asyncio.run_coroutine_threadsafe(
-            self._solve_on_loop(request, solver, deadline),
-            loop,
-        )
+        coroutine = self._solve_on_loop(request, solver, deadline)
+        with self._thread_lock:
+            if self._closed:
+                coroutine.close()
+                raise RuntimeError("Turnstile broker is closed")
+            try:
+                return asyncio.run_coroutine_threadsafe(coroutine, loop)
+            except Exception:
+                coroutine.close()
+                raise
 
     async def solve(self, request: SolveRequest, solver: AsyncSolver) -> SolveResult:
         return await asyncio.wrap_future(self._submit(request, solver))

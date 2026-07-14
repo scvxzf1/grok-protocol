@@ -5,8 +5,7 @@
 ```bash
 cd /path/to/grok协议
 python3 -m turnstile_solver.src solve \
-  --proxy "http://user:pass@host:port" \
-  --parent-proxy "http://127.0.0.1:7890" \
+  --proxy "http://user:pass@proxy.example:10000" \
   --output /tmp/turnstile.txt \
   --proxy-used-file /tmp/turnstile.proxy.txt
 ```
@@ -25,6 +24,7 @@ python3 grok_register_ttk.py http register \
 
 ## 说明
 
-- 有账密代理时，solver 会自动起本机 forwarder 给 Chrome 用
+- 有账密代理时，solver 会自动起项目内本机 forwarder 给 Chrome 用
+- WebUI 批处理如开启内置 mihomo，会自动注入同一任务的节点链路
 - 返回的 `proxy` 字段是上游代理，供注册复用
 - token 要马上用，不要囤
