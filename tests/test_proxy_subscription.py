@@ -216,6 +216,39 @@ proxy-groups:
             sub.parse_share_link("- 🇭🇰 HK|60|M523ms|2406:4440:0:106::11:a|YT|http")
         )
 
+    def test_parse_clash_trojan_ipv6_round_trip(self):
+        from embedded_proxy_manager import parse_trojan_node
+
+        yaml_text = """proxies:
+- name: v6-bare
+  type: trojan
+  server: 2001:db8::1
+  port: 443
+  password: synthetic-secret
+- name: v6-bracketed
+  type: trojan
+  server: "[2001:db8::2]"
+  port: 8443
+  password: synthetic-secret-2
+"""
+        nodes = sub.parse_subscription_text(yaml_text)
+        self.assertEqual(len(nodes), 2)
+
+        bare = next(node for node in nodes if node.name == "v6-bare")
+        self.assertIn("@[2001:db8::1]:443", bare.raw)
+        parsed_bare = parse_trojan_node(bare.raw)
+        self.assertIsNotNone(parsed_bare)
+        self.assertEqual(parsed_bare["server"], "2001:db8::1")
+        self.assertEqual(parsed_bare["port"], 443)
+
+        bracketed = next(node for node in nodes if node.name == "v6-bracketed")
+        self.assertIn("@[2001:db8::2]:8443", bracketed.raw)
+        self.assertNotIn("[[2001:db8::2]]", bracketed.raw)
+        parsed_bracketed = parse_trojan_node(bracketed.raw)
+        self.assertIsNotNone(parsed_bracketed)
+        self.assertEqual(parsed_bracketed["server"], "2001:db8::2")
+        self.assertEqual(parsed_bracketed["port"], 8443)
+
     def test_hostport_rejects_yaml_like_names(self):
         self.assertIsNone(sub.parse_share_link("PROXY:select:http-a:extra"))
         node = sub.parse_share_link("1.2.3.4:8080:user:pass")

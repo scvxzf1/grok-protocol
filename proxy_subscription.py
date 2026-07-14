@@ -498,6 +498,16 @@ def _clash_query(params: Dict[str, object]) -> str:
     return urlencode(items, doseq=False, quote_via=quote)
 
 
+def _share_link_authority_host(value: object) -> str:
+    """Bracket IPv6 literals for URL authorities without double wrapping."""
+    host = _as_text(value)
+    if host.startswith("[") and host.endswith("]"):
+        return host
+    if ":" in host:
+        return f"[{host}]"
+    return host
+
+
 def _clash_proxy_to_node(item: object) -> Optional[ParsedNode]:
     """Convert one Clash `proxies:` entry into ParsedNode."""
     if not isinstance(item, dict):
@@ -736,7 +746,8 @@ def _clash_proxy_to_node(item: object) -> Optional[ParsedNode]:
                 if service:
                     params["serviceName"] = service
         query = _clash_query(params)
-        raw = f"trojan://{quote(secret, safe='')}@{server}:{port}"
+        authority_host = _share_link_authority_host(server)
+        raw = f"trojan://{quote(secret, safe='')}@{authority_host}:{port}"
         if query:
             raw = f"{raw}?{query}"
         if name:

@@ -1713,6 +1713,59 @@ class StaticHttpProxyLeaseTests(unittest.TestCase):
             self.assertEqual(runner._manual_proxy_rotator.active_lease_count(), 0)
             self.assertEqual(runner._manual_proxy_rotator.available_lease_count(), 0)
 
+    def test_permanently_bad_static_route_exhausts_logical_retry_budget(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            runner, _source, entries = self._runner(
+                root,
+                proxy_count=1,
+                workers=1,
+                count=1,
+            )
+            runner.started = True
+            runner.phase = "running"
+
+            with mock.patch.object(
+                runner,
+                "_spawn_one",
+                side_effect=self._fake_spawn(runner),
+            ):
+                runner._spawn_available()
+                self.assertEqual(runner.started_tasks, 1)
+                self.assertEqual(len(runner.active), 1)
+
+                for attempt in range(1, 4):
+                    worker = runner.active[0]
+                    worker.log_path = runner.run_dir / f"worker_{attempt}.log"
+                    worker.log_path.write_text(
+                        "curl: (35) TLS connect error\n",
+                        encoding="utf-8",
+                    )
+                    worker.process.poll.return_value = 1
+                    runner._check_processes()
+
+                    if attempt < 3:
+                        self.assertEqual(worker.status, "stopped")
+                        self.assertEqual(runner.failed, 0)
+                        self.assertEqual(runner.started_tasks, 0)
+                        runner._spawn_available()
+                        self.assertEqual(len(runner.active), 0)
+                        runner._manual_proxy_rotator.mark_good(entries[0])
+                        runner._spawn_available()
+                        self.assertEqual(len(runner.active), 1)
+                        self.assertEqual(runner.active[0].proxy_attempt, attempt + 1)
+                    else:
+                        self.assertEqual(worker.status, "failed")
+
+            self.assertEqual(runner.failed, 1)
+            self.assertEqual(runner.stopped, 2)
+            self.assertEqual(runner.started_tasks, 1)
+            self.assertEqual(runner.failure_counts["tls_error"], 1)
+            self.assertFalse(runner._should_refill())
+            self.assertEqual(runner._manual_proxy_rotator.active_lease_count(), 0)
+            runner.tick()
+            self.assertTrue(runner.done)
+
     def test_dedicated_turnstile_failure_does_not_cool_registration_route(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)

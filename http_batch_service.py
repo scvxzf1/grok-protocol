@@ -1698,6 +1698,10 @@ class BatchRunner:
         self._proxy_pool_snapshot_path: Optional[Path] = None
         self._static_proxy_health: Dict[int, Dict[str, object]] = {}
         self._static_proxy_entries: Tuple[str, ...] = tuple()
+        # A stopped static-route attempt is replaced by a fresh WorkerState.
+        # Carry its proxy-attempt budget across that replacement so a fixed
+        # count run cannot refill forever on permanently failing routes.
+        self._static_proxy_retry_queue: Deque[int] = deque()
 
     @staticmethod
     def _free_loopback_port() -> int:
@@ -3184,8 +3188,18 @@ class BatchRunner:
             return False
 
         if self._isolate_static_proxy_lease(worker, blob):
+            attempt = max(1, int(worker.proxy_attempt or 0))
+            if attempt >= max_retries:
+                worker.last_log = (
+                    f"[Proxy] 静态 HTTP 路由失败已达上限 "
+                    f"({attempt}/{max_retries})，计入失败"
+                )
+                self._log(f"W{worker.index:02d}", worker.last_log)
+                return False
             # This attempt diagnosed infrastructure rather than a business
-            # account result.  Refill creates a replacement logical task.
+            # account result.  Refill creates a replacement logical task while
+            # retaining the attempt budget in _static_proxy_retry_queue.
+            self._static_proxy_retry_queue.append(attempt)
             worker.last_log = "[Proxy] 静态 HTTP 路由已隔离，任务将重排"
             self._mark_terminal(worker, "stopped")
             self.started_tasks = max(0, int(self.started_tasks) - 1)
@@ -3455,7 +3469,13 @@ class BatchRunner:
         while slots > 0 and attempts < int(self.plan.workers) and self._should_refill():
             if self._refill_pause_active():
                 break
-            worker = WorkerState(index=self.next_index)
+            static_retry_attempt: Optional[int] = None
+            if self._static_proxy_retry_queue:
+                static_retry_attempt = self._static_proxy_retry_queue.popleft()
+            worker = WorkerState(
+                index=self.next_index,
+                proxy_attempt=int(static_retry_attempt or 0),
+            )
             self.next_index += 1
             attempts += 1
             # staged until process actually starts
@@ -3480,6 +3500,8 @@ class BatchRunner:
                 or "没有可用代理" in reason
             )
             if resource_shortage:
+                if static_retry_attempt is not None:
+                    self._static_proxy_retry_queue.appendleft(static_retry_attempt)
                 # Remove non-started worker so it does not pollute active/queues.
                 try:
                     self.workers.remove(worker)
@@ -3492,6 +3514,11 @@ class BatchRunner:
             if worker.status not in {"failed", "stopped", "succeeded"}:
                 self._mark_terminal(worker, "failed")
                 self._record_failure(worker, reason)
+            if static_retry_attempt is not None:
+                # The original launched attempt was removed from started_tasks
+                # when it was scheduled for replacement.  A hard replacement
+                # launch failure terminates that same logical task.
+                self.started_tasks += 1
             # Still respect one-tick budget; avoid tight-loop storm.
             slots = self._available_spawn_slots()
             # brief pause after hard spawn errors too
