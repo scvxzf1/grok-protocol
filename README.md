@@ -60,7 +60,6 @@ Grok Register 是一个 HTTP 优先的 Python 自动化流程工具，提供 Web
 - [稳定性机制](#稳定性机制)
 - [常见问题](#常见问题)
 - [目录结构](#目录结构)
-- [分享前注意](#分享前注意)
 - [License](#license)
 - [Acknowledgments](#acknowledgments)
 - [Star History](#star-history)
@@ -165,7 +164,7 @@ cp config.example.json .local/config.json
 
 创建邮箱会使用 `x-admin-auth` 调用 `/admin/new_address`，后续收件仍使用接口返回的地址 JWT 调用 `/api/mails`。也就是说，admin 密码只用于创建邮箱，不用于读取邮箱邮件。
 
-`.local/config.json` 包含个人配置和密钥，整个 `.local/` 均不提交到 Git。
+配置保存在 `.local/config.json`。
 
 ## 运行
 
@@ -253,7 +252,7 @@ python xai_http_flow.py credential --sso-file .local/fixtures/sso.txt
 
 持续处理外部 Outlook/Graph 邮箱池时，可使用
 `server_mail_supervisor.py` 的断点续跑批次模式；master/work/state、代理清单与凭证目录
-都属于本机私有数据。完整命令、状态语义和退出码见 `USAGE.md`。
+统一位于 `.local/`。完整命令、状态语义和退出码见 `USAGE.md`。
 
 ## 输出文件
 
@@ -262,9 +261,7 @@ python xai_http_flow.py credential --sso-file .local/fixtures/sso.txt
 - `.local/accounts/`：成功账号、密码和 SSO token。
 - `.local/credentials/`：OAuth 凭证。
 - `.local/runs/`、`.local/exports/`、`.local/state/`：运行日志、导出和状态。
-- `.local/fixtures/`：机器本地代理、邮箱等私有测试输入。
-
-这些文件包含敏感信息，已被 `.gitignore` 忽略。
+- `.local/fixtures/`：机器本地代理、邮箱等测试输入。
 
 ## 稳定性机制
 
@@ -291,18 +288,12 @@ python xai_http_flow.py credential --sso-file .local/fixtures/sso.txt
 ├── local_proxy_forwarder.py
 ├── local_paths.py         # .local/ 机器本地路径约定
 ├── config.example.json
-├── need/                  # 仅示例；真实池文件勿提交
+├── need/                  # 示例文件
 ├── tests/
 ├── USAGE.md               # 完整使用指南（人类 + AI）
 ├── requirements.txt
 └── README.md
 ```
-
-## 分享前注意
-
-1. 只提交/打包源码与示例；**不要**带上 `.local/`、真实 `need/*` 池或抓包 JSON。
-2. `.local/config.json` 从 `config.example.json` 复制后本地填写。
-3. 分享前可用 `USAGE.md` 第 1 节自检命令扫一遍密钥残留。
 
 ## License
 
