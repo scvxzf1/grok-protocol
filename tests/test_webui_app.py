@@ -73,7 +73,35 @@ class WebUIAppTests(unittest.TestCase):
             runs = root / "http_runs"
             rid = "demo_run"
             (runs / rid).mkdir(parents=True)
-            (runs / rid / "worker_001.log").write_text("hello", encoding="utf-8")
+            (runs / rid / "worker_001.log").write_text(
+                "hello private-mailbox@example.test "
+                "refresh_token=M.C_PRIVATE_REFRESH_TOKEN\n",
+                encoding="utf-8",
+            )
+            (runs / rid / "accounts_001.txt").write_text(
+                "private-mailbox@example.test----PASSWORD----SSO_TOKEN\n",
+                encoding="utf-8",
+            )
+            (runs / rid / "proxy_pool.snapshot.txt").write_text(
+                "proxy.example.test:9000:USER:PASSWORD\n",
+                encoding="utf-8",
+            )
+            (runs / rid / "summary.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": rid,
+                        "done": True,
+                        "workers": [
+                            {
+                                "index": 1,
+                                "status": "failed",
+                                "last_log": "private-mailbox@example.test refresh_token=M.C_PRIVATE_REFRESH_TOKEN",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
             service = self._service(root)
             app = webui_app.create_app(service=service)
             client = TestClient(app)
@@ -81,6 +109,29 @@ class WebUIAppTests(unittest.TestCase):
                 ok = client.get(f"/api/runs/{rid}/files", params={"path": "worker_001.log"})
                 self.assertEqual(ok.status_code, 200)
                 self.assertIn("hello", ok.text)
+                self.assertNotIn("private-mailbox@example.test", ok.text)
+                self.assertNotIn("M.C_PRIVATE_REFRESH_TOKEN", ok.text)
+                logs = client.get(f"/api/runs/{rid}/logs", params={"worker": 1})
+                self.assertEqual(logs.status_code, 200)
+                self.assertNotIn("private-mailbox@example.test", logs.text)
+                self.assertNotIn("M.C_PRIVATE_REFRESH_TOKEN", logs.text)
+                for private_name in ("accounts_001.txt", "proxy_pool.snapshot.txt"):
+                    private = client.get(
+                        f"/api/runs/{rid}/files",
+                        params={"path": private_name},
+                    )
+                    self.assertEqual(private.status_code, 403)
+                detail = client.get(f"/api/runs/{rid}")
+                self.assertEqual(detail.status_code, 200)
+                detail_text = json.dumps(detail.json(), ensure_ascii=False)
+                self.assertNotIn("private-mailbox@example.test", detail_text)
+                self.assertNotIn("M.C_PRIVATE_REFRESH_TOKEN", detail_text)
+                self.assertFalse(
+                    any(
+                        item["name"].startswith("accounts_")
+                        for item in detail.json().get("files", [])
+                    )
+                )
                 bad = client.get(f"/api/runs/{rid}/files", params={"path": "../secret.txt"})
                 self.assertIn(bad.status_code, {403, 404, 400})
 

@@ -31,6 +31,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple
 
+from cross_process_lock import (
+    CrossProcessFileLock,
+    CrossProcessLockTimeout,
+    atomic_write_private_text,
+    configured_lock_timeout,
+    ensure_private_file,
+)
 from project_browser_registry import (
     registered_project_browsers,
     terminate_project_browser_trees,
@@ -77,7 +84,31 @@ DEFAULT_SSO_CONVERT_RETRIES = 5
 DEFAULT_SSO_CONVERT_COOLDOWN = 3
 MAX_SSO_CONVERT_RETRIES = 20
 MAX_SSO_CONVERT_COOLDOWN = 120
+MS_MAIL_POOL_UI_LOCK_TIMEOUT_SEC = configured_lock_timeout(
+    "XAI_MS_MAIL_POOL_LOCK_TIMEOUT_SEC",
+    default=60.0,
+)
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+MAIL_RECORD_RE = re.compile(
+    r"(?i)[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9.-]+----[^\r\n]+"
+)
+EMAIL_ADDRESS_RE = re.compile(
+    r"(?i)(?<![A-Z0-9.!#$%&'*+/=?^_`{|}~-])"
+    r"[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9.-]+"
+)
+SENSITIVE_VALUE_RE = re.compile(
+    r"(?i)\b(access[_-]?token|refresh[_-]?token|sso(?:[_-]?cookie)?|password|client[_-]?id)"
+    r"(\s*[=:]\s*[\"']?)([^\s\"',;}]+)"
+)
+BEARER_VALUE_RE = re.compile(r"(?i)\b(Bearer\s+)[A-Za-z0-9._~+/=-]+")
+MS_REFRESH_VALUE_RE = re.compile(r"\bM\.[A-Za-z0-9._~+/=-]{8,}")
+JWT_VALUE_RE = re.compile(
+    r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"
+)
+UUID_VALUE_RE = re.compile(
+    r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+    r"[0-9a-f]{4}-[0-9a-f]{12}\b"
+)
 
 STATUS_LABELS = {
     "queued": "排队中",
@@ -530,6 +561,28 @@ def _safe_text(value: object, limit: int = 400) -> str:
     return text[:limit]
 
 
+def _redact_sensitive_runtime_text(value: object) -> str:
+    """Remove mailbox identities and credentials from ordinary runtime logs."""
+
+    text_value = str(value or "")
+    text_value = MAIL_RECORD_RE.sub("[mail-record-redacted]", text_value)
+
+    def mask_email(match: re.Match[str]) -> str:
+        address = match.group(0)
+        local, domain = address.split("@", 1)
+        return f"{local[:1] or '*'}***@{domain}"
+
+    text_value = EMAIL_ADDRESS_RE.sub(mask_email, text_value)
+    text_value = SENSITIVE_VALUE_RE.sub(
+        lambda match: f"{match.group(1)}{match.group(2)}***",
+        text_value,
+    )
+    text_value = BEARER_VALUE_RE.sub(r"\1***", text_value)
+    text_value = MS_REFRESH_VALUE_RE.sub("[refresh-token-redacted]", text_value)
+    text_value = JWT_VALUE_RE.sub("[jwt-redacted]", text_value)
+    return UUID_VALUE_RE.sub("[uuid-redacted]", text_value)
+
+
 def _status_label(status: str) -> str:
     return STATUS_LABELS.get(status, status)
 
@@ -964,11 +1017,8 @@ def _read_config(path: Path) -> Dict[str, object]:
 
 def _write_config(path: Path, data: Dict[str, object]) -> None:
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
         payload = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
-        tmp.write_text(payload, encoding="utf-8")
-        os.replace(tmp, path)
+        atomic_write_private_text(path, payload)
     except OSError as exc:
         raise TuiConfigError(f"无法写入配置文件: {exc}") from exc
 
@@ -1941,7 +1991,9 @@ class BatchRunner:
         self.workers = new_workers
 
     def _log(self, source: str, message: str) -> None:
-        message = _safe_text(self._redact_proxy_text(message))
+        message = _safe_text(
+            _redact_sensitive_runtime_text(self._redact_proxy_text(message))
+        )
         if message:
             self.logs.append(f"[{source}] {message}")
 
@@ -2401,7 +2453,9 @@ class BatchRunner:
         return command
 
     def _append_worker_log(self, worker: WorkerState, message: str) -> None:
-        text_line = _safe_text(self._redact_proxy_text(message))
+        text_line = _safe_text(
+            _redact_sensitive_runtime_text(self._redact_proxy_text(message))
+        )
         if not text_line:
             return
         self.events.put((worker.index, text_line))
@@ -2437,13 +2491,14 @@ class BatchRunner:
         fail_messages: List[str] = []
         self.plan.output_dir.mkdir(parents=True, exist_ok=True)
         for email, _password, sso in rows:
+            display_email = _redact_sensitive_runtime_text(email)
             if self.stopping:
-                fail_messages.append(f"{email}: 批次停止，跳过")
+                fail_messages.append(f"{display_email}: 批次停止，跳过")
                 continue
             sso = str(sso or "").strip().lstrip("-")
             if not sso:
-                fail_messages.append(f"{email}: SSO 为空，跳过转换")
-                self._append_worker_log(worker, f"SSO 为空，跳过转换 | email={email}")
+                fail_messages.append(f"{display_email}: SSO 为空，跳过转换")
+                self._append_worker_log(worker, f"SSO 为空，跳过转换 | email={display_email}")
                 continue
             last_error = "未知错误"
             success = False
@@ -2455,7 +2510,7 @@ class BatchRunner:
                 write_sso_file(sso_path, sso)
                 self._append_worker_log(
                     worker,
-                    f"SSO 已单独保存 | email={email} | {sso_path.name}",
+                    f"SSO 已单独保存 | email={display_email}",
                 )
             except Exception as exc:
                 self._append_worker_log(worker, f"SSO 单文件保存失败: {exc}")
@@ -2480,7 +2535,7 @@ class BatchRunner:
                     command.extend(["--email", email])
                 self._append_worker_log(
                     worker,
-                    f"开始 SSO→凭证转换 | email={email} | 尝试 {attempt}/{retries}",
+                    f"开始 SSO→凭证转换 | email={display_email} | 尝试 {attempt}/{retries}",
                 )
                 output_lines: List[str] = []
                 try:
@@ -2502,7 +2557,6 @@ class BatchRunner:
                     try:
                         for line in iter(process.stdout.readline, ""):
                             output_lines.append(line)
-                            self._append_worker_log(worker, line)
                     finally:
                         try:
                             process.stdout.close()
@@ -2518,14 +2572,14 @@ class BatchRunner:
                         last_error += " (限流/slow_down)"
                     self._append_worker_log(
                         worker,
-                        f"SSO 转换失败 | email={email} | 尝试 {attempt}/{retries} | {last_error}",
+                        f"SSO 转换失败 | email={display_email} | 尝试 {attempt}/{retries} | {last_error}",
                     )
                 if attempt < retries and not self.stopping:
                     wait_s = cooldown
                     # 限流时至少冷却配置秒数，避免连打 device/code
                     self._append_worker_log(
                         worker,
-                        f"SSO 转换冷却 {wait_s}s 后重试 | email={email} | 下一轮 {attempt + 1}/{retries}",
+                        f"SSO 转换冷却 {wait_s}s 后重试 | email={display_email} | 下一轮 {attempt + 1}/{retries}",
                     )
                     # 分段 sleep，便于 stop 时尽快退出
                     deadline = time.monotonic() + wait_s
@@ -2536,7 +2590,7 @@ class BatchRunner:
             if success:
                 ok_count += 1
             else:
-                fail_messages.append(f"{email}: {last_error}")
+                fail_messages.append(f"{display_email}: {last_error}")
 
         if ok_count == len(rows):
             return True, f"SSO 转换完成 {ok_count}/{len(rows)}"
@@ -3288,7 +3342,9 @@ class BatchRunner:
             assert process.stdout is not None
             try:
                 for line in iter(process.stdout.readline, ""):
-                    safe_line = self._redact_proxy_text(line)
+                    safe_line = _redact_sensitive_runtime_text(
+                        self._redact_proxy_text(line)
+                    )
                     try:
                         log_handle.write(safe_line)
                     except OSError:
@@ -3464,8 +3520,10 @@ class BatchRunner:
                     self._record_failure(worker, msg)
                 self._log(f"W{worker_index:02d}", worker.last_log)
                 continue
-            worker.last_log = _safe_text(self._redact_proxy_text(raw))
-            self._log(f"W{worker_index:02d}", raw)
+            worker.last_log = _safe_text(
+                _redact_sensitive_runtime_text(self._redact_proxy_text(raw))
+            )
+            self._log(f"W{worker_index:02d}", worker.last_log)
 
     def _check_processes(self) -> None:
         for worker in list(self.workers):
@@ -3683,7 +3741,9 @@ class BatchRunner:
                 {
                     "index": worker.index,
                     "status": worker.status,
-                    "last_log": self._redact_proxy_text(worker.last_log),
+                    "last_log": _redact_sensitive_runtime_text(
+                        self._redact_proxy_text(worker.last_log)
+                    ),
                     "return_code": worker.return_code,
                 }
                 for worker in shown_workers
@@ -3694,11 +3754,10 @@ class BatchRunner:
         payload = self.snapshot()
         target = self.run_dir / "summary.json"
         try:
-            target.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            try:
-                os.chmod(target, 0o600)
-            except OSError:
-                pass
+            atomic_write_private_text(
+                target,
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            )
         except OSError as exc:
             self._log("SYSTEM", f"无法写入 summary.json: {exc}")
 
@@ -3860,12 +3919,14 @@ def read_ms_mail_pool_text(settings: Settings) -> Dict[str, object]:
     exists = path.is_file()
     if exists:
         try:
+            ensure_private_file(path)
             text_value = path.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
-            raise TuiConfigError(f"读取微软邮箱池失败: {exc}") from exc
+            raise TuiConfigError("读取微软邮箱池失败") from exc
     valid = 0
     invalid = 0
-    for ln in text_value.splitlines():
+    errors: List[str] = []
+    for idx, ln in enumerate(text_value.splitlines(), start=1):
         s = ln.strip()
         if not s or s.startswith("#"):
             continue
@@ -3874,13 +3935,16 @@ def read_ms_mail_pool_text(settings: Settings) -> Dict[str, object]:
 
             parse_ms_mail_line(s)
             valid += 1
-        except Exception:
+        except Exception as exc:
             invalid += 1
+            if len(errors) < 8:
+                errors.append(f"L{idx}: {_safe_text(exc)}")
     return {
         "path": str(path),
         "exists": exists,
         "line_count": valid,
         "invalid_count": invalid,
+        "errors": errors,
         "text": text_value,
         "format": "email----password----client_id----refresh_token",
     }
@@ -3888,7 +3952,6 @@ def read_ms_mail_pool_text(settings: Settings) -> Dict[str, object]:
 
 def write_ms_mail_pool_text(settings: Settings, text_value: str) -> Dict[str, object]:
     path = _ms_mail_file_path(settings)
-    path.parent.mkdir(parents=True, exist_ok=True)
     content = str(text_value or "")
     if content and not content.endswith("\n"):
         content += "\n"
@@ -3919,14 +3982,17 @@ def write_ms_mail_pool_text(settings: Settings, text_value: str) -> Dict[str, ob
     out = "\n".join(normalized_lines)
     if out and not out.endswith("\n"):
         out += "\n"
+    lock_path = path.with_suffix(path.suffix + ".lock")
     try:
-        path.write_text(out, encoding="utf-8")
-        try:
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
+        with CrossProcessFileLock(
+            lock_path,
+            timeout=MS_MAIL_POOL_UI_LOCK_TIMEOUT_SEC,
+        ):
+            atomic_write_private_text(path, out)
+    except CrossProcessLockTimeout as exc:
+        raise TuiConfigError("写入微软邮箱池时锁等待超时") from exc
     except OSError as exc:
-        raise TuiConfigError(f"写入微软邮箱池失败: {exc}") from exc
+        raise TuiConfigError("写入微软邮箱池失败") from exc
     cfg = dict(settings.config or {})
     cfg["ms_mail_file"] = _config_path_value(path, settings.config_path.parent)
     # When user edits pool, prefer msgraph provider if they had empty path before.

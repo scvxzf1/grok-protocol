@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import time
 from pathlib import Path
 from typing import Iterable, Optional, Union
 
@@ -140,6 +141,22 @@ def _fsync_parent_directory(path: Path) -> None:
         os.close(fd)
 
 
+def _replace_with_bounded_retry(source: Path, target: Path) -> None:
+    """Publish across transient Windows reader/antivirus sharing locks."""
+
+    deadline = time.monotonic() + 1.0
+    delay = 0.005
+    while True:
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(delay)
+            delay = min(0.05, delay * 2)
+
+
 def atomic_write_private_text(path: PathLike, text: str) -> None:
     """Atomically publish UTF-8 text without exposing a partial target file."""
 
@@ -164,7 +181,7 @@ def atomic_write_private_text(path: PathLike, text: str) -> None:
                 os.fsync(handle.fileno())
             except OSError:
                 pass
-        os.replace(temp_path, target)
+        _replace_with_bounded_retry(temp_path, target)
         ensure_private_file(target)
         _fsync_parent_directory(target)
     finally:

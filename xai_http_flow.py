@@ -17,6 +17,7 @@ import argparse
 import ast
 import asyncio
 import concurrent.futures
+import functools
 import html as html_lib
 import json
 import os
@@ -4112,7 +4113,32 @@ def save_account_record(path: str, *, email: str, password: str, sso: str) -> st
     return str(target)
 
 
-def run_registration(
+class _MailboxReservationLifecycle:
+    """Own one mailbox reservation across a complete registration attempt."""
+
+    def __init__(self) -> None:
+        self.mailbox: Optional[MailboxAdapter] = None
+
+    def bind(self, mailbox: Optional[MailboxAdapter]) -> None:
+        self.mailbox = mailbox
+
+    def release(self, reason: str) -> bool:
+        mailbox = self.mailbox
+        release = getattr(mailbox, "release", None)
+        if not callable(release):
+            release = getattr(mailbox, "release_to_pool", None)
+        if not callable(release):
+            return False
+        return bool(release(reason=str(reason or "registration_failed")))
+
+    def commit(self) -> bool:
+        commit = getattr(self.mailbox, "commit_success", None)
+        if not callable(commit):
+            return False
+        return bool(commit())
+
+
+def _run_registration_impl(
     *,
     client: BrowserlessXAIClient,
     email: str = "",
@@ -4137,7 +4163,9 @@ def run_registration(
     password: str = "",
     output_dir: str = "",
     accounts_output: str = "",
+    _mailbox_lifecycle: Optional[_MailboxReservationLifecycle] = None,
 ) -> RegistrationResult:
+    lifecycle = _mailbox_lifecycle or _MailboxReservationLifecycle()
     mailbox: Optional[MailboxAdapter] = None
     mail_token = ""
     config: Dict[str, Any] = {}
@@ -4157,6 +4185,7 @@ def run_registration(
             proxy=client.proxy,
             timeout=client.timeout,
         )
+        lifecycle.bind(mailbox)
         email, mail_token = mailbox.create()
         provider = "mail-file" if mail_file else str(config.get("email_provider") or "cloudflare")
         _log(client.log_callback, f"[HTTP] 已就绪邮箱 provider={provider} | email={mask_email(email)}")
@@ -4164,6 +4193,7 @@ def run_registration(
         # Explicit email plus mailbox credentials/file for OTP polling.
         if mail_file:
             mailbox = MicrosoftGraphMailbox(mail_file, proxy=client.proxy, timeout=client.timeout, mark_used=False)
+            lifecycle.bind(mailbox)
             # Bind to provided email if the file contains it; otherwise claim is not used.
             # For explicit email mode with Graph, require matching line kept in file.
             try:
@@ -4226,6 +4256,7 @@ def run_registration(
                 if domain_try >= max_domain_tries:
                     break
                 # Mint a new temporary mailbox address and continue.
+                lifecycle.release("domain_rejected")
                 email, mail_token = mailbox.create()
                 provider = "mail-file" if mail_file else str(config.get("email_provider") or "cloudflare")
                 _log(
@@ -4420,6 +4451,9 @@ def run_registration(
             turnstile_token=turnstile_token,
             castle_request_token=castle_register_token,
         )
+    # Once xAI accepted the registration, the imported mailbox must remain
+    # consumed even if a later local artifact/OAuth write fails.
+    lifecycle.commit()
     credential_path = ""
     sso_path = ""
     if output_dir:
@@ -4441,6 +4475,26 @@ def run_registration(
         account_path=account_path,
         sso_path=sso_path,
     )
+
+
+@functools.wraps(_run_registration_impl)
+def run_registration(*args: Any, **kwargs: Any) -> RegistrationResult:
+    """Run registration and return an uncommitted Graph row on failure."""
+
+    lifecycle = _MailboxReservationLifecycle()
+    kwargs["_mailbox_lifecycle"] = lifecycle
+    try:
+        result = _run_registration_impl(*args, **kwargs)
+    except BaseException:
+        try:
+            lifecycle.release("registration_failed")
+        except Exception:
+            # Preserve the primary flow failure.  A lock/write error leaves the
+            # row in the authoritative .used ledger for deterministic restart.
+            pass
+        raise
+    lifecycle.commit()
+    return result
 
 
 def _add_proxy_options(parser: argparse.ArgumentParser) -> None:
@@ -6028,8 +6082,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 if not args.mail_config:
                     raise XAIHttpFlowError("mail-probe 需要 --mail-config 或 --mail-file")
                 mailbox = build_mailbox(config=config, proxy=proxy, timeout=args.timeout)
-            email, token = mailbox.create()
+            try:
+                email, token = mailbox.create()
+            except BaseException:
+                if bool(getattr(args, "mark_used", False)):
+                    try:
+                        mailbox.release(reason="mail_probe_failed")
+                    except Exception:
+                        pass
+                raise
             count = -1
+            inbox_probe_ok = True
             try:
                 if isinstance(mailbox, YydsTempMailbox):
                     messages = mailbox._messages(email, token)
@@ -6037,7 +6100,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     messages = mailbox._messages(token)
                 count = len(messages) if isinstance(messages, list) else 0
             except Exception as exc:
+                inbox_probe_ok = False
                 logger(f"[mail-probe] 收件箱探测警告: {_safe_error_text(exc)}")
+            if bool(getattr(args, "mark_used", False)):
+                if inbox_probe_ok:
+                    commit = getattr(mailbox, "commit_success", None)
+                    if callable(commit):
+                        commit()
+                else:
+                    release = getattr(mailbox, "release", None)
+                    if callable(release):
+                        release(reason="mail_probe_inbox_failed")
             print(f"[+] mail-probe ok email={mask_email(email)} inbox_messages={count} token_len={len(token)}")
             return 0
 

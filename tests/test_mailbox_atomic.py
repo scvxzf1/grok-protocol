@@ -90,6 +90,30 @@ class MailboxAtomicTests(unittest.TestCase):
                 with self.assertRaises(flow.MailboxPoolLockTimeout):
                     box.reserve()
 
+    def test_exhausted_pool_is_reported_after_unique_claim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pool.txt"
+            path.write_text(record(0) + "\n", encoding="utf-8")
+            first = flow.MicrosoftGraphMailbox(str(path), mark_used=True).reserve()
+            self.assertEqual(first["email"], "worker0@hotmail.test")
+            with self.assertRaises(flow.MailboxError):
+                flow.MicrosoftGraphMailbox(str(path), mark_used=True).reserve()
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits")
+    def test_constructor_tightens_source_and_used_permissions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pool.txt"
+            used = path.with_suffix(".txt.used")
+            path.write_text(record(0) + "\n", encoding="utf-8")
+            used.write_text(record(1) + "\n", encoding="utf-8")
+            os.chmod(path, 0o644)
+            os.chmod(used, 0o644)
+
+            flow.MicrosoftGraphMailbox(str(path), mark_used=True)
+
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(used.stat().st_mode & 0o777, 0o600)
+
     def test_used_ledger_prevents_duplicate_after_source_replace_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "pool.txt"
