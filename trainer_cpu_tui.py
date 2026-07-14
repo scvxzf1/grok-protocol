@@ -299,7 +299,7 @@ class CpuSampler:
         system_cpu = float(psutil.cpu_percent(interval=None))
         try:
             load1, load5, load15 = os.getloadavg()
-        except OSError:
+        except (AttributeError, OSError):
             load1 = load5 = load15 = 0.0
 
         mem = psutil.virtual_memory()

@@ -18,6 +18,7 @@ SCRIPT = ROOT / "tui.sh"
 
 @unittest.skipUnless(shutil.which("bash"), "bash is required for the HTTP TUI launcher")
 class HttpTuiLauncherTests(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "POSIX launcher paths require a POSIX host")
     def test_dry_run_uses_requested_count_and_concurrency_without_exposing_key(self):
         with tempfile.TemporaryDirectory() as directory:
             directory_path = Path(directory)
@@ -68,6 +69,7 @@ class HttpTuiLauncherTests(unittest.TestCase):
         self.assertNotIn("test-secret-key", result.stdout)
         self.assertNotIn("test-secret-key", result.stderr)
 
+    @unittest.skipIf(os.name == "nt", "POSIX launcher paths require a POSIX host")
     def test_mode2_dry_run_mentions_sso_converter(self):
         with tempfile.TemporaryDirectory() as directory:
             directory_path = Path(directory)
