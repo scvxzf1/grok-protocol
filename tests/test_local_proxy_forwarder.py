@@ -240,14 +240,20 @@ class LocalProxyForwarderOwnershipTests(unittest.TestCase):
     def test_windows_server_bind_requests_exclusive_address_use(self):
         server = object.__new__(forwarder.ThreadingTCPServer)
         server.socket = mock.Mock()
-        with mock.patch.object(forwarder.os, "name", "nt"), mock.patch.object(
+        exclusive_address_use = getattr(socket, "SO_EXCLUSIVEADDRUSE", 0x4)
+        with mock.patch.object(
+            socket,
+            "SO_EXCLUSIVEADDRUSE",
+            exclusive_address_use,
+            create=True,
+        ), mock.patch.object(forwarder.os, "name", "nt"), mock.patch.object(
             socketserver.TCPServer,
             "server_bind",
         ) as base_bind:
             forwarder.ThreadingTCPServer.server_bind(server)
         server.socket.setsockopt.assert_called_once_with(
             socket.SOL_SOCKET,
-            socket.SO_EXCLUSIVEADDRUSE,
+            exclusive_address_use,
             1,
         )
         base_bind.assert_called_once_with()
