@@ -122,6 +122,39 @@ class TurnstileCoordinationTests(unittest.TestCase):
         self.assertEqual(events, ["solve", "acquire", "consume", "release"])
         client.submit_registration.assert_not_called()
 
+    def test_registration_rejects_lease_without_reported_token_length(self):
+        events = []
+        client = self._registration_client(events)
+        invalid = flow.SolveResult(
+            token="",
+            provider="local",
+            received_at=time.monotonic(),
+            elapsed_ms=1,
+            extras={
+                "broker_url": "http://127.0.0.1:8010",
+                "lease_id": "lease-without-length",
+            },
+        )
+
+        with mock.patch.object(flow, "solve_turnstile_result", return_value=invalid), mock.patch.object(
+            flow,
+            "_acquire_remote_submit_permit",
+        ) as acquire:
+            with self.assertRaisesRegex(flow.VerificationRequiredError, "reported_len=0"):
+                flow.run_registration(
+                    client=client,
+                    email="user@example.test",
+                    email_code="123456",
+                    turnstile_provider="local",
+                    turnstile_broker_url="http://127.0.0.1:8010",
+                    given_name="Test",
+                    family_name="User",
+                    password="password",
+                )
+
+        acquire.assert_not_called()
+        client.submit_registration.assert_not_called()
+
     def test_managed_broker_command_receives_all_concurrency_limits(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

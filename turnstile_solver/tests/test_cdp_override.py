@@ -13,6 +13,7 @@ from src.browser_runtime import _require_browser_version
 from src.browser_worker import BrowserWorker, build_cdp_user_agent_metadata
 from src.config import SolverConfig
 from src.models import SolveRequest
+from turnstile_broker import build_canonical_fingerprint_profile
 
 
 class FakePage:
@@ -83,7 +84,8 @@ class CdpOverrideTests(unittest.TestCase):
         self.assertEqual(page.events[0][0:2], ("cdp", "Emulation.setUserAgentOverride"))
         self.assertEqual(page.events[1][0], "get")
         metadata = page.events[0][2]["userAgentMetadata"]
-        self.assertEqual(metadata["brands"][0], {"brand": "Not.A/Brand", "version": "99"})
+        self.assertEqual(metadata["brands"][0], {"brand": "Chromium", "version": "136"})
+        self.assertEqual(metadata["brands"][1], {"brand": "Google Chrome", "version": "136"})
         self.assertEqual(metadata["fullVersionList"][1]["version"], "136.0.7103.92")
         self.assertEqual(metadata["platform"], "Linux")
         self.assertEqual(metadata["architecture"], "x86")
@@ -97,8 +99,34 @@ class CdpOverrideTests(unittest.TestCase):
             browser_version="136.0.7103.92",
             client_hint_platform="Linux",
         )
-        self.assertEqual(metadata["brands"][1]["version"], "136")
-        self.assertEqual(metadata["fullVersionList"][0]["version"], "99.0.0.0")
+        reduced = {entry["brand"]: entry["version"] for entry in metadata["brands"]}
+        full = {entry["brand"]: entry["version"] for entry in metadata["fullVersionList"]}
+        self.assertEqual(reduced["Chromium"], "136")
+        self.assertEqual(reduced["Google Chrome"], "136")
+        self.assertEqual(full["Chromium"], "136.0.7103.92")
+        self.assertEqual(full["Google Chrome"], "136.0.7103.92")
+        grease_brand = next(brand for brand in full if brand not in {"Chromium", "Google Chrome"})
+        self.assertEqual(full[grease_brand], "99.0.0.0")
+
+    def test_http_and_cdp_reduced_brand_lists_match(self):
+        profile = build_canonical_fingerprint_profile(
+            platform_name="linux",
+            browser_major=136,
+        )
+        metadata = build_cdp_user_agent_metadata(
+            browser_version="136.0.7103.92",
+            client_hint_platform="Linux",
+        )
+        serialized = ", ".join(
+            f'"{entry["brand"]}";v="{entry["version"]}"'
+            for entry in metadata["brands"]
+        )
+
+        self.assertEqual(serialized, profile.sec_ch_ua)
+        self.assertEqual(
+            [entry["brand"] for entry in metadata["brands"]],
+            [entry["brand"] for entry in metadata["fullVersionList"]],
+        )
 
     def test_browser_binary_major_mismatch_is_rejected(self):
         with patch(

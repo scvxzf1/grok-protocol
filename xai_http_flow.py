@@ -1720,13 +1720,9 @@ def solve_turnstile_result(
         )
     except (TypeError, ValueError):
         reported_token_length = 0
-    # Local broker may return token_length via lease/extras, or only a lease_id
-    # with the real token available on /consume. Empty body token is OK then.
-    lease_ok = bool(lease_id) and (
-        reported_token_length >= 80 or reported_token_length == 0
-    )
-    if lease_id and 0 < reported_token_length < 80:
-        lease_ok = False
+    # A lease-only response must report a plausible server-side token length;
+    # a bare lease id cannot prove that /consume has a usable token.
+    lease_ok = bool(lease_id) and reported_token_length >= 80
     if token_length < 80 and not lease_ok:
         raise VerificationRequiredError(
             f"{normalized_provider} 返回的 Turnstile token 无效 "
@@ -4344,13 +4340,8 @@ def run_registration(
                     except (TypeError, ValueError):
                         reported_token_length = 0
                 # Local broker keeps the real token behind a lease; empty body token
-                # with a valid lease is a success and must be consumed later.
-                lease_ok = bool(lease_id) and (
-                    token_len >= 80 or reported_token_length >= 80 or reported_token_length == 0
-                )
-                # If broker reports an explicit short token length, treat as failure.
-                if lease_id and reported_token_length > 0 and reported_token_length < 80 and token_len < 80:
-                    lease_ok = False
+                # with a verified server-reported length is consumed later.
+                lease_ok = bool(lease_id) and reported_token_length >= 80
                 _log(
                     client.log_callback,
                     (

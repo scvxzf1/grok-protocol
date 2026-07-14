@@ -16,6 +16,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from project_browser_registry import register_project_browser, unregister_project_browser
+from turnstile_broker import build_chrome_brand_version_list
 
 from .config import SolverConfig
 from .models import FingerprintSnapshot, SolveRequest, SolveResult
@@ -651,12 +652,15 @@ def build_cdp_user_agent_metadata(
         raise RuntimeError("缺少 expected_client_hint_platform")
     return {
         "brands": [
-            {"brand": "Not.A/Brand", "version": "99"},
-            {"brand": "Chromium", "version": str(major)},
+            {"brand": brand, "version": version}
+            for brand, version in build_chrome_brand_version_list(str(major))
         ],
         "fullVersionList": [
-            {"brand": "Not.A/Brand", "version": "99.0.0.0"},
-            {"brand": "Chromium", "version": full_version},
+            {"brand": brand, "version": version}
+            for brand, version in build_chrome_brand_version_list(
+                full_version,
+                full_version=True,
+            )
         ],
         "platform": platform,
         "platformVersion": _default_platform_version(platform),

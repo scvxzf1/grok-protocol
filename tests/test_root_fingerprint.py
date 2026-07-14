@@ -16,9 +16,9 @@ class RootFingerprintTests(unittest.TestCase):
         self.assertEqual(profile.browser_major, "136")
         self.assertEqual(
             profile.sec_ch_ua,
-            '"Not.A/Brand";v="99", "Chromium";v="136"',
+            '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
         )
-        self.assertNotIn("Google Chrome", profile.sec_ch_ua)
+        self.assertIn("Google Chrome", profile.sec_ch_ua)
         if sys.platform.startswith("linux"):
             self.assertIn("X11; Linux x86_64", profile.user_agent)
             self.assertEqual(profile.navigator_platform, "Linux x86_64")
