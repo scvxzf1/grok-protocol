@@ -42,13 +42,21 @@ from project_browser_registry import (
     registered_project_browsers,
     terminate_project_browser_trees,
 )
+from local_paths import (
+    CONFIG_PATH as LOCAL_CONFIG_PATH,
+    CREDENTIALS_DIR as LOCAL_CREDENTIALS_DIR,
+    EXPORTS_DIR as LOCAL_EXPORTS_DIR,
+    FIXTURES_DIR as LOCAL_FIXTURES_DIR,
+    LOCAL_ROOT,
+    RUNS_DIR as LOCAL_RUNS_DIR,
+)
 
 
 ROOT_DIR = Path(__file__).resolve().parent
-DEFAULT_CONFIG_PATH = ROOT_DIR / "config.json"
-DEFAULT_OUTPUT_DIR = ROOT_DIR / "xai_credentials"
-DEFAULT_EXPORT_DIR = ROOT_DIR / "exports"
-RUNS_DIR = ROOT_DIR / "http_runs"
+DEFAULT_CONFIG_PATH = LOCAL_CONFIG_PATH
+DEFAULT_OUTPUT_DIR = LOCAL_CREDENTIALS_DIR
+DEFAULT_EXPORT_DIR = LOCAL_EXPORTS_DIR
+RUNS_DIR = LOCAL_RUNS_DIR
 MAX_COUNT = 99999999
 TARGET_MODE_COUNT = "count"
 TARGET_MODE_CONTINUOUS = "continuous"
@@ -716,8 +724,8 @@ PROXY_POOL_SOURCE_LABELS = {
     PROXY_POOL_SOURCE_SUBSCRIPTION: "订阅导入",
 }
 # 内嵌 mihomo 节点缓存（VLESS/Hysteria2/AnyTLS/Trojan；与订阅拉取解耦；启动只读此文件）
-EMBEDDED_VLESS_CACHE_REL = Path(".embedded_mihomo") / "vless_nodes.txt"
-EMBEDDED_NODE_CACHE_REL = Path(".embedded_mihomo") / "nodes.txt"
+EMBEDDED_VLESS_CACHE_REL = Path("state") / "embedded_mihomo" / "vless_nodes.txt"
+EMBEDDED_NODE_CACHE_REL = Path("state") / "embedded_mihomo" / "nodes.txt"
 
 
 def normalize_proxy_pool_source(value: object) -> str:
@@ -1013,9 +1021,23 @@ def _read_config(path: Path) -> Dict[str, object]:
         raise TuiConfigError(f"无法读取配置 JSON: {exc}") from exc
     if not isinstance(data, dict):
         raise TuiConfigError("配置 JSON 根节点必须是对象")
-    # Retire the former chained-egress option.  Keeping it out of the in-memory
-    # config also removes it the next time the configuration is persisted.
-    data.pop("proxy_parent", None)
+    # Retire settings whose implementations were removed. Keeping them out of
+    # memory also removes them the next time configuration is persisted.
+    for retired_key in (
+        "proxy_parent",
+        "grok2api_auto_add_local",
+        "grok2api_local_token_file",
+        "grok2api_pool_name",
+        "grok2api_auto_add_remote",
+        "grok2api_remote_base",
+        "grok2api_remote_app_key",
+        "cloudflare_path_domains",
+        "cloudflare_path_token",
+        "enable_nsfw",
+        "xai_oauth_auto",
+        "xai_oauth_callback_port",
+    ):
+        data.pop(retired_key, None)
     return data
 
 
@@ -1291,9 +1313,9 @@ def settings_from_args(args: argparse.Namespace) -> Settings:
     elif getattr(args, "mode", None):
         settings.run_mode = _normalize_run_mode(args.mode)
     if "output_dir" in explicit and getattr(args, "output_dir", None):
-        settings.output_dir = _absolute_path(args.output_dir)
+        settings.output_dir = _absolute_path(args.output_dir, settings.config_path.parent)
     elif getattr(args, "output_dir", None):
-        settings.output_dir = _absolute_path(args.output_dir)
+        settings.output_dir = _absolute_path(args.output_dir, settings.config_path.parent)
     if bool(getattr(args, "no_proxy", False)):
         settings.no_proxy = True
         settings.proxy_mode = "none"
@@ -1313,7 +1335,7 @@ def _resolve_proxy_args(settings: Settings) -> Tuple[str, List[str]]:
 
     config = settings.config
     direct_proxy = str(config.get("proxy") or "").strip()
-    proxy_file_value = str(config.get("proxy_file") or "").strip()
+    proxy_file_value = str(config.get("proxy_file") or "fixtures/proxies.txt").strip()
     proxy_file = _absolute_path(proxy_file_value, settings.config_path.parent) if proxy_file_value else None
     if mode == "auto":
         mode = "direct" if direct_proxy else "pool" if proxy_file and proxy_file.is_file() else "none"
@@ -2088,7 +2110,7 @@ class BatchRunner:
         self.plan.proxy_pool_entries = tuple(entries)
         self._manual_proxy_rotator = ProxyRotator(
             entries,
-            stats_file=str(ROOT_DIR / "proxy_stats.log"),
+            stats_file=str(self.plan.config_path.parent / "state" / "proxy_stats.log"),
         )
         self._log(
             "SYSTEM",
@@ -2396,8 +2418,7 @@ class BatchRunner:
         assert worker.accounts_path is not None
         command = [
             sys.executable,
-            str(ROOT_DIR / "grok_register_ttk.py"),
-            "http",
+            str(ROOT_DIR / "xai_http_flow.py"),
             "register",
             "--mail-config",
             str(self.plan.config_path),
@@ -2945,12 +2966,13 @@ class BatchRunner:
                 # production start() always freezes the file first.
                 proxies = load_proxy_lines(str(source))
                 self._static_proxy_entries = tuple(proxies)
-            rotator = ProxyRotator(proxies, stats_file=str(ROOT_DIR / "proxy_stats.log"))
+            stats_file = str(self.plan.config_path.parent / "state" / "proxy_stats.log")
+            rotator = ProxyRotator(proxies, stats_file=stats_file)
         else:
             proxies = load_proxy_lines(proxy_file)
             rotator = configure_global_rotator(
                 proxies,
-                stats_file=str(ROOT_DIR / "proxy_stats.log"),
+                stats_file=str(self.plan.config_path.parent / "state" / "proxy_stats.log"),
                 force=True,
             )
         self._manual_proxy_rotator = rotator
@@ -3606,7 +3628,9 @@ class BatchRunner:
         if self.done:
             return
         try:
-            summary = ROOT_DIR / f"accounts_http_{self.run_id}.txt"
+            summary_dir = self.run_dir.parent.parent / "accounts"
+            summary_dir.mkdir(parents=True, exist_ok=True)
+            summary = summary_dir / f"accounts_http_{self.run_id}.txt"
             lines: List[str] = []
             account_files = sorted(self.run_dir.glob("accounts_*.txt"))
             for accounts_path in account_files:
@@ -3867,7 +3891,6 @@ SENSITIVE_CONFIG_KEYS = (
     "yyds_jwt",
     "duckmail_api_key",
     "cloudflare_api_key",
-    "grok2api_remote_app_key",
     "cpa_api_key",
 )
 
@@ -3920,7 +3943,9 @@ def _settings_to_public_dict(settings: Settings) -> Dict[str, object]:
 
 
 def _proxy_file_path(settings: Settings) -> Path:
-    raw = str((settings.config or {}).get("proxy_file") or "proxies.txt").strip() or "proxies.txt"
+    raw = str(
+        (settings.config or {}).get("proxy_file") or "fixtures/proxies.txt"
+    ).strip() or "fixtures/proxies.txt"
     return _absolute_path(raw, settings.config_path.parent)
 
 
@@ -3929,7 +3954,7 @@ def _ms_mail_file_path(settings: Settings) -> Path:
     raw = str((settings.config or {}).get("ms_mail_file") or "").strip()
     if not raw:
         # Sensible default next to config; user can change path in UI.
-        raw = "need/outlook_mail.txt"
+        raw = "fixtures/outlook_mail.txt"
     return _absolute_path(raw, settings.config_path.parent)
 
 
@@ -4224,7 +4249,7 @@ def export_credential_page_and_delete(
 
 def resolve_export_dir(root_dir: Path | None = None) -> Path:
     """Dedicated folder for grok+timestamp.txt exports."""
-    root = Path(root_dir or ROOT_DIR)
+    root = Path(root_dir or LOCAL_ROOT)
     export_dir = (root / "exports").expanduser()
     try:
         export_dir = export_dir.resolve(strict=False)
@@ -4373,7 +4398,10 @@ def write_proxy_pool_text(settings: Settings, text_value: str, *, sync_proxies_a
 
 
 def turnstile_proxy_file_path(settings: Settings) -> Path:
-    raw = str((settings.config or {}).get("turnstile_proxy_file") or "turnstile_proxies.txt").strip() or "turnstile_proxies.txt"
+    raw = str(
+        (settings.config or {}).get("turnstile_proxy_file")
+        or "fixtures/turnstile_proxies.txt"
+    ).strip() or "fixtures/turnstile_proxies.txt"
     return _absolute_path(raw, settings.config_path.parent)
 
 
@@ -4432,14 +4460,16 @@ def pick_turnstile_proxy(config: Dict[str, object], *, base_dir: Optional[Path] 
     if mode == "direct":
         return str(cfg.get("turnstile_proxy") or "").strip()
     # pool mode
-    file_raw = str(cfg.get("turnstile_proxy_file") or "turnstile_proxies.txt").strip() or "turnstile_proxies.txt"
+    file_raw = str(
+        cfg.get("turnstile_proxy_file") or "fixtures/turnstile_proxies.txt"
+    ).strip() or "fixtures/turnstile_proxies.txt"
     try:
         path = Path(file_raw).expanduser()
         if not path.is_absolute():
             bases = []
             if base_dir is not None:
                 bases.append(Path(base_dir))
-            bases.append(ROOT_DIR)
+            bases.extend([LOCAL_ROOT, ROOT_DIR])
             # Keep first existing candidate; otherwise fall back to preferred base.
             resolved = None
             for base in bases:
@@ -4449,11 +4479,11 @@ def pick_turnstile_proxy(config: Dict[str, object], *, base_dir: Optional[Path] 
                     break
                 if resolved is None:
                     resolved = candidate
-            path = resolved if resolved is not None else (ROOT_DIR / path).resolve()
+            path = resolved if resolved is not None else (LOCAL_ROOT / path).resolve()
         else:
             path = path.resolve()
     except Exception:
-        path = ROOT_DIR / "turnstile_proxies.txt"
+        path = LOCAL_FIXTURES_DIR / "turnstile_proxies.txt"
     lines: List[str] = []
     if path.is_file():
         try:
@@ -4749,7 +4779,7 @@ def build_config_center(settings: Settings) -> Dict[str, object]:
                 )
             ),
             "proxy": str(raw.get("proxy") or ""),
-            "proxy_file": str(raw.get("proxy_file") or "proxies.txt"),
+            "proxy_file": str(raw.get("proxy_file") or "fixtures/proxies.txt"),
             "proxy_pool_source": resolve_proxy_pool_source(raw, strict=False),
             "proxy_subscription_url": str(raw.get("proxy_subscription_url") or ""),
             "proxy_subscription_urls": _subscription_urls_for_fields(raw),
@@ -4792,15 +4822,12 @@ def build_config_center(settings: Settings) -> Dict[str, object]:
             "turnstile_proxy_enabled": _as_bool(raw.get("turnstile_proxy_enabled")),
             "turnstile_proxy_mode": str(raw.get("turnstile_proxy_mode") or "pool") or "pool",
             "turnstile_proxy": str(raw.get("turnstile_proxy") or ""),
-            "turnstile_proxy_file": str(raw.get("turnstile_proxy_file") or "turnstile_proxies.txt"),
+            "turnstile_proxy_file": str(
+                raw.get("turnstile_proxy_file") or "fixtures/turnstile_proxies.txt"
+            ),
             "turnstile_proxy_random": _as_bool(raw.get("turnstile_proxy_random", True)),
             "local_proxy_port": int(raw.get("local_proxy_port") or 17890),
             "xai_oauth_output_dir": str(settings.output_dir),
-            "grok2api_remote_base": str(raw.get("grok2api_remote_base") or ""),
-            "grok2api_remote_app_key": str(raw.get("grok2api_remote_app_key") or ""),
-            "grok2api_pool_name": str(raw.get("grok2api_pool_name") or ""),
-            "grok2api_auto_add_local": _as_bool(raw.get("grok2api_auto_add_local")),
-            "grok2api_auto_add_remote": _as_bool(raw.get("grok2api_auto_add_remote")),
             "cpa_api_url": str(raw.get("cpa_api_url") or ""),
             "cpa_api_key": str(raw.get("cpa_api_key") or ""),
             "cpa_auto_upload": _as_bool(raw.get("cpa_auto_upload")),
@@ -4820,7 +4847,7 @@ class BatchService:
         root_dir: Optional[Path] = None,
     ) -> None:
         self.root_dir = Path(root_dir or ROOT_DIR)
-        self.config_path = Path(config_path or (self.root_dir / "config.json"))
+        self.config_path = Path(config_path or DEFAULT_CONFIG_PATH)
         self.settings = self._load_settings()
         self._runner: Optional[BatchRunner] = None
         self._listeners: List[Callable[[str], None]] = []
@@ -4844,7 +4871,10 @@ class BatchService:
             config_path=self.config_path,
             count=_positive_int(config.get("register_count", 1), "注册数量", MAX_COUNT),
             workers=_positive_int(config.get("concurrent_workers", 1), "并发数", MAX_WORKERS),
-            output_dir=_absolute_path(str(config.get("xai_oauth_output_dir") or DEFAULT_OUTPUT_DIR), self.root_dir),
+            output_dir=_absolute_path(
+                str(config.get("xai_oauth_output_dir") or DEFAULT_OUTPUT_DIR),
+                self.config_path.parent,
+            ),
             run_mode=_normalize_run_mode(config.get("tui_run_mode") or DEFAULT_RUN_MODE),
             proxy_mode=str(config.get("tui_proxy_mode") or "auto"),
             no_proxy=str(config.get("tui_proxy_mode") or "auto").strip().lower() == "none",
@@ -4903,7 +4933,9 @@ class BatchService:
         if "workers" in data:
             self.settings.workers = _positive_int(data.get("workers"), "并发数", MAX_WORKERS)
         if "output_dir" in data and str(data.get("output_dir") or "").strip():
-            self.settings.output_dir = _absolute_path(str(data.get("output_dir")), self.root_dir)
+            self.settings.output_dir = _absolute_path(
+                str(data.get("output_dir")), self.config_path.parent
+            )
         if "run_mode" in data:
             self.settings.run_mode = _normalize_run_mode(data.get("run_mode"))
         if "egress_mode" in data and str(data.get("egress_mode") or "").strip():
@@ -5065,7 +5097,9 @@ class BatchService:
         if "turnstile_headless" in fields:
             self.settings.turnstile_headless = _as_bool(fields.get("turnstile_headless"))
         if "xai_oauth_output_dir" in fields and str(fields.get("xai_oauth_output_dir") or "").strip():
-            self.settings.output_dir = _absolute_path(str(fields.get("xai_oauth_output_dir")), self.root_dir)
+            self.settings.output_dir = _absolute_path(
+                str(fields.get("xai_oauth_output_dir")), self.config_path.parent
+            )
 
         cfg = dict(self.settings.config or {})
         plain_keys = [
@@ -5084,9 +5118,6 @@ class BatchService:
             "turnstile_proxy",
             "turnstile_proxy_file",
             "turnstile_proxy_mode",
-            "grok2api_remote_base",
-            "grok2api_pool_name",
-            "grok2api_local_token_file",
             "cpa_api_url",
             "defaultDomains",
             "user_agent",
@@ -5106,13 +5137,9 @@ class BatchService:
         bool_keys = [
             "proxy_random",
             "proxy_rotate_session",
-            "grok2api_auto_add_local",
-            "grok2api_auto_add_remote",
             "cpa_auto_upload",
             "cpa_use_local_name",
             "cpa_skip_duplicates",
-            "enable_nsfw",
-            "xai_oauth_auto",
             "embedded_proxy_enabled",
             "turnstile_proxy_enabled",
             "turnstile_proxy_random",
@@ -5277,7 +5304,7 @@ class BatchService:
             "turnstile_proxy_file",
             "turnstile_proxy_random",
         )) and not str(cfg_now.get("turnstile_proxy_file") or "").strip():
-            cfg_now["turnstile_proxy_file"] = "turnstile_proxies.txt"
+            cfg_now["turnstile_proxy_file"] = "fixtures/turnstile_proxies.txt"
             self.settings.config = cfg_now
             persist_settings(self.settings)
             self.settings.config = _read_config(self.settings.config_path)
@@ -5289,7 +5316,7 @@ class BatchService:
         return list_credential_pairs(self.settings.output_dir, page=page, page_size=page_size)
 
     def export_dir(self) -> Path:
-        return resolve_export_dir(self.root_dir)
+        return resolve_export_dir(self.config_path.parent)
 
     def export_credentials_page(self, *, page: int = 1, page_size: int = 1000) -> Dict[str, object]:
         """Export one credentials page to exports/grok+timestamp.txt, then delete local pairs."""
@@ -5301,13 +5328,13 @@ class BatchService:
         )
 
     def list_export_files(self) -> Dict[str, object]:
-        return list_export_files(self.root_dir)
+        return list_export_files(self.config_path.parent)
 
     def delete_export_file(self, name: str) -> Dict[str, object]:
-        return delete_export_file(self.root_dir, name)
+        return delete_export_file(self.config_path.parent, name)
 
     def resolve_export_file(self, name: str) -> Path:
-        return resolve_export_file(self.root_dir, name)
+        return resolve_export_file(self.config_path.parent, name)
 
     def check_cpa_connection(self, payload: Optional[Dict[str, object]] = None) -> Dict[str, object]:
         """Test CPA management endpoint connectivity (override fields optional)."""
@@ -5479,13 +5506,16 @@ class BatchService:
     def import_clean_embedded_proxy_list(self, *, write_pool: bool = False) -> Dict[str, object]:
         """Load verified clean embedded local endpoints for the proxy pool editor."""
         candidates = [
-            self.root_dir / "proxies.clean_embedded.txt",
+            self.config_path.parent / "fixtures" / "proxies.clean_embedded.txt",
+            LOCAL_FIXTURES_DIR / "proxies.clean_embedded.txt",
             Path("/tmp/xai_good_proxies.txt"),
+            # Compatibility fallback for older local layouts.
+            self.root_dir / "proxies.clean_embedded.txt",
         ]
         path = next((p for p in candidates if p.is_file()), None)
         if path is None:
             raise TuiConfigError(
-                "未找到 clean 本地口文件（proxies.clean_embedded.txt 或 /tmp/xai_good_proxies.txt）"
+                "未找到 clean 本地口文件（.local/fixtures/proxies.clean_embedded.txt 或 /tmp/xai_good_proxies.txt）"
             )
         try:
             text_value = path.read_text(encoding="utf-8", errors="replace")
@@ -5683,11 +5713,11 @@ class BatchService:
 
     def embedded_vless_cache_path(self) -> Path:
         """Legacy path (vless-only). Prefer embedded_node_cache_path."""
-        return Path(self.root_dir) / EMBEDDED_VLESS_CACHE_REL
+        return self.config_path.parent / EMBEDDED_VLESS_CACHE_REL
 
     def embedded_node_cache_path(self) -> Path:
         """Primary cache for embedded nodes (vless/hysteria2/anytls/trojan)."""
-        return Path(self.root_dir) / EMBEDDED_NODE_CACHE_REL
+        return self.config_path.parent / EMBEDDED_NODE_CACHE_REL
 
     def _embedded_proxy_cfg_from_settings(self):
         from embedded_proxy_manager import EmbeddedProxyConfig

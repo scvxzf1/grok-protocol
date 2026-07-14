@@ -11,7 +11,7 @@
 - 仅本机绑定 `127.0.0.1`，默认端口 `33844`（可用 `XAI_WEBUI_PORT` 覆盖）
 - 同时只跑 1 个批次；含失败汇总、历史 run、浏览器残留清理
 - 导航：运行台 / 配置中心 / 凭证列表 / **CPA 巡检**
-- 隔离配置可用 `python webui_app.py --config /path/to/config.json`（或 `XAI_CONFIG_PATH`）
+- 默认配置为 `.local/config.json`；隔离配置可用 `python webui_app.py --config /path/to/config.json`（或 `XAI_CONFIG_PATH`）
 - 旧 TUI（`./tui.sh`）仍保留作过渡
 - 也可单独启动 CPA：`python cpa_main.py`（默认 `127.0.0.1:8218`，自动跳到 `/cpa`）
 
@@ -19,14 +19,14 @@
 
 <div align="center">
 
-[![Grok Register — GUI and CLI registration automation toolkit](assets/banner.png)](https://github.com/AaronL725/grok-register)
+[![Grok Register — HTTP registration automation toolkit](assets/banner.png)](https://github.com/AaronL725/grok-register)
 
-Grok Register 是一个面向自动化流程研究、测试环境验证和个人学习的 Python 自动化注册工具 — 支持 GUI / CLI、临时邮箱、浏览器流程控制、账号输出和 grok2api token 池写入。
+Grok Register 是一个 HTTP 优先的 Python 自动化流程工具，提供 WebUI / TUI / CLI、临时邮箱、内置 mihomo 出口、局部 Turnstile 浏览器求解和 OAuth 凭证管理。
 
 <p>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
   <img src="https://img.shields.io/badge/Python-3.9%2B-3776AB.svg" alt="Python 3.9+">
-  <img src="https://img.shields.io/badge/Interface-GUI%20%2B%20CLI-success.svg" alt="GUI + CLI">
+  <img src="https://img.shields.io/badge/Interface-WebUI%20%2B%20CLI-success.svg" alt="WebUI + CLI">
   <img src="https://img.shields.io/badge/Browser-Chromium%2FChrome-4285F4.svg" alt="Chromium/Chrome">
   <a href="http://makeapullrequest.com"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome"></a>
   <a href="https://linux.do"><img src="https://img.shields.io/badge/Join-linux.do-orange" alt="linux.do"></a>
@@ -55,7 +55,6 @@ Grok Register 是一个面向自动化流程研究、测试环境验证和个人
 - [安装](#安装)
 - [配置](#配置)
 - [运行](#运行)
-- [无浏览器 HTTP 模式](#无浏览器-http-模式)
 - [完整使用指南](#完整使用指南)
 - [输出文件](#输出文件)
 - [稳定性机制](#稳定性机制)
@@ -68,21 +67,19 @@ Grok Register 是一个面向自动化流程研究、测试环境验证和个人
 
 ## 功能
 
-- 支持 GUI 图形界面运行。
-- 支持 CLI 终端运行，不启动 Tk GUI。
-- 注册流程使用 Chromium/Chrome 浏览器页面完成。
-- 支持独立的无浏览器 HTTP 注册、SSO 会话导入和 OAuth 凭证获取命令。
+- 支持 WebUI、TUI 与直接 CLI 运行。
+- 注册主流程直接使用 HTTP；只有选择本地 Turnstile 时启动受控 Chrome。
+- 支持 HTTP 注册、SSO 会话导入和 OAuth 凭证获取命令。
 - 支持 DuckMail、YYDS、Cloudflare 临时邮箱接口。
 - 支持验证码邮件轮询和解析。
-- 支持成功账号实时写入 `accounts_*.txt`。
-- 支持将 SSO token 写入 grok2api 本地或远端池。
-- 支持注册后尝试开启 NSFW。
-- 支持页面卡住检测、当前账号重试、浏览器重启和内存清理。
+- 支持账号、凭证、运行记录和导出统一写入 `.local/`。
+- 支持静态 HTTP 代理池、订阅导入和内置 mihomo 多协议节点。
+- 支持有界重试、代理租约、浏览器生命周期和残留清理。
 
 ## 环境要求
 
 - Python 3.9+
-- Google Chrome 或 Chromium
+- Google Chrome 或 Chromium（仅本地 Turnstile 求解需要）
 - 可访问注册页面和临时邮箱 API 的网络环境
 
 ## 安装
@@ -103,10 +100,11 @@ pip install -r requirements.txt
 复制配置文件：
 
 ```bash
-cp config.example.json config.json
+mkdir -p .local
+cp config.example.json .local/config.json
 ```
 
-然后按需编辑 `config.json`。
+然后按需编辑 `.local/config.json`，或直接从 WebUI 保存配置。
 
 ## 配置
 
@@ -117,21 +115,13 @@ cp config.example.json config.json
 | `email_provider` | 邮箱服务商：`duckmail`、`yyds`、`cloudflare` |
 | `register_count` | 本次目标注册数量 |
 | `proxy` | 代理地址，可留空 |
-| `enable_nsfw` | 注册后是否尝试开启 NSFW |
 | `cloudflare_api_base` | Cloudflare 临时邮箱 API 地址 |
 | `cloudflare_api_key` | Cloudflare 临时邮箱接口密钥；默认匿名模式留空，admin 模式填 `ADMIN_PASSWORD` |
 | `cloudflare_auth_mode` | Cloudflare API 鉴权模式；默认 `none`，可选 `bearer`、`x-api-key`、`x-admin-auth`、`query-key` |
-| `cloudflare_path_domains` | Cloudflare 域名列表路径；默认 `/api/domains` |
 | `cloudflare_path_accounts` | Cloudflare 创建邮箱路径；默认匿名模式用 `/api/new_address`，admin 模式用 `/admin/new_address` |
-| `cloudflare_path_token` | Cloudflare token 路径；默认 `/api/token` |
 | `cloudflare_path_messages` | Cloudflare 收件列表路径；默认 `/api/mails` |
 | `defaultDomains` | Cloudflare 临时邮箱默认域名 |
-| `grok2api_auto_add_local` | 是否写入本地 grok2api token 池 |
-| `grok2api_local_token_file` | 本地 grok2api token 文件路径 |
-| `grok2api_auto_add_remote` | 是否写入远端 grok2api |
-| `grok2api_remote_base` | 远端 grok2api 地址，可填站点根地址或 `/admin/api` 管理 API 地址 |
-| `grok2api_remote_app_key` | 远端 grok2api app key |
-| `turnstile_provider` | HTTP 流验证码服务：`capsolver`、`yescaptcha`、`2captcha` |
+| `turnstile_provider` | Turnstile：`local`、`capsolver`、`yescaptcha`、`2captcha` |
 | `turnstile_api_key` | HTTP 流验证码服务 API key；也可优先通过环境变量传入 |
 
 ### Cloudflare 临时邮箱匿名模式（默认）
@@ -151,9 +141,7 @@ cp config.example.json config.json
   "cloudflare_api_base": "https://你的-worker-api-域名",
   "cloudflare_api_key": "",
   "cloudflare_auth_mode": "none",
-  "cloudflare_path_domains": "/api/domains",
   "cloudflare_path_accounts": "/api/new_address",
-  "cloudflare_path_token": "/api/token",
   "cloudflare_path_messages": "/api/mails",
   "defaultDomains": "你的收信域名.com"
 }
@@ -177,89 +165,36 @@ cp config.example.json config.json
 
 创建邮箱会使用 `x-admin-auth` 调用 `/admin/new_address`，后续收件仍使用接口返回的地址 JWT 调用 `/api/mails`。也就是说，admin 密码只用于创建邮箱，不用于读取邮箱邮件。
 
-可先用调试脚本验证 admin 创建接口：
-
-```bash
-python cf_mail_debug.py --api-base "https://你的-worker-api-域名" --auth-mode x-admin-auth --api-key "你的 ADMIN_PASSWORD" --create-path /admin/new_address --domain "你的收信域名.com"
-```
-
-### grok2api 远端入池配置
-
-如果开启 `grok2api_auto_add_remote`，`grok2api_remote_base` 可以填写站点根地址，也可以直接填写管理 API 地址：
-
-```json
-{
-  "grok2api_auto_add_remote": true,
-  "grok2api_remote_base": "https://你的-grok2api-域名",
-  "grok2api_remote_app_key": "你的 app_key"
-}
-```
-
-或：
-
-```json
-{
-  "grok2api_auto_add_remote": true,
-  "grok2api_remote_base": "https://你的-grok2api-域名/admin/api",
-  "grok2api_remote_app_key": "你的 app_key"
-}
-```
-
-程序会优先尝试 `/tokens/add`，并兼容 `/admin/api/tokens/add`；旧版全量保存接口也会兼容 `/tokens` 和 `/admin/api/tokens`。
-
-`config.json` 包含个人配置和密钥，不要提交到 Git。
+`.local/config.json` 包含个人配置和密钥，整个 `.local/` 均不提交到 Git。
 
 ## 运行
 
-### CLI 模式
+### HTTP CLI
 
-CLI 模式不会启动 Tk GUI，但注册流程仍会打开 Chromium/Chrome 浏览器页面。
-
-```bash
-python grok_register_ttk.py cli
-```
-
-看到提示后输入：
-
-```text
-start
-```
-
-停止任务：
-
-```text
-Ctrl+C
-```
-
-CLI 模式适合长时间批量运行。程序每成功注册 5 个账号会关闭浏览器、清理运行时对象并重新启动浏览器，降低长任务内存占用。
-
-### 无浏览器 HTTP 模式
-
-`http` 子命令不会导入 Tk、DrissionPage 或启动 Chrome。它直接维护 xAI 的跨域 Cookie、调用注册/邮箱验证码/OAuth consent 接口，并将 OAuth 凭证写成 CLIProxyAPI 兼容的 JSON：
+CLI 直接维护跨域 Cookie，并调用注册、邮箱验证码和 OAuth consent 接口；选择第三方 Turnstile provider 时全程不启动浏览器：
 
 ```bash
-python grok_register_ttk.py http --help
+python xai_http_flow.py --help
 ```
 
 已存在 SSO 会话时，只获取凭证：
 
 ```bash
-python grok_register_ttk.py http credential --sso-file sso.txt --output-dir xai_credentials
+python xai_http_flow.py credential --sso-file .local/fixtures/sso.txt
 ```
 
-完整注册可使用 `config.json` 邮箱服务商创建/轮询验证码（`yyds` / `cloudflare` / `msgraph`），或 Outlook 四段文件（格式见 `need/outlook_mail.example.txt`）：
+完整注册可使用 `.local/config.json` 邮箱服务商创建/轮询验证码（`yyds` / `cloudflare` / `msgraph`），或 `.local/fixtures/` 下的 Outlook 四段文件：
 
 ```bash
 # 探测邮箱（不注册）
-python grok_register_ttk.py http mail-probe --mail-config config.json
+python xai_http_flow.py mail-probe --mail-config .local/config.json
 
 # 推荐：captcha 服务 + 邮箱配置，无浏览器
-python grok_register_ttk.py http register \
-  --proxy-file proxies.txt --proxy-random \
-  --mail-config config.json \
+python xai_http_flow.py register \
+  --proxy-file .local/fixtures/proxies.txt --proxy-random \
+  --mail-config .local/config.json \
   --turnstile-provider yescaptcha \
-  --turnstile-api-key "$YESCAPTCHA_KEY" \
-  --output-dir xai_credentials
+  --turnstile-api-key "$YESCAPTCHA_KEY"
 ```
 
 Turnstile 也可改用浏览器捕获（会开 Chrome），见 [USAGE.md](USAGE.md)。
@@ -268,7 +203,7 @@ Turnstile 也可改用浏览器捕获（会开 Chrome），见 [USAGE.md](USAGE.
 
 ### HTTP TUI 启动器
 
-`http_tui.sh` 是无浏览器 HTTP 模式的全屏终端启动器，使用 Python 标准库 `curses`，不需要新增依赖。启动页可编辑配置文件、注册数量、并发数、OAuth 输出目录和代理模式；开始后左侧固定渲染批次进度和 worker 状态，右侧实时滚动每个协议子进程的后端日志。每个并发任务独立运行协议注册，不会启动 Chrome。
+`http_tui.sh` 是 HTTP 模式的全屏终端启动器。每个并发任务独立执行 `xai_http_flow.py register`；仅本地 Turnstile provider 会启动 Chrome。
 
 ```bash
 chmod +x http_tui.sh
@@ -278,36 +213,36 @@ chmod +x http_tui.sh
 可先检查运行计划，不发送任何请求：
 
 ```bash
-./http_tui.sh --config config.json --count 3 --workers 2 --dry-run
+./http_tui.sh --config .local/config.json --count 3 --workers 2 --dry-run
 ```
 
-TUI 的数量和并发只影响本次运行，不会改写 `config.json`。批次日志会写入已忽略的 `http_runs/`，成功账号汇总为 `accounts_http_*.txt`。
+TUI 的数量和并发只影响本次运行。批次日志写入 `.local/runs/`，成功账号汇总到 `.local/accounts/`。
 
 运行页快捷键：`q` 停止/退出，`↑` / `↓` 滚动右侧日志，`l` 回到最新日志。建议终端尺寸至少为 80x20。
 
 ### CapSolver Turnstile
 
-CapSolver 接入使用其 `createTask` / `getTaskResult` API。优先通过环境变量提供密钥，避免把密钥写入 `config.json`：
+CapSolver 接入使用其 `createTask` / `getTaskResult` API。优先通过环境变量提供密钥，避免把密钥写入 `.local/config.json`：
 
 ```bash
 export CAPSOLVER_API_KEY="你的 CapSolver API key"
 
-python grok_register_ttk.py http register \
-  --mail-config config.json \
+python xai_http_flow.py register \
+  --mail-config .local/config.json \
   --turnstile-provider capsolver \
-  --output-dir xai_credentials
+  --output-dir .local/credentials
 ```
 
 实现遵循 CapSolver 当前 Turnstile 文档，提交 `AntiTurnstileTaskProxyLess`，并在页面声明时转发 `data-action` 与 `data-cdata`。该任务类型不接收自定义代理；即使注册 HTTP 流配置了 `--proxy`，CapSolver 求解任务仍会以 proxyless 方式创建，日志会明确提示这一点。
 
-注册成功默认写 `accounts_http_*.txt`（`email----password----sso`）与 OAuth JSON；**均含敏感信息，勿提交**。
+注册成功默认写 `.local/accounts/accounts_http_*.txt` 与 `.local/credentials/` 下的 OAuth JSON。
 
 HTTP 模式不伪造 Turnstile/Castle：需 captcha 服务或 token 文件。Castle 按可选字段转发。注册会先 `VerifyEmailValidationCode` 再提交 Server Action。
 
 已有 SSO 只取凭证：
 
 ```bash
-python grok_register_ttk.py http credential --sso-file sso.txt --output-dir xai_credentials
+python xai_http_flow.py credential --sso-file .local/fixtures/sso.txt
 ```
 
 ## 完整使用指南
@@ -320,56 +255,41 @@ python grok_register_ttk.py http credential --sso-file sso.txt --output-dir xai_
 `server_mail_supervisor.py` 的断点续跑批次模式；master/work/state、代理清单与凭证目录
 都属于本机私有数据。完整命令、状态语义和退出码见 `USAGE.md`。
 
-### GUI 模式
-
-```bash
-python grok_register_ttk.py
-```
-
-GUI 模式会打开 Tkinter 窗口，适合手动调整配置和观察日志。
-
 ## 输出文件
 
 运行过程中会生成：
 
-- `accounts_*.txt`：成功账号、密码和 SSO token。
-- `mail_credentials.txt`：临时邮箱凭证。
-- `*.log`：可选日志文件。
+- `.local/accounts/`：成功账号、密码和 SSO token。
+- `.local/credentials/`：OAuth 凭证。
+- `.local/runs/`、`.local/exports/`、`.local/state/`：运行日志、导出和状态。
+- `.local/fixtures/`：机器本地代理、邮箱等私有测试输入。
 
 这些文件包含敏感信息，已被 `.gitignore` 忽略。
 
 ## 稳定性机制
 
-- 每个账号结束后重启浏览器。
-- 每成功 5 个账号执行一次内存清理。
-- CLI 模式支持 `Ctrl+C` 中断并清理浏览器。
-- 最终页长时间无变化时自动重试当前账号。
+- 本地 Turnstile 浏览器有任务数、年龄、空闲、RSS 和重试上限。
+- 停止批次时只清理本项目创建的浏览器与转发器。
+- 静态 HTTP 代理按任务独占租约并在所有退出路径释放。
 - 验证码未收到时自动更换邮箱重试。
 
 ## 常见问题
 
-### CLI 模式为什么还会打开浏览器？
+### 为什么会打开浏览器？
 
-CLI 模式只是不启动 Tk GUI。注册页、Turnstile、验证码提交和 SSO cookie 获取仍依赖真实浏览器环境。
-
-### NSFW 开启失败怎么办？
-
-如果日志显示 `Cloudflare 防护拦截，HTTP 403`，说明请求被目标站点防护拦截。程序会继续保存账号和写入 grok2api。
-
-### GUI 显示的数量和配置不同？
-
-GUI 数量控件可能有上限。CLI 模式直接读取 `config.json` 中的 `register_count`。
+只有 `turnstile_provider=local` 会启动本地 Chrome；改用已配置的第三方 provider 后，注册主链保持 HTTP。
 
 ## 目录结构
 
 ```text
 .
-├── grok_register_ttk.py   # 主程序（GUI / CLI / http 入口）
-├── xai_http_flow.py       # 无浏览器 HTTP 注册与 OAuth 凭证
+├── webui_app.py           # WebUI 入口
+├── http_batch_service.py  # WebUI/TUI 批次服务
+├── xai_http_flow.py       # HTTP 注册、邮箱与 OAuth 凭证 CLI
 ├── xai_oauth.py           # OAuth PKCE / token
 ├── turnstile_flow.py      # 浏览器页 Turnstile 状态机
 ├── local_proxy_forwarder.py
-├── cf_mail_debug.py
+├── local_paths.py         # .local/ 机器本地路径约定
 ├── config.example.json
 ├── need/                  # 仅示例；真实池文件勿提交
 ├── tests/
@@ -380,8 +300,8 @@ GUI 数量控件可能有上限。CLI 模式直接读取 `config.json` 中的 `r
 
 ## 分享前注意
 
-1. 只提交/打包源码与示例；**不要**带上 `config.json`、`proxies.txt`、`accounts_*`、`xai_credentials/`、真实 `need/*` 池、抓包 JSON。  
-2. `config.json` 从 `config.example.json` 复制后本地填写。  
+1. 只提交/打包源码与示例；**不要**带上 `.local/`、真实 `need/*` 池或抓包 JSON。
+2. `.local/config.json` 从 `config.example.json` 复制后本地填写。
 3. 分享前可用 `USAGE.md` 第 1 节自检命令扫一遍密钥残留。
 
 ## License

@@ -15,11 +15,11 @@ python3 -m turnstile_solver.src solve \
 ## 立刻同代理注册
 
 ```bash
-python3 grok_register_ttk.py http register \
+python3 xai_http_flow.py register \
   --proxy "$(cat /tmp/turnstile.proxy.txt)" \
-  --mail-config config.json \
+  --mail-config .local/config.json \
   --turnstile-token-file /tmp/turnstile.txt \
-  --output-dir xai_credentials
+  --output-dir .local/credentials
 ```
 
 ## 说明

@@ -92,7 +92,7 @@ function fill(data) {
   set("ms_mail_file", f.ms_mail_file || "");
   set("proxy_mode", f.proxy_mode || "auto");
   set("proxy", f.proxy || "");
-  set("proxy_file", f.proxy_file || "proxies.txt");
+  set("proxy_file", f.proxy_file || "fixtures/proxies.txt");
   set("proxy_pool_source", f.proxy_pool_source || "manual");
   const subUrls = Array.isArray(f.proxy_subscription_urls)
     ? f.proxy_subscription_urls
@@ -126,22 +126,19 @@ function fill(data) {
   set("turnstile_proxy_enabled", !!f.turnstile_proxy_enabled, true);
   set("turnstile_proxy_mode", f.turnstile_proxy_mode || "pool");
   set("turnstile_proxy", f.turnstile_proxy || "");
-  set("turnstile_proxy_file", f.turnstile_proxy_file || "turnstile_proxies.txt");
+  set("turnstile_proxy_file", f.turnstile_proxy_file || "fixtures/turnstile_proxies.txt");
   set("turnstile_proxy_random", f.turnstile_proxy_random !== false, true);
   set("xai_oauth_output_dir", f.xai_oauth_output_dir || "");
-  set("grok2api_remote_base", f.grok2api_remote_base || "");
-  set("grok2api_remote_app_key", f.grok2api_remote_app_key || "");
-  set("grok2api_pool_name", f.grok2api_pool_name || "");
   set("cpa_api_url", f.cpa_api_url || "");
   set("cpa_api_key", f.cpa_api_key || "");
   set("cpa_auto_upload", !!f.cpa_auto_upload, true);
   set("cpa_use_local_name", f.cpa_use_local_name !== false, true);
   set("cpa_skip_duplicates", f.cpa_skip_duplicates !== false, true);
 
-  ["yyds_api_key","yyds_jwt","turnstile_api_key","cloudflare_api_key","duckmail_api_key","grok2api_remote_app_key","cpa_api_key"]
+  ["yyds_api_key","yyds_jwt","turnstile_api_key","cloudflare_api_key","duckmail_api_key","cpa_api_key"]
     .forEach(k => setFlag(k, !!flags[k] || !!(f[k] && String(f[k]).trim())));
   // Mark which secrets were loaded non-empty so empty-save only clears intentional edits.
-  ["yyds_api_key","yyds_jwt","turnstile_api_key","cloudflare_api_key","duckmail_api_key","grok2api_remote_app_key","cpa_api_key"].forEach((k) => {
+  ["yyds_api_key","yyds_jwt","turnstile_api_key","cloudflare_api_key","duckmail_api_key","cpa_api_key"].forEach((k) => {
     const el = fieldEl(k);
     if (!el) return;
     const has = !!(f[k] && String(f[k]).trim()) || !!flags[k];
@@ -257,12 +254,9 @@ function collectFields() {
   if (present("turnstile_proxy_enabled")) put("turnstile_proxy_enabled", g("turnstile_proxy_enabled", true, false));
   if (present("turnstile_proxy_mode")) put("turnstile_proxy_mode", g("turnstile_proxy_mode", false, "pool") || "pool");
   if (present("turnstile_proxy")) put("turnstile_proxy", g("turnstile_proxy", false, "") || "");
-  if (present("turnstile_proxy_file")) put("turnstile_proxy_file", g("turnstile_proxy_file", false, "turnstile_proxies.txt") || "turnstile_proxies.txt");
+  if (present("turnstile_proxy_file")) put("turnstile_proxy_file", g("turnstile_proxy_file", false, "fixtures/turnstile_proxies.txt") || "fixtures/turnstile_proxies.txt");
   if (present("turnstile_proxy_random")) put("turnstile_proxy_random", g("turnstile_proxy_random", true, true));
   put("xai_oauth_output_dir", g("xai_oauth_output_dir"));
-  put("grok2api_remote_base", g("grok2api_remote_base"));
-  putSecret("grok2api_remote_app_key");
-  put("grok2api_pool_name", g("grok2api_pool_name"));
   put("cpa_api_url", g("cpa_api_url"));
   putSecret("cpa_api_key");
   if (present("cpa_auto_upload")) put("cpa_auto_upload", g("cpa_auto_upload", true, false));

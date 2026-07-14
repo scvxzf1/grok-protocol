@@ -116,7 +116,7 @@ class HttpTuiLauncherTests(unittest.TestCase):
     def test_batch_runner_streams_child_logs_and_merges_worker_accounts(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            fake_entry = root / "grok_register_ttk.py"
+            fake_entry = root / "xai_http_flow.py"
             fake_entry.write_text(
                 """
 import argparse
@@ -162,7 +162,7 @@ print('[HTTP] fake backend completed', flush=True)
     def test_mode2_runner_converts_sso_after_register(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            fake_entry = root / "grok_register_ttk.py"
+            fake_entry = root / "xai_http_flow.py"
             fake_entry.write_text(
                 "\n".join(
                     [
@@ -287,7 +287,7 @@ print('[HTTP] fake backend completed', flush=True)
     def test_mode2_starts_convert_without_blocking_main_loop(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "grok_register_ttk.py").write_text(
+            (root / "xai_http_flow.py").write_text(
                 "\n".join(
                     [
                         "import argparse",
@@ -372,7 +372,7 @@ print('[HTTP] fake backend completed', flush=True)
                 "'demo@example.test----password----sso-token\\n', encoding='utf-8')\n"
                 "print('register done', flush=True)\n"
             )
-            (root / "grok_register_ttk.py").write_text(register_script, encoding="utf-8")
+            (root / "xai_http_flow.py").write_text(register_script, encoding="utf-8")
             counter = root / "convert_count.txt"
             counter.write_text("0", encoding="utf-8")
             converter_script = (

@@ -107,14 +107,11 @@ checkbox 示例：
 | MS 邮箱文件 | Outlook 四段账号文件路径（msgraph 用） |
 | 代理模式 | auto/直连/代理池/关闭，控制出口怎么走 |
 | 直连代理 URL | 单个代理地址，格式如 http://user:pass@host:port |
-| 代理池文件 | 代理列表文件路径，默认 proxies.txt |
+| 代理池文件 | 代理列表文件路径，默认 fixtures/proxies.txt |
 | 本地转发端口 | 本机无认证转发端口，浏览器流常用 |
 | 代理池随机 | 从代理池随机挑，而不是固定顺序 |
 | 轮换 session | 尽量换会话出口，降低同 IP 连打风险 |
 | OAuth 输出目录 | SSO/凭证 JSON 写出目录 |
-| Grok2API Remote Base | 远端 grok2api 站点或管理 API 地址 |
-| Grok2API App Key | 远端 grok2api 的 app key |
-| Grok2API Pool Name | 写入远端时使用的 token 池名称 |
 
 说明：
 

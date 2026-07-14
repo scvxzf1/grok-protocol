@@ -19,6 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from http_batch_service import (
+    DEFAULT_CONFIG_PATH,
     ROOT_DIR,
     BatchBusyError,
     BatchService,
@@ -960,8 +961,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="xAI HTTP 协议 WebUI（仅本机）")
     parser.add_argument(
         "--config",
-        default=os.environ.get("XAI_CONFIG_PATH", str(ROOT_DIR / "config.json")),
-        help="配置文件路径（默认 config.json，也可用 XAI_CONFIG_PATH）",
+        default=os.environ.get("XAI_CONFIG_PATH") or str(DEFAULT_CONFIG_PATH),
+        help="配置文件路径（默认 .local/config.json，也可用 XAI_CONFIG_PATH）",
     )
     parser.add_argument("--host", default=os.environ.get("XAI_WEBUI_HOST", DEFAULT_WEBUI_HOST))
     parser.add_argument(
@@ -981,7 +982,7 @@ def main(argv: Optional[list] = None) -> int:
         print(f"[!] 警告: 绑定 {host} 会超出本机 loopback；规格默认仅 127.0.0.1")
     port = int(args.port or DEFAULT_WEBUI_PORT)
     config_path = Path(
-        str(args.config or (ROOT_DIR / "config.json"))
+        str(args.config or DEFAULT_CONFIG_PATH)
     ).expanduser().resolve()
     service = BatchService(config_path=config_path, root_dir=ROOT_DIR)
     app = create_app(service=service)

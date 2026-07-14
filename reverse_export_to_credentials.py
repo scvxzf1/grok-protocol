@@ -10,8 +10,8 @@ Run interactive TUI:
 
 CLI:
   python3 reverse_export_to_credentials.py --line '{...}____sso...'
-  python3 reverse_export_to_credentials.py --file exports/grok+20260712073603.txt
-  python3 reverse_export_to_credentials.py --file exports/xxx.txt --out-dir ./xai_credentials
+  python3 reverse_export_to_credentials.py --file .local/exports/grok+20260712073603.txt
+  python3 reverse_export_to_credentials.py --file .local/exports/xxx.txt --out-dir .local/credentials
 """
 
 from __future__ import annotations
@@ -25,9 +25,11 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from local_paths import CREDENTIALS_DIR
+
 
 SEP = "____"
-DEFAULT_OUT_DIR = Path(__file__).resolve().parent / "xai_credentials"
+DEFAULT_OUT_DIR = CREDENTIALS_DIR
 
 
 def sanitize_file_segment(value: str) -> str:

@@ -309,7 +309,7 @@ class LifecycleTests(unittest.TestCase):
                     with mock.patch.object(m, "_wait_port_open", return_value=True):
                         info = m.start(nodes, cfg)
 
-            config_path = root / ".embedded_mihomo" / "config.yaml"
+            config_path = root / ".local" / "state" / "embedded_mihomo" / "config.yaml"
             self.assertTrue(config_path.is_file())
             self.assertTrue(m._running)
             self.assertTrue(info.get("running"))

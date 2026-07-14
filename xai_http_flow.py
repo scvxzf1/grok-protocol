@@ -47,6 +47,7 @@ from cross_process_lock import (
     ensure_private_file,
 )
 from project_browser_registry import register_project_browser, unregister_project_browser
+from local_paths import ACCOUNTS_DIR, CONFIG_PATH, CREDENTIALS_DIR, STATE_DIR
 
 from turnstile_broker import (
     FingerprintProfile,
@@ -2786,15 +2787,12 @@ LOCAL_TURNSTILE_LOCK_TIMEOUT_SEC = configured_lock_timeout(
 
 
 def _load_turnstile_inflight_config_fallback() -> Dict[str, Any]:
-    """Best-effort read of project config.json for cross-process slot limits."""
+    """Best-effort read of the active local config for cross-process slot limits."""
     candidates = []
     env_cfg = str(os.environ.get("XAI_CONFIG_PATH") or os.environ.get("XAI_MAIL_CONFIG") or "").strip()
     if env_cfg:
         candidates.append(Path(env_cfg))
-    # common: cwd/config.json next to running register worker
-    candidates.append(Path.cwd() / "config.json")
-    here = Path(__file__).resolve().parent
-    candidates.append(here / "config.json")
+    candidates.append(CONFIG_PATH)
     for path in candidates:
         try:
             if path.is_file():
@@ -4554,13 +4552,13 @@ def _add_token_options(parser: argparse.ArgumentParser, *, registration: bool = 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="xAI 无浏览器注册与 OAuth 凭证获取（不启动 Chrome）",
+        description="xAI HTTP 注册与 OAuth 凭证获取（仅 local Turnstile 启动 Chrome）",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
     credential = sub.add_parser("credential", help="从已有 SSO 或邮箱密码获取 OAuth 凭证")
     _add_proxy_options(credential)
-    credential.add_argument("--output-dir", default="xai_credentials")
+    credential.add_argument("--output-dir", default=str(CREDENTIALS_DIR))
     credential.add_argument("--email", default="", help="密码登录邮箱或 OAuth 邮箱提示")
     credential.add_argument("--password", default="", help="密码登录密码（建议改用环境变量包装调用）")
     credential.add_argument("--sso", default="", help="已有 sso cookie")
@@ -4570,7 +4568,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     register = sub.add_parser("register", help="直接 HTTP 注册、取得 SSO 并写 OAuth 凭证")
     _add_proxy_options(register)
-    register.add_argument("--output-dir", default="xai_credentials")
+    register.add_argument("--output-dir", default=str(CREDENTIALS_DIR))
     register.add_argument("--email", default="")
     register.add_argument("--email-code", default="", help="已收到的 xAI 6 位邮箱验证码")
     register.add_argument(
@@ -4604,10 +4602,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="用真实浏览器在同一出口代理上打开注册页，捕获新鲜 Turnstile token（会启动 Chrome）",
     )
     _add_proxy_options(capture)
-    capture.add_argument("--output", default="turnstile.txt", help="写入 token 的 UTF-8 文件")
+    capture.add_argument(
+        "--output",
+        default=str(STATE_DIR / "turnstile.txt"),
+        help="写入 token 的 UTF-8 文件",
+    )
     capture.add_argument(
         "--proxy-used-file",
-        default="turnstile.proxy.txt",
+        default=str(STATE_DIR / "turnstile.proxy.txt"),
         help="写入本次实际使用的代理，便于 register 粘性复用",
     )
     capture.add_argument("--wait-seconds", type=int, default=180, help="等待原生 Turnstile 通过的秒数")
@@ -5537,7 +5539,7 @@ def _quit_turnstile_browser(browser: Any, options: Any = None) -> None:
 def capture_turnstile_token(
     *,
     proxy: str = "",
-    output: str = "turnstile.txt",
+    output: str = str(STATE_DIR / "turnstile.txt"),
     proxy_used_file: str = "",
     selected_proxy_raw: str = "",
     timeout: int = 30,
@@ -5582,7 +5584,7 @@ def capture_turnstile_token(
 def _capture_turnstile_token_impl(
     *,
     proxy: str = "",
-    output: str = "turnstile.txt",
+    output: str = str(STATE_DIR / "turnstile.txt"),
     proxy_used_file: str = "",
     selected_proxy_raw: str = "",
     timeout: int = 30,
@@ -5989,6 +5991,7 @@ return (async () => {
 
         if str(output or "").strip():
             out = Path(str(output).strip()).expanduser()
+            out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(token + "\n", encoding="utf-8")
             try:
                 if os.name != "nt":
@@ -6000,6 +6003,7 @@ return (async () => {
             _log(log_callback, f"[Turnstile] token 已捕获 (len={len(token)})")
         if proxy_used_file:
             proxy_out = Path(str(proxy_used_file)).expanduser()
+            proxy_out.parent.mkdir(parents=True, exist_ok=True)
             proxy_out.write_text((selected_proxy_raw or proxy or "") + "\n", encoding="utf-8")
         if return_result:
             return SolveResult(
@@ -6033,17 +6037,23 @@ return (async () => {
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(list(argv) if argv is not None else None)
+    previous_config_env = os.environ.get("XAI_CONFIG_PATH")
+    config_env_overridden = False
 
     def logger(message: str) -> None:
         print(message, flush=True)
 
     try:
         proxy, selected_raw = _resolve_runtime_proxy(args)
+        config: Dict[str, Any] = {}
+        mail_config_value = str(getattr(args, "mail_config", "") or "").strip()
+        if mail_config_value:
+            mail_config_path = Path(mail_config_value).expanduser().resolve()
+            config = json.loads(mail_config_path.read_text(encoding="utf-8"))
+            os.environ["XAI_CONFIG_PATH"] = str(mail_config_path)
+            config_env_overridden = True
 
         if args.command == "mail-probe":
-            config: Dict[str, Any] = {}
-            if args.mail_config:
-                config = json.loads(Path(args.mail_config).read_text(encoding="utf-8"))
             if args.mail_file:
                 mailbox = MicrosoftGraphMailbox(
                     args.mail_file,
@@ -6100,8 +6110,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(
                 "[+] Turnstile 已捕获。"
                 "请尽快用同一代理执行 register，例如:\n"
-                f'  python grok_register_ttk.py http register --proxy "{selected_raw or proxy}" '
-                f"--turnstile-token-file {args.output} --mail-config config.json --output-dir xai_credentials"
+                f'  python xai_http_flow.py register --proxy "{selected_raw or proxy}" '
+                f"--turnstile-token-file {args.output} --mail-config "
+                f"{Path(os.environ.get('XAI_CONFIG_PATH') or CONFIG_PATH).expanduser().resolve()} "
+                f"--output-dir {CREDENTIALS_DIR}"
             )
             return 0
 
@@ -6203,7 +6215,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             output_dir=args.output_dir,
             accounts_output=(
                 args.accounts_output
-                or f"accounts_http_{time.strftime('%Y%m%d_%H%M%S')}.txt"
+                or str(ACCOUNTS_DIR / f"accounts_http_{time.strftime('%Y%m%d_%H%M%S')}.txt")
             ),
         )
         print(
@@ -6217,6 +6229,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except Exception as exc:  # pragma: no cover - CLI last-resort guard
         print(f"[!] 未处理异常: {_safe_error_text(exc)}", file=sys.stderr)
         return 3
+    finally:
+        if config_env_overridden:
+            if previous_config_env is None:
+                os.environ.pop("XAI_CONFIG_PATH", None)
+            else:
+                os.environ["XAI_CONFIG_PATH"] = previous_config_env
 
 
 if __name__ == "__main__":  # pragma: no cover

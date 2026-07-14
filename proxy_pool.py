@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Union
 from urllib.parse import urlparse
 
+from local_paths import STATE_DIR
+
 
 _PROXY_STATS_DEFAULT = "proxy_stats.log"
 _INVALID_HOSTS = {
@@ -38,7 +40,7 @@ def project_root() -> str:
 
 
 def default_stats_path() -> str:
-    return os.path.join(project_root(), _PROXY_STATS_DEFAULT)
+    return str(STATE_DIR / _PROXY_STATS_DEFAULT)
 
 
 def normalize_proxy_line(line: str) -> str:

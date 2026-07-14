@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 from urllib.parse import parse_qs, unquote, urlparse
 
+from local_paths import FIXTURES_DIR, PROJECT_ROOT, STATE_DIR
+
 try:
     import yaml
 except ImportError:  # pragma: no cover - fallback for environments without PyYAML
@@ -35,7 +37,9 @@ def _preferred_local_ports() -> list[str]:
         candidates.append(Path(env))
     candidates.extend(
         [
+            FIXTURES_DIR / "proxies.clean_embedded.txt",
             Path("/tmp/xai_good_proxies.txt"),
+            # Compatibility fallback for older checkouts.
             Path(__file__).resolve().parent / "proxies.clean_embedded.txt",
         ]
     )
@@ -865,8 +869,15 @@ class EmbeddedProxyManager:
     def _project_root(self) -> Path:
         return Path(__file__).resolve().parent
 
+    def _local_state_dir(self) -> Path:
+        project_root = self._project_root().resolve()
+        if project_root == PROJECT_ROOT:
+            return STATE_DIR
+        # Tests and embedded callers may provide an isolated project root.
+        return project_root / ".local" / "state"
+
     def _runtime_paths(self) -> tuple[Path, Path, Path]:
-        runtime_dir = self._project_root() / ".embedded_mihomo"
+        runtime_dir = self._local_state_dir() / "embedded_mihomo"
         runtime_dir.mkdir(parents=True, exist_ok=True)
         config_path = runtime_dir / "config.yaml"
         log_path = runtime_dir / "mihomo.log"
@@ -885,7 +896,7 @@ class EmbeddedProxyManager:
 
     def _cleanup_stale_project_mihomo(self) -> None:
         """Best-effort kill leftover project-local mihomo processes."""
-        runtime_dir = str((self._project_root() / ".embedded_mihomo").resolve())
+        runtime_dir = str(self._runtime_paths()[0].resolve())
         marker = runtime_dir
         if os.name == "nt" or not Path("/proc").is_dir():
             return

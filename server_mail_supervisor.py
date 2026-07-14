@@ -541,8 +541,7 @@ class ServerMailSupervisor:
         record = self.records[key]
         command = [
             sys.executable,
-            str(ROOT_DIR / "grok_register_ttk.py"),
-            "http",
+            str(ROOT_DIR / "xai_http_flow.py"),
             "credential",
             "--proxy-file",
             str(self.proxy_path),
