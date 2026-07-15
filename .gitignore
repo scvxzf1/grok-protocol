@@ -8,6 +8,7 @@ venv/
 env/
 
 # Local secrets and runtime outputs
+/.local/
 config.json
 config.local.json
 config.json.bak*
@@ -54,5 +55,14 @@ autoPortData/
 *协议分析报告.md
 grok-*-协议分析*.md
 
-# Embedded mihomo runtime
+# Legacy embedded mihomo runtime (current runtime is under .local/state/)
 .embedded_mihomo/
+
+# Private integration inputs and transactional runtime state
+/测试用配置/
+proxy_pool.snapshot.txt
+*.state.json
+*.state.json.lock
+*.txt.lock
+*.tmp
+*.tmp.*

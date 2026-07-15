@@ -9,16 +9,30 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+# Parent repository root.  The solver is commonly launched from inside its
+# own directory, where root-level shared utilities are otherwise unavailable.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from project_browser_registry import register_project_browser, unregister_project_browser
+from turnstile_broker import build_chrome_brand_version_list
+
 from .config import SolverConfig
 from .models import FingerprintSnapshot, SolveRequest, SolveResult
 from .proxy import normalize_proxy, parse_proxy
 
 LogFn = Optional[Callable[[str], None]]
 
-# Parent repo root: .../grok协议
-REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+def _proxy_log_endpoint(value: str) -> str:
+    """Return a credential-free endpoint suitable for operational logs."""
+
+    spec = parse_proxy(value)
+    if not spec.enabled or not spec.host:
+        return "direct"
+    host = f"[{spec.host}]" if ":" in spec.host else spec.host
+    port = f":{spec.port}" if spec.port else ""
+    return f"{spec.scheme or 'http'}://{host}{port}"
 
 
 CLICK_EMAIL_JS = r"""
@@ -193,6 +207,7 @@ return {
   tokenLen: token.length,
   turnstileApiType: typeof window.turnstile,
   turnstileRespLen: turnstileResp.length,
+  turnstileError: String(window.__xaiTsLastError || ''),
   sitekeys,
   sitekeyCount: sitekeys.length,
   iframeCount: iframes.length,
@@ -252,7 +267,7 @@ function doRender() {{
   const opts = {{
     sitekey,
     callback:onToken,
-    'error-callback':function(code){{ window.__xaiTsLastError = String(code || 'error'); }},
+    'error-callback':function(code){{ window.__xaiTsLastError = String(code || 'error'); return true; }},
     'expired-callback':function(){{ window.__xaiTsToken = ''; try {{ ensureHiddenInput().value = ''; }} catch (e) {{}} }},
     'timeout-callback':function(){{ window.__xaiTsLastError = 'timeout'; }},
     size:'normal',
@@ -263,7 +278,6 @@ function doRender() {{
   if (cdata) opts.cData = cdata;
   try {{
     window.__xaiTsWidgetId = turnstile.render(host, opts);
-    try {{ if (typeof turnstile.execute === 'function') turnstile.execute(window.__xaiTsWidgetId); }} catch (e) {{}}
     return {{ok:true, reason:'rendered', widgetId:window.__xaiTsWidgetId, tokenLen:(window.__xaiTsToken||'').length}};
   }} catch (e) {{
     return {{ok:false, reason:'render-error', error:String(e)}};
@@ -336,35 +350,9 @@ def _ensure_injected_turnstile_widget(
 def _nudge_turnstile_widget(page: Any, *, log_callback: LogFn = None) -> str:
     actions: List[str] = []
     try:
-        clicked = page.run_js(
-            """
-const nodes = Array.from(document.querySelectorAll(
-  '#xai-local-ts-host, #xai-local-ts-host iframe, .cf-turnstile, [data-sitekey], #cf-turnstile, #turnstile-wrapper, iframe[src*="turnstile"], iframe[src*="challenges.cloudflare"]'
-));
-let count = 0;
-for (const node of nodes) {
-  try { node.scrollIntoView({block:'center', inline:'center'}); } catch (e) {}
-  try { node.click(); count += 1; } catch (e) {}
-  try {
-    const rect = node.getBoundingClientRect();
-    const x = rect.left + Math.min(Math.max(rect.width * 0.2, 8), 40);
-    const y = rect.top + rect.height / 2;
-    for (const type of ['pointerdown', 'mousedown', 'mouseup', 'click']) {
-      node.dispatchEvent(new MouseEvent(type, {bubbles:true, clientX:x, clientY:y, view:window}));
-    }
-  } catch (e) {}
-}
-return count;
-"""
-        )
-        if int(clicked or 0) > 0:
-            actions.append(f"dom:{clicked}")
-    except Exception:
-        pass
-    try:
         api_result = page.run_js(
             """
-const out = {executed:false, tokenLen:0, error:''};
+const out = {tokenLen:0, error:''};
 try {
   if (window.turnstile && window.__xaiTsWidgetId != null) {
     try {
@@ -376,20 +364,12 @@ try {
         if (input) input.value = token;
       }
     } catch (e) {}
-    try {
-      if (typeof turnstile.execute === 'function') {
-        turnstile.execute(window.__xaiTsWidgetId);
-        out.executed = true;
-      }
-    } catch (e) { out.error = String(e); }
   }
 } catch (e) { out.error = String(e); }
 return out;
 """
         )
         if isinstance(api_result, dict):
-            if api_result.get("executed"):
-                actions.append("api-execute")
             if int(api_result.get("tokenLen") or 0) >= 80:
                 actions.append(f"api-token:{api_result.get('tokenLen')}")
     except Exception:
@@ -447,20 +427,16 @@ def _log(log_callback: LogFn, message: str) -> None:
 def prepare_browser_proxy(
     proxy: str = "",
     *,
-    parent_proxy: str = "",
     preferred_local_port: int = 0,
     instance_key: str = "",
 ) -> Tuple[str, str, str]:
     """Return (browser_proxy_url, upstream_proxy_url, forwarder_instance_key)."""
     upstream = normalize_proxy(proxy)
-    parent = normalize_proxy(parent_proxy)
-    if not upstream and not parent:
+    if not upstream:
         return "", "", ""
-    if parent and not upstream:
-        raise RuntimeError("设置 parent_proxy 时必须同时提供 proxy 上游")
 
     parsed = parse_proxy(upstream)
-    needs_forwarder = bool(parent) or bool(parsed.username or parsed.password)
+    needs_forwarder = bool(parsed.username or parsed.password)
     if not needs_forwarder:
         return upstream, upstream, ""
 
@@ -471,7 +447,6 @@ def prepare_browser_proxy(
         upstream,
         preferred_local_port=int(preferred_local_port or 0),
         instance_key=key,
-        parent_proxy_raw=parent,
     )
     return str(browser_proxy or ""), upstream, key
 
@@ -672,12 +647,15 @@ def build_cdp_user_agent_metadata(
         raise RuntimeError("缺少 expected_client_hint_platform")
     return {
         "brands": [
-            {"brand": "Not.A/Brand", "version": "99"},
-            {"brand": "Chromium", "version": str(major)},
+            {"brand": brand, "version": version}
+            for brand, version in build_chrome_brand_version_list(str(major))
         ],
         "fullVersionList": [
-            {"brand": "Not.A/Brand", "version": "99.0.0.0"},
-            {"brand": "Chromium", "version": full_version},
+            {"brand": brand, "version": version}
+            for brand, version in build_chrome_brand_version_list(
+                full_version,
+                full_version=True,
+            )
         ],
         "platform": platform,
         "platformVersion": _default_platform_version(platform),
@@ -776,6 +754,7 @@ def _summarize_diag(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
         "token_len_last": token_lens[-1] if token_lens else 0,
         "token_seen_nonzero": any(x > 0 for x in token_lens),
         "turnstile_resp_len_max": max(resp_lens) if resp_lens else 0,
+        "turnstile_error_last": str(last.get("turnstileError") or ""),
         "sitekeys": sitekeys,
         "sitekey_count": len(sitekeys),
         "has_cf_input_last": bool(last.get("hasCfInput")),
@@ -796,6 +775,7 @@ def _summarize_diag(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
                 "turnstileIframeCount": s.get("turnstileIframeCount"),
                 "sitekeyCount": s.get("sitekeyCount"),
                 "challengeLike": s.get("challengeLike"),
+                "turnstileError": s.get("turnstileError"),
             }
             for s in samples
         ],
@@ -813,11 +793,6 @@ class BrowserWorker:
         started = time.monotonic()
         page_url = (request.page_url or self.config.signup_url).strip()
         upstream_raw = (request.proxy or self.config.proxy or "").strip()
-        parent_proxy = (
-            str((request.metadata or {}).get("parent_proxy") or "")
-            or self.config.parent_proxy
-            or ""
-        ).strip()
         timeout = max(5, int(request.timeout_sec or self.config.browser_timeout_sec))
         headless = bool(request.headless) or bool(self.config.headless)
         min_len = max(20, int(self.config.token_min_length or 80))
@@ -828,7 +803,6 @@ class BrowserWorker:
         try:
             browser_proxy, upstream_proxy, forwarder_instance = prepare_browser_proxy(
                 upstream_raw,
-                parent_proxy=parent_proxy,
                 preferred_local_port=int(self.config.local_proxy_port or 0),
                 instance_key=f"ts-worker-{uuid.uuid4().hex[:10]}",
             )
@@ -854,13 +828,13 @@ class BrowserWorker:
             diag = diag if isinstance(diag, dict) else {}
             extras = {
                 "browser_proxy": browser_proxy,
-                "parent_proxy": normalize_proxy(parent_proxy),
                 "forwarder_instance": forwarder_instance,
                 "diagnostics": diag,
                 "language": str(diag.get("language") or "").strip(),
                 "platform": str(diag.get("platform") or "").strip(),
                 "client_hint_platform": str(diag.get("client_hint_platform") or "").strip(),
                 "browser_major": str(diag.get("browser_major") or "").strip(),
+                "turnstile_error": str(diag.get("turnstile_error") or "").strip(),
             }
             # Surface a lightweight fingerprint so HTTP-side validation can
             # compare language/platform when present.
@@ -871,6 +845,7 @@ class BrowserWorker:
                 "browser_major": extras["browser_major"],
             }
             if len(token) < min_len:
+                challenge_error = str(extras.get("turnstile_error") or "").strip()
                 return SolveResult(
                     ok=False,
                     token=token,
@@ -879,8 +854,12 @@ class BrowserWorker:
                     user_agent=effective_ua,
                     elapsed_ms=elapsed_ms,
                     error=(
-                        f"在 {timeout}s 内未捕获到可用 Turnstile token "
-                        f"(len={len(token)}, min={min_len})"
+                        f"Turnstile challenge error {challenge_error}"
+                        if challenge_error
+                        else (
+                            f"在 {timeout}s 内未捕获到可用 Turnstile token "
+                            f"(len={len(token)}, min={min_len})"
+                        )
                     ),
                     extras=extras,
                 )
@@ -905,7 +884,6 @@ class BrowserWorker:
                 elapsed_ms=elapsed_ms,
                 error=str(exc),
                 extras={
-                    "parent_proxy": normalize_proxy(parent_proxy),
                     "forwarder_instance": forwarder_instance,
                 },
             )
@@ -939,6 +917,7 @@ class BrowserWorker:
         strict = bool((request.metadata or {}).get("strict_fingerprint", self.config.strict_fingerprint))
         samples: List[Dict[str, Any]] = []
         token = ""
+        challenge_error = ""
         fingerprint = FingerprintSnapshot()
         try:
             cdp_metadata = apply_cdp_fingerprint_override(
@@ -955,15 +934,6 @@ class BrowserWorker:
             _log(self.log_callback, f"[Turnstile] 常驻浏览器已打开注册页: {page_url}")
 
             sitekey = str(request.sitekey or "").strip()
-            # Real xAI signup pages often keep Turnstile gated behind the email
-            # entry step. Always try that first, then inject the known sitekey.
-            remaining = max(0, int(deadline - time.monotonic()))
-            if remaining > 0:
-                click_email_signup_entry(
-                    page,
-                    log_callback=self.log_callback,
-                    timeout=min(12, remaining),
-                )
             if sitekey:
                 _ensure_injected_turnstile_widget(
                     page,
@@ -974,14 +944,32 @@ class BrowserWorker:
                     log_callback=self.log_callback,
                     wait_api_sec=min(3.0, max(0.0, deadline - time.monotonic())),
                 )
+            else:
+                remaining = max(0, int(deadline - time.monotonic()))
+                if remaining > 0:
+                    click_email_signup_entry(
+                        page,
+                        log_callback=self.log_callback,
+                        timeout=min(12, remaining),
+                    )
 
             next_diag_at = 0.0
             next_inject_at = time.monotonic() + 4.0
-            next_nudge_at = time.monotonic() + 2.0
+            # Let the managed challenge settle before one cautious interaction.
+            # Fast repeated execute/click loops commonly amplify 300*/600* errors.
+            next_nudge_at = time.monotonic() + 18.0
             while time.monotonic() < deadline:
                 now = time.monotonic()
                 token = read_turnstile_token_from_page(page)
                 if len(token) >= min_len:
+                    break
+                try:
+                    challenge_error = str(
+                        page.run_js("return String(window.__xaiTsLastError || '')") or ""
+                    ).strip()
+                except Exception:
+                    challenge_error = ""
+                if challenge_error.startswith(("300", "600")):
                     break
                 if sitekey and now >= next_inject_at:
                     _ensure_injected_turnstile_widget(
@@ -996,7 +984,7 @@ class BrowserWorker:
                     next_inject_at = now + 4.0
                 if now >= next_nudge_at:
                     _nudge_turnstile_widget(page, log_callback=self.log_callback)
-                    next_nudge_at = now + 3.0
+                    next_nudge_at = now + 12.0
                 if diagnose and now >= next_diag_at:
                     snap = diagnose_page(page)
                     if isinstance(snap, dict):
@@ -1026,13 +1014,14 @@ class BrowserWorker:
                 "browser_proxy": browser_proxy,
                 "affinity_id": affinity_id,
                 "diagnostics": _summarize_diag(samples),
-                "sitekey": str(request.sitekey or ""),
-                "action": str(request.action or ""),
-                "cdata": str(request.cdata or ""),
+                "sitekey_present": bool(str(request.sitekey or "").strip()),
+                "action_present": bool(str(request.action or "").strip()),
+                "cdata_present": bool(str(request.cdata or "").strip()),
                 "accept_language": fingerprint.accept_language,
                 "language": fingerprint.navigator_language,
                 "cdp_user_agent_metadata": cdp_metadata,
                 "browser_version": browser_version,
+                "turnstile_error": challenge_error,
             }
             if len(token) < min_len:
                 # 超时/空 token 时，空 UAData 往往只是错误页副作用，不要盖住真正原因。
@@ -1055,7 +1044,11 @@ class BrowserWorker:
                     page_url=page_url,
                     user_agent=fingerprint.user_agent,
                     elapsed_ms=elapsed_ms,
-                    error=f"在 {timeout}s 内未捕获到可用 Turnstile token (len={len(token)}, min={min_len})",
+                    error=(
+                        f"Turnstile challenge error {challenge_error}"
+                        if challenge_error
+                        else f"在 {timeout}s 内未捕获到可用 Turnstile token (len={len(token)}, min={min_len})"
+                    ),
                     extras=extras,
                     fingerprint=fingerprint,
                 )
@@ -1151,9 +1144,14 @@ class BrowserWorker:
                 "platform": extras.get("platform") or "",
                 "client_hint_platform": extras.get("client_hint_platform") or "",
                 "browser_major": extras.get("browser_major") or "",
+                "turnstile_error": (
+                    extras.get("turnstile_error")
+                    or (extras.get("diagnostics") or {}).get("turnstile_error")
+                    or ""
+                ),
             }
             return token, effective_ua, diag
-        except Exception as parent_exc:
+        except ImportError as parent_exc:
             _log(self.log_callback, f"[Turnstile][warn] parent capture failed, fallback local: {parent_exc}")
 
         # 2) Local fallback path
@@ -1203,11 +1201,26 @@ class BrowserWorker:
             if browser_proxy:
                 try:
                     options.set_proxy(browser_proxy)
-                    _log(self.log_callback, f"[Turnstile] 浏览器代理: {browser_proxy}")
+                    _log(
+                        self.log_callback,
+                        f"[Turnstile] 浏览器代理: {_proxy_log_endpoint(browser_proxy)}",
+                    )
                 except Exception as exc:
                     raise RuntimeError(f"无法设置浏览器代理: {exc}") from exc
 
         browser = Chromium(options)
+        profile_dir = str(getattr(options, "_xai_profile_dir", "") or "")
+        initial_browser_pid = 0
+        for name in ("process_id", "pid", "_process_id"):
+            try:
+                value = getattr(browser, name, 0)
+                value = value() if callable(value) else value
+                initial_browser_pid = int(value or 0)
+            except Exception:
+                initial_browser_pid = 0
+            if initial_browser_pid > 1:
+                break
+        register_project_browser(initial_browser_pid, profile_dir)
         samples: List[Dict[str, Any]] = []
         try:
             tabs = getattr(browser, "get_tabs", lambda: [])()
@@ -1222,10 +1235,18 @@ class BrowserWorker:
             deadline = time.monotonic() + timeout
             started = time.monotonic()
             token = ""
+            challenge_error = ""
             next_diag_at = 0.0
+            next_nudge_at = time.monotonic() + 18.0
             while time.monotonic() < deadline:
                 now = time.monotonic()
                 token = read_turnstile_token_from_page(page)
+                try:
+                    challenge_error = str(
+                        page.run_js("return String(window.__xaiTsLastError || '')") or ""
+                    ).strip()
+                except Exception:
+                    challenge_error = ""
                 if diagnose and now >= next_diag_at:
                     snap = diagnose_page(page)
                     if isinstance(snap, dict):
@@ -1243,18 +1264,11 @@ class BrowserWorker:
                     next_diag_at = now + (5 if len(samples) <= 1 else 10)
                 if len(token) >= min_len:
                     break
-                try:
-                    page.run_js(
-                        """
-const nodes = Array.from(document.querySelectorAll('.cf-turnstile, [data-sitekey], iframe[src*="turnstile"], iframe[src*="challenges.cloudflare"]'));
-for (const n of nodes) {
-  try { n.scrollIntoView({block:'center', inline:'center'}); } catch (e) {}
-  try { n.click(); } catch (e) {}
-}
-"""
-                    )
-                except Exception:
-                    pass
+                if challenge_error.startswith(("300", "600")):
+                    break
+                if now >= next_nudge_at:
+                    _nudge_turnstile_widget(page, log_callback=self.log_callback)
+                    next_nudge_at = now + 12.0
                 time.sleep(1.0)
 
             if diagnose:
@@ -1271,6 +1285,7 @@ for (const n of nodes) {
                     effective_ua = ""
             diag = _summarize_diag(samples)
             diag["source"] = "local_fallback"
+            diag["turnstile_error"] = challenge_error
             _log(
                 self.log_callback,
                 f"[Turnstile] 捕获结束 token_len={len(token)} ua={'yes' if effective_ua else 'no'} "
@@ -1278,7 +1293,7 @@ for (const n of nodes) {
             )
             return token, effective_ua, diag
         finally:
-            browser_pid = 0
+            browser_pid = initial_browser_pid
             try:
                 for name in ("process_id", "pid", "_process_id"):
                     value = getattr(browser, name, 0)
@@ -1337,5 +1352,16 @@ for (const n of nodes) {
                             break
                         if pid <= 0:
                             break
+                except Exception:
+                    pass
+            try:
+                unregister_project_browser(browser_pid, profile_dir)
+            except Exception:
+                pass
+            if profile_dir:
+                try:
+                    import shutil
+
+                    shutil.rmtree(profile_dir, ignore_errors=True)
                 except Exception:
                     pass

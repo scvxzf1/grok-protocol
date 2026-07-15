@@ -21,7 +21,6 @@ class SolveBody(BaseModel):  # type: ignore[misc,valid-type]
     provider: str = "local"
     api_key: str = ""
     proxy: str = ""
-    parent_proxy: str = ""
     page_url: str = ""
     timeout_sec: int = 30
     headless: bool = False
@@ -81,7 +80,6 @@ def create_app(service: Optional[SolverService] = None):
                 action=body.action,
                 cdata=body.cdata,
                 diagnose=body.diagnose,
-                metadata={"parent_proxy": body.parent_proxy},
             )
         )
         # Tokens are single-consumer secrets. They leave the service only via consume.

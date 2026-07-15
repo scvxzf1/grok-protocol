@@ -53,7 +53,7 @@ function egressModeLabel(mode) {
 function egressModeHintText(mode) {
   const tips = {
     nodes: "VLESS/Hy2 订阅 → mihomo；不走 HTTP 池。",
-    http: "只走 proxies.txt / 订阅 HTTP。",
+    http: "只走 fixtures/proxies.txt / 订阅 HTTP。",
     hybrid: "节点池 + HTTP 池轮询，一边挂了换另一边。",
     direct: "所有任务用配置里的固定 HTTP 代理 URL。",
     auto: "有固定 URL 用固定，否则走 HTTP 池；默认不启节点池。",
@@ -731,7 +731,7 @@ function formatHttpPoolCompact(pool, opts = {}) {
   const source = (pool && (pool.proxy_pool_source || pool.source)) || "manual";
   const sourceLabel = source === "subscription" ? "订阅导入" : "手动维护";
   const count = Number((pool && pool.line_count) || 0);
-  const path = (pool && pool.path) || "proxies.txt";
+  const path = (pool && pool.path) || "fixtures/proxies.txt";
   const exists = !!(pool && pool.exists);
   const text = String((pool && pool.text) || "");
   const rows = text

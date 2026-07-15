@@ -92,7 +92,7 @@ function fill(data) {
   set("ms_mail_file", f.ms_mail_file || "");
   set("proxy_mode", f.proxy_mode || "auto");
   set("proxy", f.proxy || "");
-  set("proxy_file", f.proxy_file || "proxies.txt");
+  set("proxy_file", f.proxy_file || "fixtures/proxies.txt");
   set("proxy_pool_source", f.proxy_pool_source || "manual");
   const subUrls = Array.isArray(f.proxy_subscription_urls)
     ? f.proxy_subscription_urls
@@ -120,29 +120,25 @@ function fill(data) {
     "embedded_proxy_max_node_retries",
     f.embedded_proxy_max_node_retries == null ? 3 : f.embedded_proxy_max_node_retries
   );
-  set("proxy_parent", f.proxy_parent || "");
   set("local_proxy_port", f.local_proxy_port || 17890);
   set("proxy_random", !!f.proxy_random, true);
   set("proxy_rotate_session", !!f.proxy_rotate_session, true);
   set("turnstile_proxy_enabled", !!f.turnstile_proxy_enabled, true);
   set("turnstile_proxy_mode", f.turnstile_proxy_mode || "pool");
   set("turnstile_proxy", f.turnstile_proxy || "");
-  set("turnstile_proxy_file", f.turnstile_proxy_file || "turnstile_proxies.txt");
+  set("turnstile_proxy_file", f.turnstile_proxy_file || "fixtures/turnstile_proxies.txt");
   set("turnstile_proxy_random", f.turnstile_proxy_random !== false, true);
   set("xai_oauth_output_dir", f.xai_oauth_output_dir || "");
-  set("grok2api_remote_base", f.grok2api_remote_base || "");
-  set("grok2api_remote_app_key", f.grok2api_remote_app_key || "");
-  set("grok2api_pool_name", f.grok2api_pool_name || "");
   set("cpa_api_url", f.cpa_api_url || "");
   set("cpa_api_key", f.cpa_api_key || "");
   set("cpa_auto_upload", !!f.cpa_auto_upload, true);
   set("cpa_use_local_name", f.cpa_use_local_name !== false, true);
   set("cpa_skip_duplicates", f.cpa_skip_duplicates !== false, true);
 
-  ["yyds_api_key","yyds_jwt","turnstile_api_key","cloudflare_api_key","duckmail_api_key","grok2api_remote_app_key","cpa_api_key"]
+  ["yyds_api_key","yyds_jwt","turnstile_api_key","cloudflare_api_key","duckmail_api_key","cpa_api_key"]
     .forEach(k => setFlag(k, !!flags[k] || !!(f[k] && String(f[k]).trim())));
   // Mark which secrets were loaded non-empty so empty-save only clears intentional edits.
-  ["yyds_api_key","yyds_jwt","turnstile_api_key","cloudflare_api_key","duckmail_api_key","grok2api_remote_app_key","cpa_api_key"].forEach((k) => {
+  ["yyds_api_key","yyds_jwt","turnstile_api_key","cloudflare_api_key","duckmail_api_key","cpa_api_key"].forEach((k) => {
     const el = fieldEl(k);
     if (!el) return;
     const has = !!(f[k] && String(f[k]).trim()) || !!flags[k];
@@ -252,19 +248,15 @@ function collectFields() {
   if (present("embedded_proxy_probe_port")) put("embedded_proxy_probe_port", Number(g("embedded_proxy_probe_port") || 443));
   if (present("embedded_proxy_probe_timeout_sec")) put("embedded_proxy_probe_timeout_sec", Number(g("embedded_proxy_probe_timeout_sec") || 5));
   if (present("embedded_proxy_max_node_retries")) put("embedded_proxy_max_node_retries", Number(g("embedded_proxy_max_node_retries") || 3));
-  put("proxy_parent", g("proxy_parent"));
   if (present("local_proxy_port")) put("local_proxy_port", Number(g("local_proxy_port") || 17890));
   if (present("proxy_random")) put("proxy_random", g("proxy_random", true));
   if (present("proxy_rotate_session")) put("proxy_rotate_session", g("proxy_rotate_session", true));
   if (present("turnstile_proxy_enabled")) put("turnstile_proxy_enabled", g("turnstile_proxy_enabled", true, false));
   if (present("turnstile_proxy_mode")) put("turnstile_proxy_mode", g("turnstile_proxy_mode", false, "pool") || "pool");
   if (present("turnstile_proxy")) put("turnstile_proxy", g("turnstile_proxy", false, "") || "");
-  if (present("turnstile_proxy_file")) put("turnstile_proxy_file", g("turnstile_proxy_file", false, "turnstile_proxies.txt") || "turnstile_proxies.txt");
+  if (present("turnstile_proxy_file")) put("turnstile_proxy_file", g("turnstile_proxy_file", false, "fixtures/turnstile_proxies.txt") || "fixtures/turnstile_proxies.txt");
   if (present("turnstile_proxy_random")) put("turnstile_proxy_random", g("turnstile_proxy_random", true, true));
   put("xai_oauth_output_dir", g("xai_oauth_output_dir"));
-  put("grok2api_remote_base", g("grok2api_remote_base"));
-  putSecret("grok2api_remote_app_key");
-  put("grok2api_pool_name", g("grok2api_pool_name"));
   put("cpa_api_url", g("cpa_api_url"));
   putSecret("cpa_api_key");
   if (present("cpa_auto_upload")) put("cpa_auto_upload", g("cpa_auto_upload", true, false));
@@ -1466,7 +1458,6 @@ function syncAdvancedMirrorsFromHidden() {
     ["embeddedProxyEnabledVisible", "embedded_proxy_enabled", "checked"],
     ["proxyFileVisible", "proxy_file", "value"],
     ["proxyRetriesVisible", "embedded_proxy_max_node_retries", "value"],
-    ["proxyParentVisible", "proxy_parent", "value"],
     ["localProxyPortVisible", "local_proxy_port", "value"],
     ["proxyRandomVisible", "proxy_random", "checked"],
     ["proxyRotateVisible", "proxy_rotate_session", "checked"],
@@ -1494,7 +1485,6 @@ function bindAdvancedMirrors() {
     ["embeddedProxyEnabledVisible", "embedded_proxy_enabled", "checked", "change"],
     ["proxyFileVisible", "proxy_file", "value", "input"],
     ["proxyRetriesVisible", "embedded_proxy_max_node_retries", "value", "input"],
-    ["proxyParentVisible", "proxy_parent", "value", "input"],
     ["localProxyPortVisible", "local_proxy_port", "value", "input"],
     ["proxyRandomVisible", "proxy_random", "checked", "change"],
     ["proxyRotateVisible", "proxy_rotate_session", "checked", "change"],

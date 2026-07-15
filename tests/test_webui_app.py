@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -73,7 +74,35 @@ class WebUIAppTests(unittest.TestCase):
             runs = root / "http_runs"
             rid = "demo_run"
             (runs / rid).mkdir(parents=True)
-            (runs / rid / "worker_001.log").write_text("hello", encoding="utf-8")
+            (runs / rid / "worker_001.log").write_text(
+                "hello private-mailbox@example.test "
+                "refresh_token=M.C_PRIVATE_REFRESH_TOKEN\n",
+                encoding="utf-8",
+            )
+            (runs / rid / "accounts_001.txt").write_text(
+                "private-mailbox@example.test----PASSWORD----SSO_TOKEN\n",
+                encoding="utf-8",
+            )
+            (runs / rid / "proxy_pool.snapshot.txt").write_text(
+                "proxy.example.test:9000:USER:PASSWORD\n",
+                encoding="utf-8",
+            )
+            (runs / rid / "summary.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": rid,
+                        "done": True,
+                        "workers": [
+                            {
+                                "index": 1,
+                                "status": "failed",
+                                "last_log": "private-mailbox@example.test refresh_token=M.C_PRIVATE_REFRESH_TOKEN",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
             service = self._service(root)
             app = webui_app.create_app(service=service)
             client = TestClient(app)
@@ -81,6 +110,29 @@ class WebUIAppTests(unittest.TestCase):
                 ok = client.get(f"/api/runs/{rid}/files", params={"path": "worker_001.log"})
                 self.assertEqual(ok.status_code, 200)
                 self.assertIn("hello", ok.text)
+                self.assertNotIn("private-mailbox@example.test", ok.text)
+                self.assertNotIn("M.C_PRIVATE_REFRESH_TOKEN", ok.text)
+                logs = client.get(f"/api/runs/{rid}/logs", params={"worker": 1})
+                self.assertEqual(logs.status_code, 200)
+                self.assertNotIn("private-mailbox@example.test", logs.text)
+                self.assertNotIn("M.C_PRIVATE_REFRESH_TOKEN", logs.text)
+                for private_name in ("accounts_001.txt", "proxy_pool.snapshot.txt"):
+                    private = client.get(
+                        f"/api/runs/{rid}/files",
+                        params={"path": private_name},
+                    )
+                    self.assertEqual(private.status_code, 403)
+                detail = client.get(f"/api/runs/{rid}")
+                self.assertEqual(detail.status_code, 200)
+                detail_text = json.dumps(detail.json(), ensure_ascii=False)
+                self.assertNotIn("private-mailbox@example.test", detail_text)
+                self.assertNotIn("M.C_PRIVATE_REFRESH_TOKEN", detail_text)
+                self.assertFalse(
+                    any(
+                        item["name"].startswith("accounts_")
+                        for item in detail.json().get("files", [])
+                    )
+                )
                 bad = client.get(f"/api/runs/{rid}/files", params={"path": "../secret.txt"})
                 self.assertIn(bad.status_code, {403, 404, 400})
 
@@ -150,10 +202,7 @@ class WebUIAppTests(unittest.TestCase):
             self.assertEqual(r.status_code, 200)
             self.assertEqual(r.json()["ok"], 1)
             page = client.get("/config/proxy")
-            self.assertTrue(
-                ("随机测试" in page.text) or ("测试注册代理池" in page.text),
-                page.text[:500],
-            )
+            self.assertIn("测试代理池", page.text)
 
     def test_embedded_proxy_status_and_reload_guard(self):
         with tempfile.TemporaryDirectory() as d:
@@ -217,7 +266,8 @@ class WebUIAppTests(unittest.TestCase):
             self.assertEqual(page.status_code, 200)
             self.assertIn("embedded_proxy_enabled", page.text)
             self.assertIn("btnEmbeddedProbe", page.text)
-            self.assertIn("内嵌", page.text)
+            self.assertIn("节点池", page.text)
+            self.assertIn("mihomo", page.text)
             self.assertIn("embedded_proxy_base_port", page.text)
             self.assertIn("btnEmbeddedStart", page.text)
             self.assertIn("btnEmbeddedFetchSub", page.text)
@@ -594,6 +644,60 @@ class WebUIAppTests(unittest.TestCase):
                             if i > 2:
                                 break
             self.assertGreaterEqual(attached["n"], 1)
+
+    def test_webui_main_constructs_service_from_custom_config(self):
+        with tempfile.TemporaryDirectory() as d:
+            config_path = (Path(d) / "isolated-config.json").resolve()
+            service = object()
+            app = object()
+            with mock.patch.object(
+                webui_app,
+                "BatchService",
+                return_value=service,
+            ) as service_type, mock.patch.object(
+                webui_app,
+                "create_app",
+                return_value=app,
+            ) as create, mock.patch(
+                "uvicorn.run"
+            ) as run_server, mock.patch(
+                "builtins.print"
+            ) as printed:
+                rc = webui_app.main(
+                    [
+                        "--config",
+                        str(config_path),
+                        "--host",
+                        "127.0.0.1",
+                        "--port",
+                        "33999",
+                    ]
+                )
+
+            self.assertEqual(rc, 0)
+            service_type.assert_called_once_with(
+                config_path=config_path,
+                root_dir=webui_app.ROOT_DIR,
+            )
+            create.assert_called_once_with(service=service)
+            run_server.assert_called_once_with(
+                app,
+                host="127.0.0.1",
+                port=33999,
+                log_level="info",
+            )
+            printed_text = "\n".join(
+                " ".join(str(value) for value in call.args)
+                for call in printed.call_args_list
+            )
+            self.assertNotIn(str(config_path), printed_text)
+
+    def test_webui_parser_uses_config_environment_default(self):
+        with tempfile.TemporaryDirectory() as d:
+            config_path = str((Path(d) / "env-config.json").resolve())
+            with mock.patch.dict(os.environ, {"XAI_CONFIG_PATH": config_path}):
+                args = webui_app.build_parser().parse_args([])
+            self.assertEqual(args.config, config_path)
 
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@ from typing import Dict, List, Optional
 from turnstile_broker import build_canonical_fingerprint_profile
 
 from .browser_runtime import _read_browser_full_version
-from .config import SolverConfig, load_config
+from .config import MAX_SUBMIT_WORKERS, SolverConfig, load_config
 from .models import SolveRequest
 from .service import SolverService
 
@@ -31,11 +31,6 @@ def build_parser() -> argparse.ArgumentParser:
     solve = sub.add_parser("solve", help="Capture one Turnstile token via local Chrome")
     solve.add_argument("--config", default="", help="Path to solver config JSON")
     solve.add_argument("--proxy", default="", help="Proxy URL/string for this task")
-    solve.add_argument(
-        "--parent-proxy",
-        default="",
-        help="Optional parent proxy (e.g. Clash http://127.0.0.1:7890)",
-    )
     solve.add_argument("--page-url", default="", help="Signup page URL")
     solve.add_argument("--timeout-sec", type=int, default=0)
     solve.add_argument("--headless", action="store_true")
@@ -156,6 +151,8 @@ def _apply_serve_overrides(args: argparse.Namespace, config: SolverConfig) -> No
     ):
         value = int(getattr(args, name, 0) or 0)
         if value > 0:
+            if name == "submit_workers":
+                value = min(MAX_SUBMIT_WORKERS, value)
             setattr(config, name, value)
 
 
@@ -190,7 +187,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     if args.command == "solve":
-        parent_proxy = args.parent_proxy or config.parent_proxy
         try:
             result = service.solve(
                 SolveRequest(
@@ -206,7 +202,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                     ),
                     expected_browser_major=int(fingerprint["expected_browser_major"]),
                     metadata={
-                        "parent_proxy": parent_proxy,
                         "diagnose": (not args.no_diagnose),
                     },
                 )
@@ -233,7 +228,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             )
             return 1
         app = create_app(service)
-        uvicorn.run(app, host=config.host, port=config.port, log_level="info", workers=1)
+        try:
+            uvicorn.run(app, host=config.host, port=config.port, log_level="info", workers=1)
+        finally:
+            service.close()
         return 0
 
     service.close()

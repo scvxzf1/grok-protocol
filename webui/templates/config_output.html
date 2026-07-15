@@ -15,7 +15,7 @@
     <div class="top-main">
       <div>
         <h1>产物 / 推送</h1>
-        <p class="muted">本机 {{ host }}:{{ port }} · OAuth 输出 · Grok2API · CPA 推送</p>
+        <p class="muted">本机 {{ host }}:{{ port }} · OAuth 输出 · CPA 推送</p>
       </div>
       <nav class="nav" aria-label="主导航">
         <a href="/" class="{% if active == 'run' %}active{% endif %}">运行台</a>
@@ -45,8 +45,8 @@
     </section>
     <form id="cfgCenterForm" class="cfg-form">
 <section class="panel">
-      <h2>产物与远端</h2>
-      <p class="muted">凭证写出目录与远端 grok2api 对接；与代理出口无关。</p>
+      <h2>产物目录</h2>
+      <p class="muted">凭证默认写入 .local/credentials；与代理出口无关。</p>
       <div class="form" id="outputForm">
         <label>
           <span class="field-title">
@@ -54,30 +54,6 @@
             <button type="button" class="help-tip" aria-label="说明" data-tip="SSO/凭证 JSON 写出目录">?</button>
           </span>
           <input name="xai_oauth_output_dir" type="text" />
-        </label>
-        <label>
-          <span class="field-title">
-            Grok2API Remote Base
-            <button type="button" class="help-tip" aria-label="说明" data-tip="远端 grok2api 站点或管理 API 地址">?</button>
-          </span>
-          <input name="grok2api_remote_base" type="text" />
-        </label>
-        <label>
-          <span class="field-title">
-            Grok2API App Key
-            <button type="button" class="help-tip" aria-label="说明" data-tip="远端 grok2api 的 app key">?</button>
-          </span>
-          <div class="secret-row">
-            <input name="grok2api_remote_app_key" type="text" placeholder="空=未配置" autocomplete="off" />
-          </div>
-          <span class="flag" data-flag="grok2api_remote_app_key"></span>
-        </label>
-        <label>
-          <span class="field-title">
-            Grok2API Pool Name
-            <button type="button" class="help-tip" aria-label="说明" data-tip="写入远端时使用的 token 池名称（不是代理池）">?</button>
-          </span>
-          <input name="grok2api_pool_name" type="text" />
         </label>
       </div>
     </section>

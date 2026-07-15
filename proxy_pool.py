@@ -11,10 +11,14 @@ import json
 import os
 import random
 import re
+import secrets
 import threading
 import time
-from typing import Any, Dict, List, Optional, Sequence
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Sequence, Union
 from urllib.parse import urlparse
+
+from local_paths import STATE_DIR
 
 
 _PROXY_STATS_DEFAULT = "proxy_stats.log"
@@ -36,7 +40,7 @@ def project_root() -> str:
 
 
 def default_stats_path() -> str:
-    return os.path.join(project_root(), _PROXY_STATS_DEFAULT)
+    return str(STATE_DIR / _PROXY_STATS_DEFAULT)
 
 
 def normalize_proxy_line(line: str) -> str:
@@ -241,6 +245,41 @@ def mask_proxy(proxy_str: str) -> str:
     return str(proxy_str or "")
 
 
+_CREDENTIAL_PROXY_RE = re.compile(
+    r"(?P<scheme>[a-zA-Z][a-zA-Z0-9+.-]*://)(?P<credentials>[^/@\s]+@)"
+)
+
+
+def redact_proxy_text(text: object, proxy_list: Sequence[str] = ()) -> str:
+    """Remove proxy credentials from diagnostic text before it is persisted.
+
+    Exact pool entries are replaced first so unusual usernames/passwords do not
+    defeat the generic URL pattern.  The function intentionally leaves host and
+    port visible because they are useful route diagnostics and are not secrets.
+    """
+    clean = str(text or "")
+    for proxy in proxy_list or ():
+        raw = str(proxy or "")
+        if raw and raw in clean:
+            clean = clean.replace(raw, mask_proxy(raw))
+    return _CREDENTIAL_PROXY_RE.sub(r"\g<scheme>***@", clean)
+
+
+@dataclass(frozen=True)
+class ProxyLease:
+    """Opaque exclusive binding between one task and one proxy entry."""
+
+    token: str = field(repr=False)
+    proxy: str = field(repr=False)
+    owner: str = field(default="", repr=False)
+    acquired_at: float = field(default=0.0, repr=False)
+    expires_at: float = field(default=0.0, repr=False)
+
+    @property
+    def masked_proxy(self) -> str:
+        return mask_proxy(self.proxy)
+
+
 class ProxyRotator:
     """Thread-safe weighted proxy rotator with dynamic cooldown + JSONL stats."""
 
@@ -251,6 +290,8 @@ class ProxyRotator:
         self._bad_proxies: Dict[str, float] = {}
         self._country_stats: Dict[str, Dict[str, Any]] = {}
         self._proxy_country: Dict[str, str] = {}
+        self._leases_by_token: Dict[str, ProxyLease] = {}
+        self._lease_token_by_proxy: Dict[str, str] = {}
         self._stats_file = stats_file or default_stats_path()
         for proxy in self._proxies:
             country = extract_country(proxy)
@@ -309,7 +350,7 @@ class ProxyRotator:
                 "result": result,
             }
             if reason:
-                rec["reason"] = str(reason)[:200]
+                rec["reason"] = redact_proxy_text(reason, self._proxies)[:200]
             parent = os.path.dirname(self._stats_file)
             if parent:
                 os.makedirs(parent, exist_ok=True)
@@ -318,48 +359,50 @@ class ProxyRotator:
         except Exception:
             pass
 
+    def _stats_for_proxy_locked(self, proxy_str: str) -> tuple[str, Dict[str, Any]]:
+        country = self._proxy_country.get(proxy_str) or extract_country(proxy_str)
+        self._proxy_country[proxy_str] = country
+        if country not in self._country_stats:
+            self._country_stats[country] = {
+                "success": 0,
+                "fail": 0,
+                "consecutive_fail": 0,
+                "last_fail_time": 0.0,
+            }
+        return country, self._country_stats[country]
+
+    def _record_result_locked(self, proxy_str: str, success: bool) -> str:
+        country, stats = self._stats_for_proxy_locked(proxy_str)
+        if success:
+            stats["success"] += 1
+            stats["consecutive_fail"] = 0
+        else:
+            stats["fail"] += 1
+            stats["consecutive_fail"] += 1
+            stats["last_fail_time"] = time.time()
+        return country
+
+    def _mark_bad_locked(self, proxy_str: str, cooldown_seconds: int = 0) -> None:
+        _country, stats = self._stats_for_proxy_locked(proxy_str)
+        if cooldown_seconds > 0:
+            cooldown = int(cooldown_seconds)
+        else:
+            consecutive = int(stats["consecutive_fail"] or 0)
+            cooldown = min(60 * (2 ** max(consecutive, 0)), 600)
+        self._bad_proxies[proxy_str] = time.time() + cooldown
+
     def record_result(self, proxy_str: str, success: bool, reason: str = "") -> None:
         if not proxy_str:
             return
-        country = self._proxy_country.get(proxy_str) or extract_country(proxy_str)
-        self._proxy_country[proxy_str] = country
         with self._lock:
-            if country not in self._country_stats:
-                self._country_stats[country] = {
-                    "success": 0,
-                    "fail": 0,
-                    "consecutive_fail": 0,
-                    "last_fail_time": 0.0,
-                }
-            st = self._country_stats[country]
-            if success:
-                st["success"] += 1
-                st["consecutive_fail"] = 0
-            else:
-                st["fail"] += 1
-                st["consecutive_fail"] += 1
-                st["last_fail_time"] = time.time()
+            country = self._record_result_locked(proxy_str, bool(success))
         self._append_log(country, proxy_str, "success" if success else "fail", reason)
 
     def mark_bad(self, proxy_str: str, cooldown_seconds: int = 0) -> None:
         if not proxy_str:
             return
-        country = self._proxy_country.get(proxy_str) or extract_country(proxy_str)
-        self._proxy_country[proxy_str] = country
         with self._lock:
-            if country not in self._country_stats:
-                self._country_stats[country] = {
-                    "success": 0,
-                    "fail": 0,
-                    "consecutive_fail": 0,
-                    "last_fail_time": 0.0,
-                }
-            if cooldown_seconds > 0:
-                cd = int(cooldown_seconds)
-            else:
-                cf = int(self._country_stats[country]["consecutive_fail"] or 0)
-                cd = min(60 * (2 ** max(cf, 0)), 600)
-            self._bad_proxies[proxy_str] = time.time() + cd
+            self._mark_bad_locked(proxy_str, cooldown_seconds=cooldown_seconds)
 
     def mark_good(self, proxy_str: str) -> None:
         if not proxy_str:
@@ -375,6 +418,145 @@ class ProxyRotator:
             del self._bad_proxies[proxy_str]
             return True
         return False
+
+    def _recover_expired_leases_locked(self, now: Optional[float] = None) -> int:
+        current = time.monotonic() if now is None else float(now)
+        expired = [
+            token
+            for token, lease in self._leases_by_token.items()
+            if lease.expires_at > 0 and current >= lease.expires_at
+        ]
+        for token in expired:
+            lease = self._leases_by_token.pop(token, None)
+            if lease is not None and self._lease_token_by_proxy.get(lease.proxy) == token:
+                self._lease_token_by_proxy.pop(lease.proxy, None)
+        return len(expired)
+
+    def recover_expired_leases(self) -> int:
+        """Return abandoned TTL leases to the free pool."""
+        with self._lock:
+            return self._recover_expired_leases_locked()
+
+    def acquire_lease(
+        self,
+        *,
+        owner: object = "",
+        ttl_seconds: float = 0.0,
+    ) -> Optional[ProxyLease]:
+        """Atomically lease one healthy, currently-unbound entry.
+
+        Unlike :meth:`next`, this never falls back to a cooled entry and never
+        hands one entry to two active owners.
+        """
+        if not self._proxies:
+            return None
+        with self._lock:
+            self._recover_expired_leases_locked()
+            available = [
+                proxy
+                for proxy in self._proxies
+                if proxy not in self._lease_token_by_proxy and self._is_available(proxy)
+            ]
+            if not available:
+                return None
+            if len(available) == 1:
+                proxy = available[0]
+            else:
+                weights = [
+                    self._country_weight(self._proxy_country.get(item, "??"))
+                    for item in available
+                ]
+                proxy = random.choices(available, weights=weights, k=1)[0]
+            now = time.monotonic()
+            ttl = max(0.0, float(ttl_seconds or 0.0))
+            token = secrets.token_urlsafe(24)
+            lease = ProxyLease(
+                token=token,
+                proxy=proxy,
+                owner=redact_proxy_text(owner, self._proxies)[:120],
+                acquired_at=now,
+                expires_at=(now + ttl) if ttl > 0 else 0.0,
+            )
+            self._leases_by_token[token] = lease
+            self._lease_token_by_proxy[proxy] = token
+            return lease
+
+    def release_lease(
+        self,
+        lease_or_token: Union[ProxyLease, str],
+        *,
+        success: Optional[bool] = None,
+        reason: str = "",
+        cooldown_seconds: int = 0,
+    ) -> bool:
+        """Release an exclusive lease once and optionally attribute its outcome.
+
+        A stale/duplicate token is a no-op and returns ``False``.  Health updates
+        happen after the lease map is unlocked, avoiding nested acquisition of
+        the rotator's non-reentrant lock.
+        """
+        token = (
+            lease_or_token.token
+            if isinstance(lease_or_token, ProxyLease)
+            else str(lease_or_token or "")
+        )
+        if not token:
+            return False
+        log_record: Optional[tuple[str, str]] = None
+        with self._lock:
+            lease = self._leases_by_token.pop(token, None)
+            if lease is None:
+                return False
+            if success is not None:
+                clean_reason = redact_proxy_text(reason, self._proxies)[:200]
+                country = self._record_result_locked(lease.proxy, bool(success))
+                if success:
+                    self._bad_proxies.pop(lease.proxy, None)
+                else:
+                    self._mark_bad_locked(
+                        lease.proxy,
+                        cooldown_seconds=cooldown_seconds,
+                    )
+                log_record = (country, clean_reason)
+            if self._lease_token_by_proxy.get(lease.proxy) == token:
+                self._lease_token_by_proxy.pop(lease.proxy, None)
+        if log_record is not None:
+            country, clean_reason = log_record
+            self._append_log(
+                country,
+                lease.proxy,
+                "success" if success else "fail",
+                clean_reason,
+            )
+        return True
+
+    def available_lease_count(self) -> int:
+        """Number of healthy entries that can be leased immediately."""
+        with self._lock:
+            self._recover_expired_leases_locked()
+            return sum(
+                1
+                for proxy in self._proxies
+                if proxy not in self._lease_token_by_proxy and self._is_available(proxy)
+            )
+
+    def active_lease_count(self) -> int:
+        with self._lock:
+            self._recover_expired_leases_locked()
+            return len(self._leases_by_token)
+
+    def lease_status(self) -> List[Dict[str, Any]]:
+        """Secret-free active lease diagnostics."""
+        with self._lock:
+            self._recover_expired_leases_locked()
+            return [
+                {
+                    "proxy": mask_proxy(lease.proxy),
+                    "owner": redact_proxy_text(lease.owner, self._proxies),
+                    "expires": bool(lease.expires_at > 0),
+                }
+                for lease in self._leases_by_token.values()
+            ]
 
     def _country_weight(self, country: str) -> float:
         st = self._country_stats.get(country)
@@ -393,6 +575,8 @@ class ProxyRotator:
             available: List[str] = []
             first_bad: Optional[str] = None
             for proxy in self._proxies:
+                if proxy in self._lease_token_by_proxy:
+                    continue
                 if self._is_available(proxy):
                     available.append(proxy)
                 elif first_bad is None:
@@ -421,8 +605,14 @@ class ProxyRotator:
             picked.append(item)
             if len(picked) >= count:
                 break
-        while len(picked) < count and self._proxies:
-            picked.append(random.choice(self._proxies))
+        with self._lock:
+            repeatable = [
+                proxy
+                for proxy in self._proxies
+                if proxy not in self._lease_token_by_proxy
+            ]
+        while len(picked) < count and repeatable:
+            picked.append(random.choice(repeatable))
         return picked[:count]
 
     def get_status(self) -> List[Dict[str, Any]]:
@@ -443,6 +633,7 @@ class ProxyRotator:
                         "status": status,
                         "cooldown_left": cooldown_left,
                         "country": self._proxy_country.get(proxy_str, "??"),
+                        "leased": proxy_str in self._lease_token_by_proxy,
                     }
                 )
             return rows

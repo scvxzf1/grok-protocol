@@ -588,6 +588,8 @@ class XAIHttpFlowTests(unittest.TestCase):
         self.assertIn("turnstile.render", js)
         self.assertIn("sign-up", js)
         self.assertIn("opaque", js)
+        self.assertIn("return true", js)
+        self.assertNotIn("turnstile.execute", js)
 
     def test_solve_turnstile_local_forwards_sitekey_metadata(self):
         logs = []
@@ -692,27 +694,16 @@ class XAIHttpFlowTests(unittest.TestCase):
         self.assertGreaterEqual(page.calls, 2)
 
 
-    def test_resolve_local_browser_mode_prefers_virtual_headed(self):
-        with mock.patch.object(flow, "_virtual_display_available", return_value=True):
-            mode, use_headless = flow._resolve_local_browser_mode(want_headless=True)
-        self.assertEqual(mode, "virtual-headed")
-        self.assertFalse(use_headless)
-
-    def test_resolve_local_browser_mode_falls_back_to_headless_new(self):
-        with mock.patch.object(flow, "_virtual_display_available", return_value=False), mock.patch.object(
-            flow, "_display_env_available", return_value=False
-        ):
-            mode, use_headless = flow._resolve_local_browser_mode(want_headless=True)
+    def test_resolve_local_browser_mode_uses_native_headless_new(self):
+        mode, use_headless = flow._resolve_local_browser_mode(want_headless=True)
         self.assertEqual(mode, "headless-new")
         self.assertTrue(use_headless)
 
-    def test_resolve_local_browser_mode_maps_headless_to_headed_without_xvfb(self):
-        with mock.patch.object(flow, "_virtual_display_available", return_value=False), mock.patch.object(
-            flow, "_display_env_available", return_value=True
-        ):
+    def test_resolve_local_browser_mode_does_not_depend_on_display(self):
+        with mock.patch.dict(flow.os.environ, {"DISPLAY": ":99"}):
             mode, use_headless = flow._resolve_local_browser_mode(want_headless=True)
-        self.assertEqual(mode, "headed")
-        self.assertFalse(use_headless)
+        self.assertEqual(mode, "headless-new")
+        self.assertTrue(use_headless)
 
     def test_resolve_local_browser_mode_headed(self):
         mode, use_headless = flow._resolve_local_browser_mode(want_headless=False)
@@ -906,6 +897,18 @@ class XAIHttpFlowTests(unittest.TestCase):
         self.assertTrue(flow._proxy_has_embedded_auth("http://user:pass@host:1000"))
         self.assertFalse(flow._proxy_has_embedded_auth("http://127.0.0.1:17890"))
         self.assertFalse(flow._proxy_has_embedded_auth("http://host:1000"))
+
+    def test_http_cli_has_no_parent_proxy_option(self):
+        parser = flow.build_parser()
+        subparsers = next(
+            action
+            for action in parser._actions
+            if isinstance(getattr(action, "choices", None), dict)
+            and "register" in action.choices
+        )
+        for command in ("credential", "register", "mail-probe", "turnstile-capture"):
+            destinations = {action.dest for action in subparsers.choices[command]._actions}
+            self.assertNotIn("proxy_parent", destinations)
 
     def test_prepare_browser_proxy_auth_uses_forwarder(self):
         logs = []

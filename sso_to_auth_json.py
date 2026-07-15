@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SSO / Token → xai_credentials
+SSO / Token → .local/credentials
 
 模式:
   auth   : SSO cookie 走 Device Flow 鉴权后写出 xai-*.json（默认）
@@ -8,10 +8,10 @@ SSO / Token → xai_credentials
 
 用法:
   # 鉴权（并发）
-  python3 sso_to_auth_json.py --mode auth --sso sso_list.txt --out-dir ./xai_credentials --workers 10
+  python3 sso_to_auth_json.py --mode auth --sso sso_list.txt --out-dir .local/credentials --workers 10
 
   # 不鉴权：输入已是 access_token / JSON 凭证 / grok auth 片段
-  python3 sso_to_auth_json.py --mode noauth --sso tokens.txt --out-dir ./xai_credentials --workers 20
+  python3 sso_to_auth_json.py --mode noauth --sso tokens.txt --out-dir .local/credentials --workers 20
 """
 from __future__ import annotations
 
@@ -32,6 +32,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from curl_cffi import requests
+from local_paths import CONFIG_PATH, CREDENTIALS_DIR
 
 CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 OIDC_ISSUER = "https://auth.x.ai"
@@ -544,7 +545,7 @@ def _maybe_auto_push_cpa(path: Path, *, prefix: str = "") -> None:
     try:
         import cpa_push
 
-        cfg_path = Path(__file__).resolve().parent / "config.json"
+        cfg_path = CONFIG_PATH
         cfg = {}
         if cfg_path.is_file():
             try:
@@ -656,11 +657,11 @@ def run_pool(items: list, worker_fn, workers: int, out_dir: Path, email: str) ->
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="SSO/Token → xai_credentials（鉴权/不鉴权）")
+    ap = argparse.ArgumentParser(description="SSO/Token → .local/credentials（鉴权/不鉴权）")
     ap.add_argument("--mode", choices=["auth", "noauth"], default="auth", help="auth=鉴权, noauth=不鉴权仅转换")
     ap.add_argument("--sso", metavar="FILE", help="输入列表文件")
     ap.add_argument("--sso-cookie", metavar="TEXT", help="单行输入")
-    ap.add_argument("--out-dir", default=None, help="输出目录（默认 ./xai_credentials）")
+    ap.add_argument("--out-dir", default=None, help="输出目录（默认 .local/credentials）")
     ap.add_argument("--out", default=None, help="兼容旧参数")
     ap.add_argument("--workers", type=int, default=8, help="并发数（默认 8）")
     ap.add_argument("--email", default="", help="统一 email（可选）")
@@ -673,18 +674,18 @@ def main() -> int:
         p = Path(args.out)
         out_dir = p if p.suffix == "" else p.parent
     else:
-        out_dir = Path.cwd() / "xai_credentials"
+        out_dir = CREDENTIALS_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
 
     mode = args.mode
     if mode == "auth":
         items = load_sso_list(args.sso, args.sso_cookie)
         worker = process_auth_one
-        title = "鉴权模式 SSO → xai_credentials"
+        title = "鉴权模式 SSO → .local/credentials"
     else:
         items = load_input_lines(args.sso, args.sso_cookie)
         worker = process_noauth_one
-        title = "不鉴权模式 格式转换 → xai_credentials"
+        title = "不鉴权模式 格式转换 → .local/credentials"
 
     if not items:
         ap.error("需要 --sso 或 --sso-cookie")

@@ -83,7 +83,6 @@ def make_slot(browser, *, worker=None):
     locale = config.locale or accept_language.split(",", 1)[0].split(";", 1)[0].strip()
     affinity = BrowserAffinity.build(
         proxy=request.proxy or config.proxy,
-        parent_proxy=str((request.metadata or {}).get("parent_proxy") or config.parent_proxy or ""),
         user_agent=request.user_agent or config.user_agent,
         headless=bool(request.headless or config.headless),
         locale=locale,
@@ -100,7 +99,6 @@ def make_slot(browser, *, worker=None):
         worker,
         affinity=affinity,
         upstream_proxy="",
-        parent_proxy="",
         user_agent=request.user_agent or config.user_agent,
     )
     slot.browser = browser

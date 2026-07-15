@@ -41,14 +41,12 @@ class BrowserAffinityTests(unittest.TestCase):
     def test_proxy_credentials_affect_affinity_without_exposure(self):
         first = BrowserAffinity.build(
             proxy="http://user-a:secret@127.0.0.1:8080",
-            parent_proxy="",
             user_agent="",
             headless=False,
             locale="zh-CN",
         )
         second = BrowserAffinity.build(
             proxy="http://user-b:secret@127.0.0.1:8080",
-            parent_proxy="",
             user_agent="",
             headless=False,
             locale="zh-CN",
@@ -57,7 +55,7 @@ class BrowserAffinityTests(unittest.TestCase):
         self.assertNotIn("secret", repr(first))
 
     def test_ua_and_mode_are_strict_affinity_fields(self):
-        base = dict(proxy="", parent_proxy="", locale="")
+        base = dict(proxy="", locale="")
         headed = BrowserAffinity.build(user_agent="UA-1", headless=False, **base)
         headless = BrowserAffinity.build(user_agent="UA-1", headless=True, **base)
         other_ua = BrowserAffinity.build(user_agent="UA-2", headless=False, **base)
@@ -67,7 +65,6 @@ class BrowserAffinityTests(unittest.TestCase):
     def test_browser_binary_and_expected_platform_are_affinity_fields(self):
         base = dict(
             proxy="",
-            parent_proxy="",
             user_agent="UA",
             headless=False,
             locale="zh-CN",
@@ -91,7 +88,6 @@ class BrowserAffinityTests(unittest.TestCase):
     def test_no_sandbox_is_an_explicit_affinity_field(self):
         base = dict(
             proxy="",
-            parent_proxy="",
             user_agent="UA",
             headless=False,
             locale="zh-CN",
