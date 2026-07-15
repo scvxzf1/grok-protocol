@@ -80,12 +80,19 @@ function markActiveExportRow(name) {
 }
 
 async function previewExport(name) {
-  const data = await api(`/api/credential-exports/preview?name=${encodeURIComponent(name)}`);
+  // 拉满原始 json____sso 全文（后端上限 2MB，覆盖每页最多 1000 条导出）
+  const data = await api(
+    `/api/credential-exports/preview?name=${encodeURIComponent(name)}&max_chars=2000000`
+  );
   const lines = Number(data.line_count || 0);
   const size = formatBytes(data.size);
-  const trunc = data.truncated ? " · 内容过长已截断预览" : "";
+  const text = String(data.text || "");
+  const shownLines = text ? text.split("\n").filter((l, i, arr) => l || i < arr.length - 1).length : 0;
+  const trunc = data.truncated
+    ? ` · 内容过长已截断预览（已显示约 ${shownLines}/${lines} 行，请点下载看全文）`
+    : ` · 完整原文 ${shownLines} 行`;
   setExportPreview(
-    data.text || "",
+    text,
     `正在查看: ${data.name || name} · ${lines} 行 · ${size}${trunc}`
   );
   markActiveExportRow(String(data.name || name));
