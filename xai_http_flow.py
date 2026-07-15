@@ -17,7 +17,7 @@ import argparse
 import ast
 import asyncio
 import concurrent.futures
-import fcntl
+import functools
 import html as html_lib
 import json
 import os
@@ -37,6 +37,17 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
 
 from curl_cffi import requests
+
+from cross_process_lock import (
+    CrossProcessFileLock,
+    CrossProcessLockTimeout,
+    atomic_write_private_lines,
+    atomic_write_private_text,
+    configured_lock_timeout,
+    ensure_private_file,
+)
+from project_browser_registry import register_project_browser, unregister_project_browser
+from local_paths import ACCOUNTS_DIR, CONFIG_PATH, CREDENTIALS_DIR, STATE_DIR
 
 from turnstile_broker import (
     FingerprintProfile,
@@ -95,16 +106,31 @@ def build_runtime_fingerprint_profile(
     return DEFAULT_FINGERPRINT
 
 
+def _is_tls_transport_error(exc: BaseException) -> bool:
+    """Identify handshake/transport failures that can use another TLS profile."""
 
-def _session_with_impersonate_fallback(impersonate: str, *, log_callback: LogFn = None) -> Any:
-    """Create curl_cffi Session, falling back when impersonate target is unsupported."""
+    text = str(exc or "").lower()
+    markers = (
+        "curl: (35)",
+        "tls connect error",
+        "ssl connect error",
+        "openssl_internal",
+        "wrong version number",
+        "schannel",
+        "handshake failure",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _impersonate_fallback_chain(primary: str) -> List[str]:
+    """Return a bounded, installed curl_cffi impersonation fallback chain."""
+
     from turnstile_broker import _impersonate_for_browser_major, _impersonate_is_usable
 
-    candidates = []
-    primary = str(impersonate or "").strip()
-    if primary:
-        candidates.append(primary)
+    selected = str(primary or "").strip()
+    candidates: List[str] = []
     for name in (
+        selected,
         _impersonate_for_browser_major("136"),
         "chrome136",
         "chrome131",
@@ -112,13 +138,52 @@ def _session_with_impersonate_fallback(impersonate: str, *, log_callback: LogFn 
         "chrome120",
         "chrome",
     ):
-        if name and name not in candidates:
-            candidates.append(name)
+        normalized = str(name or "").strip()
+        if not normalized or normalized in candidates:
+            continue
+        if normalized != selected and not _impersonate_is_usable(normalized):
+            continue
+        candidates.append(normalized)
+    return candidates
+
+
+def _rebuild_session_with_impersonate(client: Any, impersonate: str) -> None:
+    """Replace a client session while retaining its headers and cookie jar."""
+
+    previous = getattr(client, "session", None)
+    session = requests.Session(impersonate=str(impersonate or "chrome"))
+    previous_headers = getattr(previous, "headers", None)
+    if previous_headers is not None:
+        try:
+            session.headers.update(dict(previous_headers))
+        except Exception:
+            pass
+    previous_cookies = getattr(previous, "cookies", None)
+    if previous_cookies is not None:
+        try:
+            session.cookies.update(previous_cookies)
+        except Exception:
+            try:
+                jar = getattr(previous_cookies, "jar", None)
+                if jar is not None:
+                    session.cookies.update(jar)
+            except Exception:
+                pass
+    try:
+        setattr(session, "_xai_impersonate", str(impersonate or "chrome"))
+    except Exception:
+        pass
+    client.session = session
+
+
+
+def _session_with_impersonate_fallback(impersonate: str, *, log_callback: LogFn = None) -> Any:
+    """Create curl_cffi Session, falling back when impersonate target is unsupported."""
+    primary = str(impersonate or "").strip()
+    candidates = _impersonate_fallback_chain(primary)
 
     last_error: Optional[Exception] = None
     for name in candidates:
-        if name != primary and not _impersonate_is_usable(name):
-            continue
         try:
             session = requests.Session(impersonate=name)
             # Force-materialize impersonate support on versions that fail lazily.
@@ -130,6 +195,10 @@ def _session_with_impersonate_fallback(impersonate: str, *, log_callback: LogFn 
                     raise
             if name != primary:
                 _log(log_callback, f"[HTTP][warn] impersonate 回退: {primary or '-'} -> {name}")
+            try:
+                setattr(session, "_xai_impersonate", name)
+            except Exception:
+                pass
             return session
         except Exception as exc:
             last_error = exc
@@ -174,6 +243,10 @@ def is_email_domain_rejected_error(exc: BaseException | str) -> bool:
 
 class MailboxError(XAIHttpFlowError):
     """Raised by the optional Cloudflare temporary mailbox adapter."""
+
+
+class MailboxPoolLockTimeout(MailboxError):
+    """Raised when a mailbox pool transaction cannot acquire its lock."""
 
 
 @dataclass
@@ -845,7 +918,6 @@ def _proxy_has_embedded_auth(proxy: str) -> bool:
 def _prepare_browser_proxy(
     proxy: str = "",
     *,
-    parent_proxy: str = "",
     preferred_local_port: int = 0,
     instance_key: str = "",
     log_callback: LogFn = None,
@@ -853,25 +925,22 @@ def _prepare_browser_proxy(
     """Resolve a proxy URL that Chromium/DrissionPage can actually consume.
 
     Chrome rejects ``http://user:pass@host:port`` with ``ERR_NO_SUPPORTED_PROXIES``.
-    When credentials (or a parent chain) are present, expose a local no-auth
-    forwarder on ``127.0.0.1`` and inject ``Proxy-Authorization`` upstream.
+    When credentials are present, expose a local no-auth forwarder on
+    ``127.0.0.1`` and inject ``Proxy-Authorization`` upstream.
 
     Returns ``(browser_proxy_url, forwarder_instance_key)``.
     """
     proxy = str(proxy or "").strip()
-    parent = str(parent_proxy or "").strip()
-    if not proxy and not parent:
+    if not proxy:
         return "", ""
-    if parent and not proxy:
-        raise XAIHttpFlowError("设置 parent_proxy 时必须同时提供上游 proxy")
 
     # Local no-auth endpoints are already browser-safe.
     parts = _parse_proxy_components(proxy)
     host = str(parts.get("host") or "").lower()
-    if host in {"127.0.0.1", "localhost", "::1"} and not parent and not _proxy_has_embedded_auth(proxy):
+    if host in {"127.0.0.1", "localhost", "::1"} and not _proxy_has_embedded_auth(proxy):
         return normalize_proxy(proxy), ""
 
-    needs_forwarder = bool(parent) or _proxy_has_embedded_auth(proxy)
+    needs_forwarder = _proxy_has_embedded_auth(proxy)
     if not needs_forwarder:
         return normalize_proxy(proxy), ""
 
@@ -883,7 +952,6 @@ def _prepare_browser_proxy(
             proxy,
             preferred_local_port=int(preferred_local_port or 0),
             instance_key=key,
-            parent_proxy_raw=parent,
         )
     except Exception as exc:
         raise XAIHttpFlowError(f"本地代理转发启动失败: {exc}") from exc
@@ -1377,8 +1445,8 @@ def _validate_local_fingerprint(
         )
     expected_primary = str(expected_language or "").split(",", 1)[0].split(";", 1)[0].strip().lower()
     observed_primary = str(observed_language or "").strip().lower()
-    # Only compare when the browser actually reported a value. Some headless /
-    # virtual-headed sessions transiently return empty language/platform fields.
+    # Only compare when the browser actually reported a value. Some startup/error
+    # pages transiently return empty language/platform fields.
     if expected_primary and observed_primary and observed_primary != expected_primary:
         raise VerificationRequiredError(
             "local Turnstile 浏览器语言与 HTTP 会话指纹不一致"
@@ -1649,13 +1717,9 @@ def solve_turnstile_result(
         )
     except (TypeError, ValueError):
         reported_token_length = 0
-    # Local broker may return token_length via lease/extras, or only a lease_id
-    # with the real token available on /consume. Empty body token is OK then.
-    lease_ok = bool(lease_id) and (
-        reported_token_length >= 80 or reported_token_length == 0
-    )
-    if lease_id and 0 < reported_token_length < 80:
-        lease_ok = False
+    # A lease-only response must report a plausible server-side token length;
+    # a bare lease id cannot prove that /consume has a usable token.
+    lease_ok = bool(lease_id) and reported_token_length >= 80
     if token_length < 80 and not lease_ok:
         raise VerificationRequiredError(
             f"{normalized_provider} 返回的 Turnstile token 无效 "
@@ -1861,7 +1925,43 @@ class BrowserlessXAIClient:
         if self.proxies and "proxies" not in kwargs:
             kwargs["proxies"] = self.proxies
         fn = getattr(self.session, method.lower())
-        return fn(url, **kwargs)
+        try:
+            return fn(url, **kwargs)
+        except Exception as exc:
+            if not _is_tls_transport_error(exc):
+                raise
+            fingerprint = getattr(self, "fingerprint", None)
+            primary = str(getattr(fingerprint, "impersonate", "") or "").strip()
+            active = str(vars(self).get("_active_impersonate") or "").strip()
+            if not active:
+                active = str(getattr(self.session, "_xai_impersonate", "") or "").strip()
+            active = active or primary
+            candidates = _impersonate_fallback_chain(primary)
+            try:
+                start_index = candidates.index(active)
+            except ValueError:
+                try:
+                    start_index = candidates.index(primary)
+                except ValueError:
+                    start_index = -1
+            last_error: Exception = exc
+            for candidate in candidates[start_index + 1 :]:
+                _log(
+                    self.log_callback,
+                    f"[HTTP][warn] TLS transport 失败，impersonate 重试: "
+                    f"{active or '-'} -> {candidate}",
+                )
+                try:
+                    _rebuild_session_with_impersonate(self, candidate)
+                    self._active_impersonate = candidate
+                    fn = getattr(self.session, method.lower())
+                    return fn(url, **kwargs)
+                except Exception as retry_exc:
+                    if not _is_tls_transport_error(retry_exc):
+                        raise
+                    last_error = retry_exc
+                    active = candidate
+            raise last_error
 
     def _assert_normal_page(self, response: Any, stage: str) -> None:
         if _is_cf_interstitial(response):
@@ -2668,7 +2768,7 @@ class CloudflareTempMailbox:
 
 # Cross-process local Turnstile browser limiter.
 # Each register worker is a separate process; without this, 4 workers open 4
-# Chrome+Xvfb at once and thrash each other (disconnect / empty timeout).
+# Chrome processes at once and thrash each other (disconnect / empty timeout).
 _LOCAL_TURNSTILE_LOCK_PATH = Path(
     os.environ.get("XAI_LOCAL_TURNSTILE_LOCK_PATH")
     or (Path(tempfile.gettempdir()) / "xai-local-turnstile.lock")
@@ -2680,18 +2780,19 @@ _LOCAL_TURNSTILE_SLOT_DIR = Path(
 DEFAULT_LOCAL_TURNSTILE_MAX_INFLIGHT = 2
 MIN_LOCAL_TURNSTILE_MAX_INFLIGHT = 1
 MAX_LOCAL_TURNSTILE_MAX_INFLIGHT = 12
+LOCAL_TURNSTILE_LOCK_TIMEOUT_SEC = configured_lock_timeout(
+    "XAI_LOCAL_TURNSTILE_LOCK_TIMEOUT_SEC",
+    default=120.0,
+)
 
 
 def _load_turnstile_inflight_config_fallback() -> Dict[str, Any]:
-    """Best-effort read of project config.json for cross-process slot limits."""
+    """Best-effort read of the active local config for cross-process slot limits."""
     candidates = []
     env_cfg = str(os.environ.get("XAI_CONFIG_PATH") or os.environ.get("XAI_MAIL_CONFIG") or "").strip()
     if env_cfg:
         candidates.append(Path(env_cfg))
-    # common: cwd/config.json next to running register worker
-    candidates.append(Path.cwd() / "config.json")
-    here = Path(__file__).resolve().parent
-    candidates.append(here / "config.json")
+    candidates.append(CONFIG_PATH)
     for path in candidates:
         try:
             if path.is_file():
@@ -2761,34 +2862,47 @@ def _local_turnstile_slot(*, max_inflight: Optional[int] = None, log_callback: L
 
     slot_dir = _LOCAL_TURNSTILE_SLOT_DIR
     slot_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(slot_dir, 0o700)
+    except OSError:
+        pass
     gate_path = _LOCAL_TURNSTILE_LOCK_PATH
     gate_path.parent.mkdir(parents=True, exist_ok=True)
-    gate = open(gate_path, "a+", encoding="utf-8")
-    handle = None
+    slot_lock: Optional[CrossProcessFileLock] = None
     slot_idx = None
     waited = False
     started_wait = time.monotonic()
+    deadline = started_wait + LOCAL_TURNSTILE_LOCK_TIMEOUT_SEC
     try:
         while True:
-            fcntl.flock(gate.fileno(), fcntl.LOCK_EX)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise CrossProcessLockTimeout(
+                    gate_path,
+                    LOCAL_TURNSTILE_LOCK_TIMEOUT_SEC,
+                )
             try:
-                for i in range(limit):
-                    path_i = slot_dir / f"slot-{i}.lock"
-                    fh = open(path_i, "a+", encoding="utf-8")
-                    try:
-                        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    except BlockingIOError:
+                with CrossProcessFileLock(
+                    gate_path,
+                    timeout=min(1.0, remaining),
+                ):
+                    for i in range(limit):
+                        candidate = CrossProcessFileLock(
+                            slot_dir / f"slot-{i}.lock",
+                            timeout=0.0,
+                        )
                         try:
-                            fh.close()
-                        except Exception:
-                            pass
-                        continue
-                    handle = fh
-                    slot_idx = i
-                    break
-            finally:
-                fcntl.flock(gate.fileno(), fcntl.LOCK_UN)
-            if handle is not None:
+                            candidate.acquire()
+                        except CrossProcessLockTimeout:
+                            continue
+                        slot_lock = candidate
+                        slot_idx = i
+                        break
+            except CrossProcessLockTimeout:
+                # Another worker is scanning the small slot set.  Retry within
+                # the overall bounded wait rather than failing on the gate.
+                pass
+            if slot_lock is not None:
                 break
             if not waited:
                 waited = True
@@ -2796,7 +2910,7 @@ def _local_turnstile_slot(*, max_inflight: Optional[int] = None, log_callback: L
                     log_callback,
                     f"[Turnstile] 本地求解排队中（全局限流 {limit} 路浏览器，避免 4 并发互挤）",
                 )
-            time.sleep(0.35)
+            time.sleep(min(0.35, max(0.01, deadline - time.monotonic())))
         wait_ms = int((time.monotonic() - started_wait) * 1000)
         if waited:
             _log(
@@ -2805,19 +2919,8 @@ def _local_turnstile_slot(*, max_inflight: Optional[int] = None, log_callback: L
             )
         yield {"slot": slot_idx, "limit": limit, "wait_ms": wait_ms}
     finally:
-        if handle is not None:
-            try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-            except Exception:
-                pass
-            try:
-                handle.close()
-            except Exception:
-                pass
-        try:
-            gate.close()
-        except Exception:
-            pass
+        if slot_lock is not None:
+            slot_lock.release()
 
 
 # Cross-process YYDS account-create limiter.
@@ -2839,6 +2942,10 @@ _YYDS_DOMAIN_RR_LOCK_PATH = Path(
 _YYDS_DOMAIN_RR_STATE_PATH = Path(
     os.environ.get("XAI_YYDS_DOMAIN_RR_STATE_PATH")
     or (Path(tempfile.gettempdir()) / "xai-yyds-domain-rr-state.json")
+)
+YYDS_FILE_LOCK_TIMEOUT_SEC = configured_lock_timeout(
+    "XAI_YYDS_FILE_LOCK_TIMEOUT_SEC",
+    default=120.0,
 )
 
 
@@ -2891,22 +2998,13 @@ def _yyds_create_spacing_sec(config: Optional[Dict[str, Any]] = None) -> float:
 
 @contextmanager
 def _yyds_create_file_lock():
-    """Exclusive flock around YYDS create pacing + request."""
+    """Exclusive cross-process lock around YYDS create pacing + request."""
     lock_path = _YYDS_CREATE_LOCK_PATH
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    handle = open(lock_path, "a+", encoding="utf-8")
-    try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        yield handle
-    finally:
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        except OSError:
-            pass
-        try:
-            handle.close()
-        except OSError:
-            pass
+    with CrossProcessFileLock(
+        lock_path,
+        timeout=YYDS_FILE_LOCK_TIMEOUT_SEC,
+    ) as lock:
+        yield lock
 
 
 def _yyds_read_last_create_at() -> float:
@@ -2925,20 +3023,12 @@ def _yyds_write_last_create_at(ts: float) -> None:
     path = _YYDS_CREATE_STATE_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps({"last_create_at": float(ts)}, ensure_ascii=False)
-    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
     try:
-        tmp.write_text(payload, encoding="utf-8")
-        os.replace(tmp, path)
+        atomic_write_private_text(path, payload)
     except OSError:
-        try:
-            path.write_text(payload, encoding="utf-8")
-        except OSError:
-            pass
-        try:
-            if tmp.exists():
-                tmp.unlink()
-        except OSError:
-            pass
+        # Keep the last complete timestamp rather than publishing a partial
+        # fallback file after an interrupted atomic replace.
+        pass
 
 
 def _yyds_wait_create_slot() -> None:
@@ -3012,20 +3102,11 @@ def _yyds_normalize_domain_list(raw: Any) -> List[str]:
 @contextmanager
 def _yyds_domain_rr_lock():
     lock_path = _YYDS_DOMAIN_RR_LOCK_PATH
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    handle = open(lock_path, "a+", encoding="utf-8")
-    try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        yield handle
-    finally:
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        except OSError:
-            pass
-        try:
-            handle.close()
-        except OSError:
-            pass
+    with CrossProcessFileLock(
+        lock_path,
+        timeout=YYDS_FILE_LOCK_TIMEOUT_SEC,
+    ) as lock:
+        yield lock
 
 
 def _yyds_read_domain_rr_state() -> Dict[str, Any]:
@@ -3067,20 +3148,11 @@ def _yyds_write_domain_rr_state(*, index: int, rejected: Optional[List[str]] = N
         },
         ensure_ascii=False,
     )
-    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
     try:
-        tmp.write_text(payload, encoding="utf-8")
-        os.replace(tmp, path)
+        atomic_write_private_text(path, payload)
     except OSError:
-        try:
-            path.write_text(payload, encoding="utf-8")
-        except OSError:
-            pass
-        try:
-            if tmp.exists():
-                tmp.unlink()
-        except OSError:
-            pass
+        # Preserve the previous complete round-robin state.
+        pass
 
 
 def _yyds_read_domain_rr_index() -> int:
@@ -3385,6 +3457,14 @@ class YydsTempMailbox:
 MS_GRAPH_TOKEN_URL = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
 MS_GRAPH_SCOPE = "https://graph.microsoft.com/Mail.Read offline_access"
 MS_GRAPH_MESSAGES_URL = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages"
+MS_MAIL_POOL_LOCK_TIMEOUT_SEC = configured_lock_timeout(
+    "XAI_MS_MAIL_POOL_LOCK_TIMEOUT_SEC",
+    default=60.0,
+)
+_MS_CLIENT_ID_PATTERN = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
 
 
 def parse_ms_mail_line(line: str) -> Dict[str, str]:
@@ -3402,8 +3482,8 @@ def parse_ms_mail_line(line: str) -> Dict[str, str]:
     refresh_token = "----".join(parts[3:]).strip()
     if "@" not in email or not client_id or not refresh_token:
         raise MailboxError(f"微软邮箱行字段不完整: {mask_email(email)}")
-    if not re.fullmatch(r"[0-9a-fA-F-]{36}", client_id):
-        raise MailboxError(f"client_id 看起来不是 UUID: {client_id}")
+    if not _MS_CLIENT_ID_PATTERN.fullmatch(client_id):
+        raise MailboxError("client_id 格式错误（应为 UUID）")
     return {
         "email": email,
         "password": password,
@@ -3422,6 +3502,12 @@ def serialize_ms_mail_line(account: Dict[str, str]) -> str:
             str(account.get("refresh_token") or ""),
         ]
     )
+
+
+def _atomic_write_utf8_lines(path: Path, lines: Sequence[str]) -> None:
+    """Compatibility wrapper for atomic private mailbox/state line writes."""
+
+    atomic_write_private_lines(path, lines)
 
 
 class MicrosoftGraphMailbox:
@@ -3444,17 +3530,29 @@ class MicrosoftGraphMailbox:
         proxy: str = "",
         timeout: int = DEFAULT_TIMEOUT,
         mark_used: bool = True,
+        lock_timeout: Optional[float] = None,
     ):
-        self.path = Path(str(mail_file or "")).expanduser()
+        self.path = Path(str(mail_file or "")).expanduser().resolve(strict=False)
         if not self.path.is_file():
-            raise MailboxError(f"微软邮箱文件不存在: {self.path}")
+            raise MailboxError("微软邮箱文件不存在")
+        self.used_path = self.path.with_suffix(self.path.suffix + ".used")
+        self.lock_path = self.path.with_suffix(self.path.suffix + ".lock")
+        ensure_private_file(self.path)
+        ensure_private_file(self.used_path)
         self.timeout = max(5, int(timeout or DEFAULT_TIMEOUT))
+        self.lock_timeout = (
+            MS_MAIL_POOL_LOCK_TIMEOUT_SEC
+            if lock_timeout is None
+            else max(0.0, float(lock_timeout))
+        )
         self.proxies = _proxy_dict(proxy)
         self.mark_used = bool(mark_used)
         self.session = requests.Session(impersonate="chrome136")
         self.account: Dict[str, str] = {}
         self.access_token = ""
         self.access_expires_at = 0.0
+        self._claimed_for_return = False
+        self._claim_committed = False
 
     def _request(self, method: str, url: str, **kwargs: Any) -> Any:
         kwargs.setdefault("timeout", self.timeout)
@@ -3463,31 +3561,170 @@ class MicrosoftGraphMailbox:
         return getattr(self.session, method.lower())(url, **kwargs)
 
     def _claim_account(self) -> Dict[str, str]:
+        """Reserve one unique pool record under the durable ``.used`` ledger."""
+
+        try:
+            with CrossProcessFileLock(
+                self.lock_path,
+                timeout=self.lock_timeout,
+            ):
+                claimed = self._claim_account_locked()
+        except CrossProcessLockTimeout as exc:
+            raise MailboxPoolLockTimeout("微软邮箱池锁等待超时") from exc
+        except MailboxError:
+            raise
+        except Exception as exc:
+            raise MailboxError("微软邮箱池领取事务失败") from exc
+
+        self.account = dict(claimed)
+        self._claimed_for_return = bool(self.mark_used)
+        self._claim_committed = False
+        return claimed
+
+    def _claim_account_locked(self) -> Dict[str, str]:
         try:
             lines = self.path.read_text(encoding="utf-8").splitlines()
         except Exception as exc:
-            raise MailboxError(f"无法读取微软邮箱文件: {exc}") from exc
+            raise MailboxError("微软邮箱池读取失败") from exc
+        try:
+            used_lines = (
+                self.used_path.read_text(encoding="utf-8").splitlines()
+                if self.used_path.is_file()
+                else []
+            )
+        except Exception as exc:
+            raise MailboxError("微软邮箱已用记录读取失败") from exc
+
+        used_emails = set()
+        for used_line in used_lines:
+            try:
+                used_emails.add(
+                    parse_ms_mail_line(used_line)["email"].strip().lower()
+                )
+            except MailboxError:
+                continue
+
         remaining: List[str] = []
         claimed: Optional[Dict[str, str]] = None
         for line in lines:
             stripped = line.strip()
-            if claimed is None and stripped and not stripped.startswith("#"):
-                try:
-                    claimed = parse_ms_mail_line(stripped)
-                    if self.mark_used:
-                        continue
-                except MailboxError:
-                    remaining.append(line)
+            if not stripped or stripped.startswith("#"):
+                remaining.append(line)
+                continue
+            try:
+                account = parse_ms_mail_line(stripped)
+            except MailboxError:
+                remaining.append(line)
+                continue
+            email_key = account["email"].strip().lower()
+            if self.mark_used and email_key in used_emails:
+                # The durable ledger wins if a previous writer stopped after
+                # publishing .used but before removing the source row.
+                continue
+            if claimed is None:
+                claimed = account
+                if self.mark_used:
+                    used_emails.add(email_key)
                     continue
             remaining.append(line)
         if claimed is None:
-            raise MailboxError(f"微软邮箱文件没有可用账号: {self.path}")
+            raise MailboxError("微软邮箱文件没有可用账号")
         if self.mark_used:
-            self.path.write_text("\n".join(remaining) + ("\n" if remaining else ""), encoding="utf-8")
-            used_path = self.path.with_suffix(self.path.suffix + ".used")
-            with used_path.open("a", encoding="utf-8", newline="\n") as handle:
-                handle.write(serialize_ms_mail_line(claimed) + "\n")
+            # Commit the claim ledger first.  If publishing the source snapshot
+            # is interrupted, the next claimant filters the stale source row.
+            _atomic_write_utf8_lines(
+                self.used_path,
+                [*used_lines, serialize_ms_mail_line(claimed)],
+            )
+            try:
+                _atomic_write_utf8_lines(self.path, remaining)
+            except OSError:
+                # The reservation is already durable and remains unique.  A
+                # later claimant will clean the stale source entry.
+                pass
         return claimed
+
+    def reserve(self) -> Dict[str, str]:
+        """Public reservation operation used by batch/supervisor integrations."""
+
+        return self._claim_account()
+
+    @staticmethod
+    def _rewrite_matching_account(
+        lines: Sequence[str],
+        account: Dict[str, str],
+        *,
+        append_if_missing: bool,
+    ) -> Tuple[List[str], bool]:
+        email_key = str(account.get("email") or "").strip().lower()
+        rewritten: List[str] = []
+        replaced = False
+        for line in lines:
+            try:
+                parsed = parse_ms_mail_line(line)
+            except MailboxError:
+                rewritten.append(line)
+                continue
+            if parsed["email"].strip().lower() == email_key:
+                if not replaced:
+                    rewritten.append(serialize_ms_mail_line(account))
+                    replaced = True
+                continue
+            rewritten.append(line)
+        if append_if_missing and not replaced:
+            rewritten.append(serialize_ms_mail_line(account))
+            replaced = True
+        return rewritten, replaced
+
+    def _update_account_record(self, account: Dict[str, str]) -> None:
+        """Persist a rotated token in whichever file currently owns the row."""
+
+        try:
+            with CrossProcessFileLock(
+                self.lock_path,
+                timeout=self.lock_timeout,
+            ):
+                used_lines = (
+                    self.used_path.read_text(encoding="utf-8").splitlines()
+                    if self.used_path.is_file()
+                    else []
+                )
+                pool_lines = self.path.read_text(encoding="utf-8").splitlines()
+                email_key = str(account.get("email") or "").strip().lower()
+                owned_by_used = False
+                for line in used_lines:
+                    try:
+                        if parse_ms_mail_line(line)["email"].strip().lower() == email_key:
+                            owned_by_used = True
+                            break
+                    except MailboxError:
+                        continue
+                if owned_by_used:
+                    rewritten, _ = self._rewrite_matching_account(
+                        used_lines,
+                        account,
+                        append_if_missing=True,
+                    )
+                    _atomic_write_utf8_lines(self.used_path, rewritten)
+                else:
+                    rewritten, replaced = self._rewrite_matching_account(
+                        pool_lines,
+                        account,
+                        append_if_missing=False,
+                    )
+                    if not replaced:
+                        raise MailboxError("微软邮箱轮换令牌对应记录已不存在")
+                    _atomic_write_utf8_lines(self.path, rewritten)
+        except CrossProcessLockTimeout as exc:
+            raise MailboxPoolLockTimeout("微软邮箱池锁等待超时") from exc
+        except MailboxError:
+            raise
+        except Exception as exc:
+            raise MailboxError("微软邮箱轮换令牌持久化失败") from exc
+
+    # Kept as a narrow compatibility hook for the old reference tests.
+    def _update_used_account(self, account: Dict[str, str]) -> None:
+        self._update_account_record(account)
 
     def _refresh_access_token(self, account: Dict[str, str]) -> str:
         response = self._request(
@@ -3512,29 +3749,7 @@ class MicrosoftGraphMailbox:
         new_refresh = str(data.get("refresh_token") or "").strip()
         if new_refresh and new_refresh != account.get("refresh_token"):
             account["refresh_token"] = new_refresh
-            if self.mark_used:
-                used_path = self.path.with_suffix(self.path.suffix + ".used")
-                try:
-                    used_lines = used_path.read_text(encoding="utf-8").splitlines() if used_path.is_file() else []
-                    email = account["email"].lower()
-                    rewritten = []
-                    replaced = False
-                    for line in used_lines:
-                        try:
-                            parsed = parse_ms_mail_line(line)
-                        except MailboxError:
-                            rewritten.append(line)
-                            continue
-                        if parsed["email"].lower() == email:
-                            rewritten.append(serialize_ms_mail_line(account))
-                            replaced = True
-                        else:
-                            rewritten.append(line)
-                    if not replaced:
-                        rewritten.append(serialize_ms_mail_line(account))
-                    used_path.write_text("\n".join(rewritten) + "\n", encoding="utf-8")
-                except Exception:
-                    pass
+            self._update_account_record(account)
         expires_in = int(data.get("expires_in") or 3600)
         self.access_token = access
         self.access_expires_at = time.monotonic() + max(60, expires_in - 60)
@@ -3557,14 +3772,103 @@ class MicrosoftGraphMailbox:
                 return self.account["email"], token
             except MailboxError as exc:
                 last_error = exc
+                if not self.mark_used:
+                    # A non-consuming probe always sees the same first source
+                    # row, so advancing would repeat the same failed request.
+                    self.account = {}
+                    raise
                 print(
                     f"[HTTP][warn] 微软邮箱换票失败，跳过 {mask_email(self.account.get('email', ''))}: "
                     f"{_safe_error_text(exc)}",
                     flush=True,
                 )
+                # This record produced a mailbox-specific token failure and is
+                # intentionally retained in the used ledger.
+                self.commit_success()
                 self.account = {}
                 continue
         raise MailboxError(f"微软邮箱池连续换票失败: {_safe_error_text(last_error)}")
+
+    def release_to_pool(self, *, reason: str = "") -> bool:
+        """Return the current uncommitted reservation exactly once."""
+
+        del reason  # Failure categories are intentionally not persisted here.
+        if (
+            not self.mark_used
+            or not self._claimed_for_return
+            or self._claim_committed
+            or not self.account
+        ):
+            return False
+        account = dict(self.account)
+        email_key = str(account.get("email") or "").strip().lower()
+        try:
+            with CrossProcessFileLock(
+                self.lock_path,
+                timeout=self.lock_timeout,
+            ):
+                pool_lines = self.path.read_text(encoding="utf-8").splitlines()
+                used_lines = (
+                    self.used_path.read_text(encoding="utf-8").splitlines()
+                    if self.used_path.is_file()
+                    else []
+                )
+                authoritative = account
+                kept_used: List[str] = []
+                found_used = False
+                for line in used_lines:
+                    try:
+                        parsed = parse_ms_mail_line(line)
+                    except MailboxError:
+                        kept_used.append(line)
+                        continue
+                    if parsed["email"].strip().lower() == email_key:
+                        if not found_used:
+                            authoritative = parsed
+                            found_used = True
+                        continue
+                    kept_used.append(line)
+
+                # Deduplicate a prior partially completed release, then publish
+                # the available row before removing the authoritative ledger.
+                kept_pool: List[str] = []
+                for line in pool_lines:
+                    try:
+                        parsed = parse_ms_mail_line(line)
+                    except MailboxError:
+                        kept_pool.append(line)
+                        continue
+                    if parsed["email"].strip().lower() == email_key:
+                        continue
+                    kept_pool.append(line)
+                _atomic_write_utf8_lines(
+                    self.path,
+                    [serialize_ms_mail_line(authoritative), *kept_pool],
+                )
+                _atomic_write_utf8_lines(self.used_path, kept_used)
+        except CrossProcessLockTimeout as exc:
+            raise MailboxPoolLockTimeout("微软邮箱池锁等待超时") from exc
+        except MailboxError:
+            raise
+        except Exception as exc:
+            raise MailboxError("微软邮箱池归还事务失败") from exc
+        self.account = authoritative
+        self._claimed_for_return = False
+        return True
+
+    def release(self, *, reason: str = "") -> bool:
+        """Alias for supervisor lifecycle integrations."""
+
+        return self.release_to_pool(reason=reason)
+
+    def commit_success(self) -> bool:
+        """Mark the current reservation consumed so later release is a no-op."""
+
+        if not self._claimed_for_return or self._claim_committed:
+            return False
+        self._claim_committed = True
+        self._claimed_for_return = False
+        return True
 
     def _ensure_access_token(self, token: str = "") -> str:
         if self.access_token and time.monotonic() < self.access_expires_at:
@@ -3802,7 +4106,32 @@ def save_account_record(path: str, *, email: str, password: str, sso: str) -> st
     return str(target)
 
 
-def run_registration(
+class _MailboxReservationLifecycle:
+    """Own one mailbox reservation across a complete registration attempt."""
+
+    def __init__(self) -> None:
+        self.mailbox: Optional[MailboxAdapter] = None
+
+    def bind(self, mailbox: Optional[MailboxAdapter]) -> None:
+        self.mailbox = mailbox
+
+    def release(self, reason: str) -> bool:
+        mailbox = self.mailbox
+        release = getattr(mailbox, "release", None)
+        if not callable(release):
+            release = getattr(mailbox, "release_to_pool", None)
+        if not callable(release):
+            return False
+        return bool(release(reason=str(reason or "registration_failed")))
+
+    def commit(self) -> bool:
+        commit = getattr(self.mailbox, "commit_success", None)
+        if not callable(commit):
+            return False
+        return bool(commit())
+
+
+def _run_registration_impl(
     *,
     client: BrowserlessXAIClient,
     email: str = "",
@@ -3827,7 +4156,9 @@ def run_registration(
     password: str = "",
     output_dir: str = "",
     accounts_output: str = "",
+    _mailbox_lifecycle: Optional[_MailboxReservationLifecycle] = None,
 ) -> RegistrationResult:
+    lifecycle = _mailbox_lifecycle or _MailboxReservationLifecycle()
     mailbox: Optional[MailboxAdapter] = None
     mail_token = ""
     config: Dict[str, Any] = {}
@@ -3847,6 +4178,7 @@ def run_registration(
             proxy=client.proxy,
             timeout=client.timeout,
         )
+        lifecycle.bind(mailbox)
         email, mail_token = mailbox.create()
         provider = "mail-file" if mail_file else str(config.get("email_provider") or "cloudflare")
         _log(client.log_callback, f"[HTTP] 已就绪邮箱 provider={provider} | email={mask_email(email)}")
@@ -3854,6 +4186,7 @@ def run_registration(
         # Explicit email plus mailbox credentials/file for OTP polling.
         if mail_file:
             mailbox = MicrosoftGraphMailbox(mail_file, proxy=client.proxy, timeout=client.timeout, mark_used=False)
+            lifecycle.bind(mailbox)
             # Bind to provided email if the file contains it; otherwise claim is not used.
             # For explicit email mode with Graph, require matching line kept in file.
             try:
@@ -3916,6 +4249,7 @@ def run_registration(
                 if domain_try >= max_domain_tries:
                     break
                 # Mint a new temporary mailbox address and continue.
+                lifecycle.release("domain_rejected")
                 email, mail_token = mailbox.create()
                 provider = "mail-file" if mail_file else str(config.get("email_provider") or "cloudflare")
                 _log(
@@ -4030,13 +4364,8 @@ def run_registration(
                     except (TypeError, ValueError):
                         reported_token_length = 0
                 # Local broker keeps the real token behind a lease; empty body token
-                # with a valid lease is a success and must be consumed later.
-                lease_ok = bool(lease_id) and (
-                    token_len >= 80 or reported_token_length >= 80 or reported_token_length == 0
-                )
-                # If broker reports an explicit short token length, treat as failure.
-                if lease_id and reported_token_length > 0 and reported_token_length < 80 and token_len < 80:
-                    lease_ok = False
+                # with a verified server-reported length is consumed later.
+                lease_ok = bool(lease_id) and reported_token_length >= 80
                 _log(
                     client.log_callback,
                     (
@@ -4115,6 +4444,9 @@ def run_registration(
             turnstile_token=turnstile_token,
             castle_request_token=castle_register_token,
         )
+    # Once xAI accepted the registration, the imported mailbox must remain
+    # consumed even if a later local artifact/OAuth write fails.
+    lifecycle.commit()
     credential_path = ""
     sso_path = ""
     if output_dir:
@@ -4138,16 +4470,31 @@ def run_registration(
     )
 
 
+@functools.wraps(_run_registration_impl)
+def run_registration(*args: Any, **kwargs: Any) -> RegistrationResult:
+    """Run registration and return an uncommitted Graph row on failure."""
+
+    lifecycle = _MailboxReservationLifecycle()
+    kwargs["_mailbox_lifecycle"] = lifecycle
+    try:
+        result = _run_registration_impl(*args, **kwargs)
+    except BaseException:
+        try:
+            lifecycle.release("registration_failed")
+        except Exception:
+            # Preserve the primary flow failure.  A lock/write error leaves the
+            # row in the authoritative .used ledger for deterministic restart.
+            pass
+        raise
+    lifecycle.commit()
+    return result
+
+
 def _add_proxy_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--proxy", default="", help="直连 HTTP/SOCKS 代理 URL，或 host:port:user:password")
     parser.add_argument("--proxy-file", default="", help="代理池文件；每行一个代理")
     parser.add_argument("--proxy-random", action="store_true", help="从代理池随机选择一条")
     parser.add_argument("--proxy-index", type=int, default=0, help="代理池固定索引（默认 0）")
-    parser.add_argument(
-        "--proxy-parent",
-        default="",
-        help="可选父 HTTP 代理；例如 http://127.0.0.1:7890，经其连接选中的认证上游",
-    )
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
 
 
@@ -4205,13 +4552,13 @@ def _add_token_options(parser: argparse.ArgumentParser, *, registration: bool = 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="xAI 无浏览器注册与 OAuth 凭证获取（不启动 Chrome）",
+        description="xAI HTTP 注册与 OAuth 凭证获取（仅 local Turnstile 启动 Chrome）",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
     credential = sub.add_parser("credential", help="从已有 SSO 或邮箱密码获取 OAuth 凭证")
     _add_proxy_options(credential)
-    credential.add_argument("--output-dir", default="xai_credentials")
+    credential.add_argument("--output-dir", default=str(CREDENTIALS_DIR))
     credential.add_argument("--email", default="", help="密码登录邮箱或 OAuth 邮箱提示")
     credential.add_argument("--password", default="", help="密码登录密码（建议改用环境变量包装调用）")
     credential.add_argument("--sso", default="", help="已有 sso cookie")
@@ -4221,7 +4568,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     register = sub.add_parser("register", help="直接 HTTP 注册、取得 SSO 并写 OAuth 凭证")
     _add_proxy_options(register)
-    register.add_argument("--output-dir", default="xai_credentials")
+    register.add_argument("--output-dir", default=str(CREDENTIALS_DIR))
     register.add_argument("--email", default="")
     register.add_argument("--email-code", default="", help="已收到的 xAI 6 位邮箱验证码")
     register.add_argument(
@@ -4255,10 +4602,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="用真实浏览器在同一出口代理上打开注册页，捕获新鲜 Turnstile token（会启动 Chrome）",
     )
     _add_proxy_options(capture)
-    capture.add_argument("--output", default="turnstile.txt", help="写入 token 的 UTF-8 文件")
+    capture.add_argument(
+        "--output",
+        default=str(STATE_DIR / "turnstile.txt"),
+        help="写入 token 的 UTF-8 文件",
+    )
     capture.add_argument(
         "--proxy-used-file",
-        default="turnstile.proxy.txt",
+        default=str(STATE_DIR / "turnstile.proxy.txt"),
         help="写入本次实际使用的代理，便于 register 粘性复用",
     )
     capture.add_argument("--wait-seconds", type=int, default=180, help="等待原生 Turnstile 通过的秒数")
@@ -4266,8 +4617,8 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _resolve_runtime_proxy(args: argparse.Namespace, logger: Callable[[str], None]) -> Tuple[str, str, str]:
-    """Return (effective_proxy_url, forwarder_instance_key, selected_upstream_raw)."""
+def _resolve_runtime_proxy(args: argparse.Namespace) -> Tuple[str, str]:
+    """Return (effective_proxy_url, selected_upstream_raw)."""
     selected_raw = str(getattr(args, "proxy", "") or "").strip()
     if not selected_raw and str(getattr(args, "proxy_file", "") or "").strip():
         path = Path(str(args.proxy_file).strip())
@@ -4279,23 +4630,7 @@ def _resolve_runtime_proxy(args: argparse.Namespace, logger: Callable[[str], Non
                 else:
                     selected_raw = lines[int(getattr(args, "proxy_index", 0) or 0) % len(lines)]
     selected = normalize_proxy(selected_raw) if selected_raw else ""
-    parent_proxy = str(getattr(args, "proxy_parent", "") or "").strip()
-    forwarder_instance = ""
-    proxy = selected
-    if parent_proxy:
-        if not proxy:
-            raise XAIHttpFlowError("设置 --proxy-parent 时还必须提供 --proxy 或 --proxy-file 上游代理")
-        from local_proxy_forwarder import ensure_local_forwarder
-
-        forwarder_instance = f"xai-http-{os.getpid()}-{secrets.token_hex(3)}"
-        proxy, _ = ensure_local_forwarder(
-            proxy,
-            preferred_local_port=0,
-            instance_key=forwarder_instance,
-            parent_proxy_raw=parent_proxy,
-        )
-        logger("[HTTP] 已启用父代理链（本机转发 -> parent -> 上游）")
-    return proxy, forwarder_instance, selected_raw or selected
+    return selected, selected_raw or selected
 
 
 def _safe_call(fn, *args, **kwargs):
@@ -4306,120 +4641,10 @@ def _safe_call(fn, *args, **kwargs):
 
 
 
-def _virtual_display_available() -> bool:
-    """Return True when Xvfb can provide a virtual headed display."""
-    import shutil
-
-    return bool(shutil.which("Xvfb") or shutil.which("xvfb-run"))
-
-
-def _display_env_available() -> bool:
-    return bool(str(os.environ.get("DISPLAY") or "").strip())
-
-
 def _resolve_local_browser_mode(*, want_headless: bool) -> Tuple[str, bool]:
-    """Map user headless intent to an actual browser launch mode.
+    """Map the setting directly to headed or native Chrome headless-new."""
 
-    Returns (mode, use_headless_flag):
-      - headed: normal visible Chrome
-      - virtual-headed: headed Chrome under Xvfb (best "headless" for CF)
-      - headless-new: true Chrome headless (usually hard-blocked by x.ai)
-    """
-    if not want_headless:
-        return "headed", False
-    if _virtual_display_available():
-        return "virtual-headed", False
-    # Pure headless is consistently hard-blocked by accounts.x.ai in this project.
-    # Without Xvfb, map "headless" to real headed so we do not burn a doomed launch.
-    if _display_env_available():
-        return "headed", False
-    return "headless-new", True
-
-
-class _VirtualDisplaySession:
-    """Best-effort Xvfb session for virtual headed Chrome."""
-
-    def __init__(self, log_callback: LogFn = None):
-        self.log_callback = log_callback
-        self._backend = ""
-        self._display = None
-        self._proc = None
-        self._old_display = os.environ.get("DISPLAY")
-        self.active = False
-
-    def start(self) -> bool:
-        # 1) pyvirtualdisplay if installed
-        try:
-            from pyvirtualdisplay import Display  # type: ignore
-
-            disp = Display(visible=False, size=(1365, 900))
-            disp.start()
-            self._display = disp
-            self._backend = "pyvirtualdisplay"
-            self.active = True
-            _log(self.log_callback, f"[Turnstile] 已启动虚拟显示 backend=pyvirtualdisplay DISPLAY={os.environ.get('DISPLAY')}")
-            return True
-        except Exception:
-            pass
-
-        # 2) raw Xvfb
-        import shutil
-        import subprocess
-
-        xvfb = shutil.which("Xvfb")
-        if not xvfb:
-            return False
-        # Pick a high display number.
-        display_no = 90 + (os.getpid() % 20)
-        display = f":{display_no}"
-        try:
-            proc = subprocess.Popen(
-                [xvfb, display, "-screen", "0", "1365x900x24", "-nolisten", "tcp"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except Exception as exc:
-            _log(self.log_callback, f"[Turnstile][warn] 启动 Xvfb 失败: {exc}")
-            return False
-        time.sleep(0.3)
-        if proc.poll() is not None:
-            _log(self.log_callback, "[Turnstile][warn] Xvfb 立即退出，虚拟显示不可用")
-            return False
-        self._proc = proc
-        self._backend = "xvfb"
-        os.environ["DISPLAY"] = display
-        self.active = True
-        _log(self.log_callback, f"[Turnstile] 已启动虚拟显示 backend=xvfb DISPLAY={display}")
-        return True
-
-    def stop(self) -> None:
-        if not self.active and self._display is None and self._proc is None:
-            return
-        try:
-            if self._display is not None:
-                try:
-                    self._display.stop()
-                except Exception:
-                    pass
-                self._display = None
-            if self._proc is not None:
-                try:
-                    self._proc.terminate()
-                    self._proc.wait(timeout=2)
-                except Exception:
-                    try:
-                        self._proc.kill()
-                    except Exception:
-                        pass
-                self._proc = None
-        finally:
-            if self._old_display is None:
-                os.environ.pop("DISPLAY", None)
-            else:
-                os.environ["DISPLAY"] = self._old_display
-            if self.active:
-                _log(self.log_callback, f"[Turnstile] 已关闭虚拟显示 backend={self._backend or '-'}")
-            self.active = False
+    return ("headless-new", True) if want_headless else ("headed", False)
 
 
 def _build_turnstile_browser_options(
@@ -4476,7 +4701,7 @@ def _build_turnstile_browser_options(
             options._xai_profile_dir = profile_dir  # type: ignore[attr-defined]
         except Exception:
             pass
-        _log(log_callback, f"[Turnstile] 使用独立用户目录: {profile_dir}")
+        _log(log_callback, f"[Turnstile] 使用独立用户目录: {Path(profile_dir).name}")
     except Exception as exc:
         _log(log_callback, f"[Turnstile][warn] 创建独立用户目录失败: {exc}")
 
@@ -4532,8 +4757,7 @@ def _build_turnstile_browser_options(
             _safe_call(getattr(options, "set_argument", None), arg)
         _log(
             log_callback,
-            "[Turnstile][warn] headless 模式启用（headless=new）；"
-            "注入 sitekey widget 后会主动轮询/触发，成功率仍通常低于有头",
+            "[Turnstile] 已启用原生 Chrome --headless=new",
         )
 
     proxy = str(proxy or "").strip()
@@ -4620,8 +4844,7 @@ def _classify_turnstile_page_state(diag: Any) -> Dict[str, Any]:
         message = (
             "本地浏览器打开 accounts.x.ai 时被 Cloudflare 硬拦截(blocked)"
             f"（title={title or '-'}；url={url or '-'}）。"
-            "有头直连通常可解；无头易被硬拦，建议安装 Xvfb 走 virtual-headed，或改回有界面；"
-            "必要时换出口或改用远程 captcha provider。不要继续空等 Turnstile token。"
+            "当前启动模式将在本次捕获中保持不变；请让上层有界重试或更换出口。"
         )
         return {
             "blocked": True,
@@ -4849,6 +5072,7 @@ return {
   tokenLen: token.length,
   turnstileApiType: typeof window.turnstile,
   turnstileRespLen: turnstileResp.length,
+  turnstileError: String(window.__xaiTsLastError || ''),
   sitekeys,
   sitekeyCount: sitekeys.length,
   iframeCount: iframes.length,
@@ -5010,39 +5234,11 @@ def _nudge_turnstile_widget(page: Any, *, log_callback: LogFn = None) -> str:
     """Best-effort interaction with Turnstile host/iframe/shadow checkbox."""
     actions: list[str] = []
 
-    # 1) Plain DOM hosts
-    try:
-        clicked = page.run_js(
-            """
-const nodes = Array.from(document.querySelectorAll(
-  '#xai-local-ts-host, #xai-local-ts-host iframe, .cf-turnstile, [data-sitekey], #cf-turnstile, #turnstile-wrapper, iframe[src*="turnstile"], iframe[src*="challenges.cloudflare"]'
-));
-let n = 0;
-for (const node of nodes) {
-  try { node.scrollIntoView({block:'center', inline:'center'}); } catch (e) {}
-  try { node.click(); n += 1; } catch (e) {}
-  try {
-    const rect = node.getBoundingClientRect();
-    const x = rect.left + Math.min(Math.max(rect.width * 0.2, 8), 40);
-    const y = rect.top + rect.height / 2;
-    for (const type of ['pointerdown', 'mousedown', 'mouseup', 'click']) {
-      node.dispatchEvent(new MouseEvent(type, { bubbles: true, clientX: x, clientY: y, view: window }));
-    }
-  } catch (e) {}
-}
-return n;
-"""
-        )
-        if int(clicked or 0) > 0:
-            actions.append(f"dom:{clicked}")
-    except Exception:
-        pass
-
-    # 1b) Explicit Turnstile API execute / getResponse for injected widgets.
+    # Read the explicit widget response without repeatedly calling execute().
     try:
         api_hit = page.run_js(
             """
-let out = {executed:false, tokenLen:0, reset:false, error:''};
+let out = {tokenLen:0, error:''};
 try {
   if (window.turnstile && window.__xaiTsWidgetId != null) {
     try {
@@ -5054,20 +5250,12 @@ try {
         if (input) input.value = cur;
       }
     } catch (e) {}
-    try {
-      if (typeof turnstile.execute === 'function') {
-        turnstile.execute(window.__xaiTsWidgetId);
-        out.executed = true;
-      }
-    } catch (e) { out.error = String(e); }
   }
 } catch (e) { out.error = String(e); }
 return out;
 """
         )
         if isinstance(api_hit, dict):
-            if api_hit.get("executed"):
-                actions.append("api-execute")
             if int(api_hit.get("tokenLen") or 0) >= 80:
                 actions.append(f"api-token:{api_hit.get('tokenLen')}")
     except Exception:
@@ -5098,19 +5286,6 @@ return out;
                 except Exception:
                     iframe = None
             if iframe is not None:
-                try:
-                    iframe.run_js(
-                        """
-window.dtp = 1;
-function getRandomInt(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
-let sx = getRandomInt(800, 1200);
-let sy = getRandomInt(400, 700);
-try { Object.defineProperty(MouseEvent.prototype, 'screenX', { value: sx }); } catch (e) {}
-try { Object.defineProperty(MouseEvent.prototype, 'screenY', { value: sy }); } catch (e) {}
-"""
-                    )
-                except Exception:
-                    pass
                 clicked_shadow = False
                 try:
                     body_sr = iframe.ele("tag:body", timeout=0.2).shadow_root
@@ -5191,7 +5366,7 @@ function doRender() {{
   const opts = {{
     sitekey,
     callback: onToken,
-    'error-callback': function(code){{ window.__xaiTsLastError = String(code || 'error'); }},
+    'error-callback': function(code){{ window.__xaiTsLastError = String(code || 'error'); return true; }},
     'expired-callback': function(){{ window.__xaiTsToken = ''; }},
     'timeout-callback': function(){{ window.__xaiTsLastError = 'timeout'; }},
     size: 'normal',
@@ -5202,7 +5377,6 @@ function doRender() {{
   if (cdata) opts.cData = cdata;
   try {{
     window.__xaiTsWidgetId = turnstile.render(host, opts);
-    try {{ if (typeof turnstile.execute === 'function') turnstile.execute(window.__xaiTsWidgetId); }} catch (e) {{}}
     return {{ok:true, reason:'rendered', widgetId: window.__xaiTsWidgetId, tokenLen: (window.__xaiTsToken||'').length}};
   }} catch (e) {{
     return {{ok:false, reason:'render-error', error: String(e)}};
@@ -5300,8 +5474,7 @@ def _launch_turnstile_browser(options: Any, *, log_callback: LogFn = None) -> An
         ):
             hint = (
                 "有界面 Chrome 拉不起：当前图形会话资源耗尽（X11 clients / inotify / 打开文件过多）。"
-                "请先关掉大量 Playwright/Chrome 残留进程，或新开图形会话后再试；"
-                "若要稳定无真窗，请安装 Xvfb 走 virtual-headed。"
+                "请先清理本项目残留浏览器，或显式启用原生 headless=new。"
                 f" 原始错误: {msg}"
             )
         else:
@@ -5316,7 +5489,23 @@ def _launch_turnstile_browser(options: Any, *, log_callback: LogFn = None) -> An
     return browser
 
 
+def _turnstile_browser_pid(browser: Any) -> int:
+    if browser is None:
+        return 0
+    for name in ("process_id", "pid", "_process_id"):
+        try:
+            value = getattr(browser, name, 0)
+            value = value() if callable(value) else value
+            pid = int(value or 0)
+        except Exception:
+            pid = 0
+        if pid > 1:
+            return pid
+    return 0
+
+
 def _quit_turnstile_browser(browser: Any, options: Any = None) -> None:
+    browser_pid = _turnstile_browser_pid(browser)
     try:
         if browser is not None:
             browser.quit()
@@ -5327,6 +5516,17 @@ def _quit_turnstile_browser(browser: Any, options: Any = None) -> None:
         profile = getattr(options, "_xai_profile_dir", None) if options is not None else None
     except Exception:
         profile = None
+    if browser_pid > 1:
+        try:
+            from turnstile_solver.src.browser_runtime import _reap_chrome_process_tree
+
+            _reap_chrome_process_tree(browser_pid, timeout_sec=2.0)
+        except Exception:
+            pass
+    try:
+        unregister_project_browser(browser_pid, profile or "")
+    except Exception:
+        pass
     if profile:
         try:
             import shutil
@@ -5339,7 +5539,7 @@ def _quit_turnstile_browser(browser: Any, options: Any = None) -> None:
 def capture_turnstile_token(
     *,
     proxy: str = "",
-    output: str = "turnstile.txt",
+    output: str = str(STATE_DIR / "turnstile.txt"),
     proxy_used_file: str = "",
     selected_proxy_raw: str = "",
     timeout: int = 30,
@@ -5384,7 +5584,7 @@ def capture_turnstile_token(
 def _capture_turnstile_token_impl(
     *,
     proxy: str = "",
-    output: str = "turnstile.txt",
+    output: str = str(STATE_DIR / "turnstile.txt"),
     proxy_used_file: str = "",
     selected_proxy_raw: str = "",
     timeout: int = 30,
@@ -5424,12 +5624,10 @@ def _capture_turnstile_token_impl(
     selected_proxy_raw = str(selected_proxy_raw or proxy or "").strip()
     browser_proxy = ""
     forwarder_instance = ""
-    virtual = None
     options = None
     browser = None
     page = None
     diag_samples: list[Dict[str, Any]] = []
-    hard_block_retried = False
     capture_started = time.monotonic()
     try:
         browser_proxy, forwarder_instance = _prepare_browser_proxy(
@@ -5440,38 +5638,62 @@ def _capture_turnstile_token_impl(
 
         want_headless = bool(headless)
         mode, use_headless = _resolve_local_browser_mode(want_headless=want_headless)
-        virtual = _VirtualDisplaySession(log_callback=log_callback) if mode == "virtual-headed" else None
-        if virtual is not None:
-            if not virtual.start():
-                _log(log_callback, "[Turnstile][warn] 虚拟显示启动失败，回退 headless-new")
-                mode, use_headless = "headless-new", True
-                virtual = None
-        if mode == "virtual-headed":
-            _log(log_callback, "[Turnstile] 无头请求已映射为 virtual-headed（Xvfb 有界面，对 Cloudflare 更友好）")
-        elif mode == "headed" and want_headless:
+        if mode == "headless-new":
             _log(
                 log_callback,
-                "[Turnstile][warn] 未检测到 Xvfb；纯 headless 会被 x.ai 硬拦，"
-                "本次无头选项已自动改走本机有界面",
+                "[Turnstile] 已启用原生 headless=new（无虚拟显示、无可见窗口、无有头回退）",
             )
-        elif mode == "headless-new" and want_headless:
-            _log(
-                log_callback,
-                "[Turnstile][warn] 未检测到 Xvfb 且无 DISPLAY；只能试 headless-new，"
-                "很可能被 x.ai 硬拦截",
-            )
+
+        if use_headless and not str(user_agent or "").strip():
+            runtime_fingerprint = build_runtime_fingerprint_profile()
+            user_agent = runtime_fingerprint.user_agent
+            accept_language = runtime_fingerprint.accept_language
+            expected_platform = runtime_fingerprint.navigator_platform
+            expected_client_hint_platform = runtime_fingerprint.client_hint_platform
+            expected_browser_major = runtime_fingerprint.browser_major
 
         options = _build_turnstile_browser_options(
             options=ChromiumOptions(),
             proxy=proxy,
             headless=bool(use_headless),
-            user_agent="",
+            user_agent=user_agent,
             log_callback=log_callback,
         )
         _log(log_callback, f"[Turnstile] 正在启动浏览器 mode={mode} headless={use_headless}")
         browser = _launch_turnstile_browser(options, log_callback=log_callback)
+        register_project_browser(
+            _turnstile_browser_pid(browser),
+            getattr(options, "_xai_profile_dir", ""),
+        )
         tabs = getattr(browser, "get_tabs", lambda: [])()
         page = tabs[-1] if tabs else browser.new_tab()
+        if str(user_agent or "").strip():
+            from turnstile_solver.src.browser_worker import apply_cdp_fingerprint_override
+            from turnstile_solver.src.models import SolveRequest as LocalSolveRequest
+
+            version_info = page.run_cdp("Browser.getVersion") or {}
+            product = str(version_info.get("product") or "")
+            match = re.search(r"(?:Headless)?Chrome/(\d+\.\d+\.\d+\.\d+)", product)
+            if not match:
+                raise XAIHttpFlowError(f"未识别 Chrome 完整版本: {product or '-'}")
+            local_request = LocalSolveRequest(
+                headless=bool(use_headless),
+                user_agent=str(user_agent or ""),
+                accept_language=str(accept_language or ""),
+                expected_platform=str(expected_platform or ""),
+                expected_client_hint_platform=str(expected_client_hint_platform or ""),
+                expected_browser_major=int(str(expected_browser_major or "0") or "0"),
+            )
+            apply_cdp_fingerprint_override(
+                page,
+                local_request,
+                browser_version=match.group(1),
+                strict=True,
+            )
+            _log(
+                log_callback,
+                f"[Turnstile] CDP 指纹已对齐 Chrome/{match.group(1).split('.', 1)[0]}",
+            )
         target_url = str(page_url or SIGNUP_URL).strip() or SIGNUP_URL
         page.get(target_url)
         _log(log_callback, f"[Turnstile] 已打开注册页: {target_url}")
@@ -5488,7 +5710,7 @@ def _capture_turnstile_token_impl(
         if inject_mode:
             _log(
                 log_callback,
-                f"[Turnstile] 使用 sitekey 注入模式 | sitekey={sitekey[:12]}… "
+                "[Turnstile] 使用 sitekey 注入模式 | sitekey=yes "
                 f"action={'yes' if action else 'no'} cdata={'yes' if cdata else 'no'} "
                 f"headless={'yes' if headless else 'no'}",
             )
@@ -5523,8 +5745,7 @@ def _capture_turnstile_token_impl(
                 f"cfInput={first_diag.get('hasCfInput')} "
                 f"tsIframes={first_diag.get('turnstileIframeCount')} "
                 f"inputs={first_diag.get('inputs')} "
-                f"title={first_diag.get('title')} "
-                f"body={str(first_diag.get('bodySnippet') or '')[:120]}",
+                f"title={first_diag.get('title')}",
             )
             # Hard Cloudflare block will never mount Turnstile; fail fast.
             # Soft challenge pages may clear themselves in headed mode, so wait.
@@ -5537,83 +5758,12 @@ def _capture_turnstile_token_impl(
                     kinds={"email_verification_deadend"},
                 )
             if classified0.get("kind") == "cloudflare_hard_block":
-                can_retry_headed = (
-                    want_headless
-                    and not hard_block_retried
-                    and mode in {"headless-new", "virtual-headed"}
-                    and _display_env_available()
+                _raise_if_turnstile_page_blocked(
+                    first_diag,
+                    log_callback=log_callback,
+                    stage="打开注册页后",
+                    kinds={"cloudflare_hard_block"},
                 )
-                if can_retry_headed:
-                    hard_block_retried = True
-                    _log(
-                        log_callback,
-                        "[Turnstile][warn] 当前模式被 Cloudflare 硬拦截，自动回退本机有界面重试一次",
-                    )
-                    try:
-                        if browser is not None:
-                            browser.quit()
-                    except Exception:
-                        pass
-                    browser = None
-                    if virtual is not None:
-                        virtual.stop()
-                        virtual = None
-                    mode, use_headless = "headed", False
-                    options = _build_turnstile_browser_options(
-                        options=ChromiumOptions(),
-                        proxy=proxy,
-                        headless=False,
-                        user_agent="",
-                        log_callback=log_callback,
-                    )
-                    _log(log_callback, "[Turnstile] 正在启动有界面回退浏览器…")
-                    browser = _launch_turnstile_browser(options, log_callback=log_callback)
-                    tabs = getattr(browser, "get_tabs", lambda: [])()
-                    page = tabs[-1] if tabs else browser.new_tab()
-                    page.get(target_url)
-                    _log(log_callback, f"[Turnstile] 有界面回退已打开注册页: {target_url}")
-                    try:
-                        page.wait.doc_loaded()
-                    except Exception:
-                        pass
-                    time.sleep(1.0)
-                    if inject_mode:
-                        _ensure_injected_turnstile_widget(
-                            page,
-                            sitekey=sitekey,
-                            action=action,
-                            cdata=cdata,
-                            log_callback=log_callback,
-                            wait_api_sec=3.0,
-                        )
-                        time.sleep(0.8)
-                    first_diag = _diagnose_turnstile_page(page)
-                    if isinstance(first_diag, dict):
-                        first_diag["_t"] = 0
-                        diag_samples.append(first_diag)
-                        _log(
-                            log_callback,
-                            "[Turnstile][diag] "
-                            f"t=0s tokenLen={first_diag.get('tokenLen')} "
-                            f"sitekeys={first_diag.get('sitekeyCount')} "
-                            f"cfInput={first_diag.get('hasCfInput')} "
-                            f"tsIframes={first_diag.get('turnstileIframeCount')} "
-                            f"title={first_diag.get('title')} "
-                            f"body={str(first_diag.get('bodySnippet') or '')[:120]}",
-                        )
-                        _raise_if_turnstile_page_blocked(
-                            first_diag,
-                            log_callback=log_callback,
-                            stage="有界面回退后",
-                            kinds={"cloudflare_hard_block", "email_verification_deadend"},
-                        )
-                else:
-                    _raise_if_turnstile_page_blocked(
-                        first_diag,
-                        log_callback=log_callback,
-                        stage="打开注册页后",
-                        kinds={"cloudflare_hard_block"},
-                    )
             elif classified0.get("blocked"):
                 _log(
                     log_callback,
@@ -5641,8 +5791,8 @@ def _capture_turnstile_token_impl(
         token = ""
         next_diag_at = started + 5
         next_prime_at = started + 8
-        next_nudge_at = started + 2
-        next_inject_at = started + 1
+        next_nudge_at = started + 18
+        next_inject_at = started + 4
         challenge_since: Optional[float] = None
         while time.monotonic() < deadline:
             now = time.monotonic()
@@ -5651,26 +5801,6 @@ def _capture_turnstile_token_impl(
                 break
 
             if inject_mode and now >= next_inject_at:
-                # If the widget has been idle too long in headless, force a re-render.
-                if headless and (now - started) >= 12:
-                    try:
-                        page.run_js(
-                            """
-try {
-  if (window.turnstile && window.__xaiTsWidgetId != null && typeof turnstile.remove === 'function') {
-    turnstile.remove(window.__xaiTsWidgetId);
-  }
-} catch (e) {}
-window.__xaiTsWidgetId = null;
-window.__xaiTsToken = '';
-const host = document.getElementById('xai-local-ts-host');
-if (host) host.innerHTML = '';
-return true;
-"""
-                        )
-                        _log(log_callback, "[Turnstile] headless 空闲过久，重置并重渲染 widget")
-                    except Exception:
-                        pass
                 _ensure_injected_turnstile_widget(
                     page,
                     sitekey=sitekey,
@@ -5679,11 +5809,11 @@ return true;
                     log_callback=log_callback,
                     wait_api_sec=2.5 if headless else 1.5,
                 )
-                next_inject_at = now + (3 if headless else 4)
+                next_inject_at = now + 8
 
             if now >= next_nudge_at:
                 _nudge_turnstile_widget(page, log_callback=log_callback)
-                next_nudge_at = now + (2 if (headless and inject_mode) else 3)
+                next_nudge_at = now + 12
 
             if (not inject_mode) and now >= next_prime_at:
                 snap_now = _diagnose_turnstile_page(page)
@@ -5729,9 +5859,15 @@ return true;
                         f"cfInput={snap.get('hasCfInput')} "
                         f"tsIframes={snap.get('turnstileIframeCount')} "
                         f"challenge={snap.get('challengeLike')} "
+                        f"tsError={snap.get('turnstileError') or '-'} "
                         f"state={classified.get('kind')} "
                         f"title={snap.get('title')}",
                     )
+                    challenge_error = str(snap.get("turnstileError") or "").strip()
+                    if challenge_error.startswith(("300", "600")):
+                        raise VerificationRequiredError(
+                            f"Turnstile challenge error {challenge_error}"
+                        )
                     if classified.get("kind") in {"cloudflare_hard_block", "email_verification_deadend"}:
                         _raise_if_turnstile_page_blocked(
                             snap,
@@ -5768,10 +5904,27 @@ return true;
                 "has_cf_input_any": any(bool(s.get("hasCfInput")) for s in diag_samples),
                 "turnstile_iframe_any": any(int(s.get("turnstileIframeCount") or 0) > 0 for s in diag_samples),
                 "challenge_like_any": any(bool(s.get("challengeLike")) for s in diag_samples),
+                "turnstile_error_last": str(
+                    (diag_samples[-1] if diag_samples else {}).get("turnstileError") or ""
+                ),
                 "last": diag_samples[-1] if diag_samples else {},
             }
-            _log(log_callback, f"[Turnstile][diag] 失败摘要: {summary}")
+            _log(
+                log_callback,
+                "[Turnstile][diag] 失败摘要: "
+                f"samples={summary['samples']} token_len_max={summary['token_len_max']} "
+                f"sitekey_count_max={summary['sitekey_count_max']} "
+                f"cf_input={summary['has_cf_input_any']} "
+                f"ts_iframe={summary['turnstile_iframe_any']} "
+                f"challenge={summary['challenge_like_any']} "
+                f"ts_error={summary['turnstile_error_last'] or '-'}",
+            )
             last_state = _classify_turnstile_page_state(diag_samples[-1] if diag_samples else {})
+            challenge_error = str(summary.get("turnstile_error_last") or "").strip()
+            if challenge_error:
+                raise VerificationRequiredError(
+                    f"Turnstile challenge error {challenge_error}"
+                )
             if last_state.get("blocked"):
                 raise VerificationRequiredError(str(last_state.get("message") or "Cloudflare blocked"))
             raise VerificationRequiredError(
@@ -5838,6 +5991,7 @@ return (async () => {
 
         if str(output or "").strip():
             out = Path(str(output).strip()).expanduser()
+            out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(token + "\n", encoding="utf-8")
             try:
                 if os.name != "nt":
@@ -5849,6 +6003,7 @@ return (async () => {
             _log(log_callback, f"[Turnstile] token 已捕获 (len={len(token)})")
         if proxy_used_file:
             proxy_out = Path(str(proxy_used_file)).expanduser()
+            proxy_out.parent.mkdir(parents=True, exist_ok=True)
             proxy_out.write_text((selected_proxy_raw or proxy or "") + "\n", encoding="utf-8")
         if return_result:
             return SolveResult(
@@ -5871,11 +6026,6 @@ return (async () => {
         return token
     finally:
         _quit_turnstile_browser(browser, options)
-        try:
-            if virtual is not None:
-                virtual.stop()
-        except Exception:
-            pass
         if forwarder_instance:
             try:
                 from local_proxy_forwarder import stop_local_forwarder
@@ -5887,18 +6037,23 @@ return (async () => {
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(list(argv) if argv is not None else None)
+    previous_config_env = os.environ.get("XAI_CONFIG_PATH")
+    config_env_overridden = False
 
     def logger(message: str) -> None:
         print(message, flush=True)
 
-    forwarder_instance = ""
     try:
-        proxy, forwarder_instance, selected_raw = _resolve_runtime_proxy(args, logger)
+        proxy, selected_raw = _resolve_runtime_proxy(args)
+        config: Dict[str, Any] = {}
+        mail_config_value = str(getattr(args, "mail_config", "") or "").strip()
+        if mail_config_value:
+            mail_config_path = Path(mail_config_value).expanduser().resolve()
+            config = json.loads(mail_config_path.read_text(encoding="utf-8"))
+            os.environ["XAI_CONFIG_PATH"] = str(mail_config_path)
+            config_env_overridden = True
 
         if args.command == "mail-probe":
-            config: Dict[str, Any] = {}
-            if args.mail_config:
-                config = json.loads(Path(args.mail_config).read_text(encoding="utf-8"))
             if args.mail_file:
                 mailbox = MicrosoftGraphMailbox(
                     args.mail_file,
@@ -5910,8 +6065,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 if not args.mail_config:
                     raise XAIHttpFlowError("mail-probe 需要 --mail-config 或 --mail-file")
                 mailbox = build_mailbox(config=config, proxy=proxy, timeout=args.timeout)
-            email, token = mailbox.create()
+            try:
+                email, token = mailbox.create()
+            except BaseException:
+                if bool(getattr(args, "mark_used", False)):
+                    try:
+                        mailbox.release(reason="mail_probe_failed")
+                    except Exception:
+                        pass
+                raise
             count = -1
+            inbox_probe_ok = True
             try:
                 if isinstance(mailbox, YydsTempMailbox):
                     messages = mailbox._messages(email, token)
@@ -5919,7 +6083,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     messages = mailbox._messages(token)
                 count = len(messages) if isinstance(messages, list) else 0
             except Exception as exc:
+                inbox_probe_ok = False
                 logger(f"[mail-probe] 收件箱探测警告: {_safe_error_text(exc)}")
+            if bool(getattr(args, "mark_used", False)):
+                if inbox_probe_ok:
+                    commit = getattr(mailbox, "commit_success", None)
+                    if callable(commit):
+                        commit()
+                else:
+                    release = getattr(mailbox, "release", None)
+                    if callable(release):
+                        release(reason="mail_probe_inbox_failed")
             print(f"[+] mail-probe ok email={mask_email(email)} inbox_messages={count} token_len={len(token)}")
             return 0
 
@@ -5936,8 +6110,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(
                 "[+] Turnstile 已捕获。"
                 "请尽快用同一代理执行 register，例如:\n"
-                f'  python grok_register_ttk.py http register --proxy "{selected_raw or proxy}" '
-                f"--turnstile-token-file {args.output} --mail-config config.json --output-dir xai_credentials"
+                f'  python xai_http_flow.py register --proxy "{selected_raw or proxy}" '
+                f"--turnstile-token-file {args.output} --mail-config "
+                f"{Path(os.environ.get('XAI_CONFIG_PATH') or CONFIG_PATH).expanduser().resolve()} "
+                f"--output-dir {CREDENTIALS_DIR}"
             )
             return 0
 
@@ -6039,7 +6215,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             output_dir=args.output_dir,
             accounts_output=(
                 args.accounts_output
-                or f"accounts_http_{time.strftime('%Y%m%d_%H%M%S')}.txt"
+                or str(ACCOUNTS_DIR / f"accounts_http_{time.strftime('%Y%m%d_%H%M%S')}.txt")
             ),
         )
         print(
@@ -6054,13 +6230,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"[!] 未处理异常: {_safe_error_text(exc)}", file=sys.stderr)
         return 3
     finally:
-        if forwarder_instance:
-            try:
-                from local_proxy_forwarder import stop_local_forwarder
-
-                stop_local_forwarder(instance_key=forwarder_instance)
-            except Exception:
-                pass
+        if config_env_overridden:
+            if previous_config_env is None:
+                os.environ.pop("XAI_CONFIG_PATH", None)
+            else:
+                os.environ["XAI_CONFIG_PATH"] = previous_config_env
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -7,12 +7,11 @@ import trainer_cpu_tui as m
 def test_classify_and_scope():
     trainer = [
         "/home/scv/miniconda3/bin/python3",
-        "/path/grok_register_ttk.py",
-        "http",
+        "/path/xai_http_flow.py",
         "register",
     ]
     webui = ["python3", "webui_app.py", "--port", "33844"]
-    bash_echo = ["/bin/bash", "-c", "echo grok_register_ttk.py"]
+    bash_echo = ["/bin/bash", "-c", "echo xai_http_flow.py"]
     self_mon = ["python3", "trainer_cpu_tui.py", "--once"]
 
     assert m._classify_proc(trainer) == m.CAT_TRAINER

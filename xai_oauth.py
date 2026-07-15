@@ -14,10 +14,12 @@ import threading
 import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse
 
 from curl_cffi import requests
 
+from local_paths import CONFIG_PATH
 import turnstile_flow as _tf
 from turnstile_flow import (
     SCENE_OAUTH,
@@ -281,9 +283,7 @@ def save_credential_file(doc, output_dir):
     # Best-effort CPA auto push (config-driven). Never break credential write.
     try:
         import cpa_push
-        from pathlib import Path as _Path
-
-        cfg_path = _Path(__file__).resolve().parent / "config.json"
+        cfg_path = Path(os.environ.get("XAI_CONFIG_PATH") or CONFIG_PATH).expanduser().resolve()
         cfg = {}
         if cfg_path.is_file():
             try:

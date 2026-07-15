@@ -231,7 +231,7 @@ def _classify_proc(parts: Sequence[str], name: str = "") -> Optional[str]:
         return None
     bases = {_argv_basename(p) for p in parts}
 
-    if "grok_register_ttk.py" in bases or "grok_register_ttk" in bases:
+    if "xai_http_flow.py" in bases or "xai_http_flow" in bases:
         return CAT_TRAINER
     if "webui_app.py" in bases or "cpa_main.py" in bases:
         return CAT_WEBUI
@@ -246,10 +246,10 @@ def _classify_proc(parts: Sequence[str], name: str = "") -> Optional[str]:
     ):
         return CAT_CHROME
 
-    if ".embedded_mihomo" in joined or "verge-mihomo" in joined:
-        if "grok" in joined or ".embedded_mihomo" in joined:
+    if "embedded_mihomo" in joined or "verge-mihomo" in joined:
+        if "grok" in joined or "embedded_mihomo" in joined:
             return CAT_MIHOMO
-    if "mihomo" in bases and ".embedded_mihomo" in joined:
+    if "mihomo" in bases and "embedded_mihomo" in joined:
         return CAT_MIHOMO
 
     return None
@@ -299,7 +299,7 @@ class CpuSampler:
         system_cpu = float(psutil.cpu_percent(interval=None))
         try:
             load1, load5, load15 = os.getloadavg()
-        except OSError:
+        except (AttributeError, OSError):
             load1 = load5 = load15 = 0.0
 
         mem = psutil.virtual_memory()

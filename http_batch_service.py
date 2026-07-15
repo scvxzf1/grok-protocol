@@ -12,28 +12,51 @@ import json
 import os
 import random
 import queue
+import secrets
 import shutil
 import signal
 import re
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unicodedata
 import urllib.error
 import urllib.request
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple
 
+from cross_process_lock import (
+    CrossProcessFileLock,
+    CrossProcessLockTimeout,
+    atomic_write_private_text,
+    configured_lock_timeout,
+    ensure_private_file,
+)
+from project_browser_registry import (
+    registered_project_browsers,
+    terminate_project_browser_trees,
+)
+from local_paths import (
+    CONFIG_PATH as LOCAL_CONFIG_PATH,
+    CREDENTIALS_DIR as LOCAL_CREDENTIALS_DIR,
+    EXPORTS_DIR as LOCAL_EXPORTS_DIR,
+    FIXTURES_DIR as LOCAL_FIXTURES_DIR,
+    LOCAL_ROOT,
+    RUNS_DIR as LOCAL_RUNS_DIR,
+)
+
 
 ROOT_DIR = Path(__file__).resolve().parent
-DEFAULT_CONFIG_PATH = ROOT_DIR / "config.json"
-DEFAULT_OUTPUT_DIR = ROOT_DIR / "xai_credentials"
-DEFAULT_EXPORT_DIR = ROOT_DIR / "exports"
-RUNS_DIR = ROOT_DIR / "http_runs"
+DEFAULT_CONFIG_PATH = LOCAL_CONFIG_PATH
+DEFAULT_OUTPUT_DIR = LOCAL_CREDENTIALS_DIR
+DEFAULT_EXPORT_DIR = LOCAL_EXPORTS_DIR
+RUNS_DIR = LOCAL_RUNS_DIR
 MAX_COUNT = 99999999
 TARGET_MODE_COUNT = "count"
 TARGET_MODE_CONTINUOUS = "continuous"
@@ -48,6 +71,14 @@ CIRCUIT_PAUSE_SEC = 30.0
 CONTINUOUS_STALL_RECOVERY_SEC = 20.0
 PROXY_HEALTH_CHECK_INTERVAL_SEC = 15.0
 PROXY_DEAD_PAUSE_SEC = 15.0
+STATIC_PROXY_HEALTH_TIMEOUT_SEC = 12.0
+STATIC_PROXY_HEALTH_PROBE_WORKERS = 2
+STATIC_PROXY_HEALTH_ATTEMPTS = 3
+STATIC_PROXY_HEALTH_BACKOFF_SEC = 0.35
+STATIC_PROXY_SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
+STATIC_PROXY_MS_TOKEN_URL = (
+    "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
+)
 RECENT_WORKER_WINDOW = 200
 MAX_WORKERS = 128
 MAX_LOCAL_TURNSTILE_WORKERS = 3  # default local Turnstile concurrency cap
@@ -55,12 +86,37 @@ MIN_LOCAL_TURNSTILE_WORKERS = 1
 ABS_MAX_LOCAL_TURNSTILE_WORKERS = 6666
 DEFAULT_TURNSTILE_QUEUE_SIZE = 64
 DEFAULT_SUBMIT_WORKERS = 4
+MAX_SUBMIT_WORKERS = 32
 MAX_LOG_LINES = 700
 DEFAULT_SSO_CONVERT_RETRIES = 5
 DEFAULT_SSO_CONVERT_COOLDOWN = 3
 MAX_SSO_CONVERT_RETRIES = 20
 MAX_SSO_CONVERT_COOLDOWN = 120
+MS_MAIL_POOL_UI_LOCK_TIMEOUT_SEC = configured_lock_timeout(
+    "XAI_MS_MAIL_POOL_LOCK_TIMEOUT_SEC",
+    default=60.0,
+)
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+MAIL_RECORD_RE = re.compile(
+    r"(?i)[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9.-]+----[^\r\n]+"
+)
+EMAIL_ADDRESS_RE = re.compile(
+    r"(?i)(?<![A-Z0-9.!#$%&'*+/=?^_`{|}~-])"
+    r"[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9.-]+"
+)
+SENSITIVE_VALUE_RE = re.compile(
+    r"(?i)\b(access[_-]?token|refresh[_-]?token|sso(?:[_-]?cookie)?|password|client[_-]?id)"
+    r"(\s*[=:]\s*[\"']?)([^\s\"',;}]+)"
+)
+BEARER_VALUE_RE = re.compile(r"(?i)\b(Bearer\s+)[A-Za-z0-9._~+/=-]+")
+MS_REFRESH_VALUE_RE = re.compile(r"\bM\.[A-Za-z0-9._~+/=-]{8,}")
+JWT_VALUE_RE = re.compile(
+    r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"
+)
+UUID_VALUE_RE = re.compile(
+    r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+    r"[0-9a-f]{4}-[0-9a-f]{12}\b"
+)
 
 STATUS_LABELS = {
     "queued": "排队中",
@@ -222,10 +278,8 @@ def format_browser_health(status: Optional[Dict[str, int]] = None) -> str:
 
 _TEMP_DIR_GLOBS = (
     "xai-ts-chrome-*",
-    "xai-ts-probe*",
-    "xai-chrome-raw-*",
-    "playwright_chromiumdev_profile-*",
 )
+_TEMP_DIR_ORPHAN_GRACE_SEC = 30.0
 
 
 def _reap_zombie_children() -> int:
@@ -253,6 +307,8 @@ def _kill_orphan_turnstile_solvers(*, keep_pids: Optional[set[int]] = None) -> i
     then accumulate as zombies. Cleaning these orphans is safe for this project
     and does not touch the user's daily Chrome browser.
     """
+    if os.name == "nt":
+        return 0
     keep = set(int(x) for x in (keep_pids or set()) if int(x) > 1)
     keep.add(os.getpid())
     killed = 0
@@ -320,49 +376,52 @@ def cleanup_browser_residues(
     keep_solver_pids: Optional[set[int]] = None,
     pkill_fn=None,
 ) -> Dict[str, int]:
-    """Clean Playwright/Chrome residues that commonly block headed Turnstile launches.
+    """Clean only Chromium trees bearing this project's profile marker.
 
-    Default is conservative for the user's daily browser:
-      - kill Playwright Chromium leftovers
-      - kill this project's temp Chrome profiles (xai-ts-chrome-*)
-      - kill orphan turnstile_solver parents left by previous runs
-      - do NOT kill every Chrome process unless explicitly requested
+    The legacy ``kill_playwright``/``kill_all_chrome``/``pkill_fn`` arguments
+    remain call-compatible but never widen selection to unrelated browsers.
     """
-    if pkill_fn is None:
-        def pkill_fn(pattern: str) -> int:
-            before = _pgrep_count(pattern)
-            if before <= 0:
-                return 0
-            subprocess.run(
-                ["pkill", "-f", pattern],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            # Give the kernel a moment to reap.
-            time.sleep(0.2)
-            after = _pgrep_count(pattern)
-            return max(0, before - after)
+    del kill_playwright, kill_all_chrome, pkill_fn
 
     killed_solvers = int(_kill_orphan_turnstile_solvers(keep_pids=keep_solver_pids) if kill_orphan_solvers else 0)
-    killed_playwright = int(pkill_fn("ms-playwright/chromium") if kill_playwright else 0)
-    # Always reap this project's headless profiles; do not touch the user's daily Chrome.
-    killed_project_chrome = int(pkill_fn("xai-ts-chrome-") + pkill_fn("xai-chrome-raw-"))
-    killed_chrome = int(pkill_fn("chrome") if kill_all_chrome else 0) + killed_project_chrome
+    project_cleanup = terminate_project_browser_trees(grace_sec=2.0)
+    killed_project_chrome = int(project_cleanup.get("browser_roots") or 0)
+    killed_playwright = 0
+    killed_chrome = killed_project_chrome
     reaped_zombies = int(_reap_zombie_children())
 
-    root = Path(temp_root or "/tmp")
-    removed = 0
+    root = Path(temp_root or tempfile.gettempdir()).expanduser().resolve(strict=False)
+    removed = int(project_cleanup.get("profiles_removed") or 0)
+    try:
+        protected_profiles = {
+            str(Path(entry.get("profile_dir") or "").expanduser().resolve(strict=False))
+            for entry in registered_project_browsers()
+            if str(entry.get("profile_dir") or "").strip()
+        }
+    except Exception:
+        protected_profiles = set()
+    now = time.time()
     for pattern in _TEMP_DIR_GLOBS:
         for path in root.glob(pattern):
             try:
-                if path.is_dir():
-                    shutil.rmtree(path, ignore_errors=True)
+                resolved = path.resolve(strict=False)
+                if os.path.commonpath((str(resolved), str(root))) != str(root):
+                    continue
+                if str(resolved) in protected_profiles:
+                    continue
+                # Browser launch creates its profile shortly before publishing
+                # the PID.  A short grace period prevents a concurrent cleanup
+                # pass from deleting that not-yet-registered directory.
+                age = max(0.0, now - float(resolved.stat().st_mtime))
+                if age < _TEMP_DIR_ORPHAN_GRACE_SEC:
+                    continue
+                if resolved.is_dir():
+                    shutil.rmtree(resolved, ignore_errors=True)
                     removed += 1
-                elif path.exists():
-                    path.unlink(missing_ok=True)
+                elif resolved.exists():
+                    resolved.unlink(missing_ok=True)
                     removed += 1
-            except OSError:
+            except (OSError, ValueError):
                 continue
 
     health = browser_health_status()
@@ -440,6 +499,10 @@ class RunPlan:
     warnings: List[str] = field(default_factory=list)
     embedded_proxy_enabled: bool = False
     embedded_proxy_max_node_retries: int = 3
+    # Static HTTP affinity remains opt-in for compatibility with generic
+    # weighted rotation.  A durable supervisor may force this switch per run.
+    proxy_slot_sticky: bool = False
+    proxy_pool_entries: Tuple[str, ...] = field(default_factory=tuple)
     target_mode: str = TARGET_MODE_COUNT
     target_success: int = 0
     continuous_max_runtime_min: int = 0
@@ -460,6 +523,8 @@ class WorkerState:
     proxy_local_http: str = ""
     # HTTP pool assignment (proxies.txt / subscription HTTP). Can mix with embedded.
     manual_proxy: str = ""
+    manual_proxy_lease_token: str = field(default="", repr=False)
+    uses_independent_turnstile_proxy: bool = False
     tried_node_ids: List[str] = field(default_factory=list)
     proxy_attempt: int = 0
 
@@ -502,6 +567,28 @@ def _safe_text(value: object, limit: int = 400) -> str:
     text = ANSI_ESCAPE_RE.sub("", str(value or "")).replace("\r", "").replace("\t", "    ")
     text = " ".join(text.split())
     return text[:limit]
+
+
+def _redact_sensitive_runtime_text(value: object) -> str:
+    """Remove mailbox identities and credentials from ordinary runtime logs."""
+
+    text_value = str(value or "")
+    text_value = MAIL_RECORD_RE.sub("[mail-record-redacted]", text_value)
+
+    def mask_email(match: re.Match[str]) -> str:
+        address = match.group(0)
+        local, domain = address.split("@", 1)
+        return f"{local[:1] or '*'}***@{domain}"
+
+    text_value = EMAIL_ADDRESS_RE.sub(mask_email, text_value)
+    text_value = SENSITIVE_VALUE_RE.sub(
+        lambda match: f"{match.group(1)}{match.group(2)}***",
+        text_value,
+    )
+    text_value = BEARER_VALUE_RE.sub(r"\1***", text_value)
+    text_value = MS_REFRESH_VALUE_RE.sub("[refresh-token-redacted]", text_value)
+    text_value = JWT_VALUE_RE.sub("[jwt-redacted]", text_value)
+    return UUID_VALUE_RE.sub("[uuid-redacted]", text_value)
 
 
 def _status_label(status: str) -> str:
@@ -621,6 +708,7 @@ def apply_egress_mode_to_config(cfg: Dict[str, object], egress_mode: object) -> 
     cfg["proxy_mode"] = proxy_mode
     cfg["tui_proxy_mode"] = proxy_mode
     cfg["embedded_proxy_enabled"] = bool(embedded)
+    cfg.pop("proxy_parent", None)
     return mode
 
 
@@ -635,9 +723,9 @@ PROXY_POOL_SOURCE_LABELS = {
     PROXY_POOL_SOURCE_MANUAL: "手动维护",
     PROXY_POOL_SOURCE_SUBSCRIPTION: "订阅导入",
 }
-# 内嵌 mihomo 节点缓存（VLESS/Hysteria2/AnyTLS；与订阅拉取解耦；启动只读此文件）
-EMBEDDED_VLESS_CACHE_REL = Path(".embedded_mihomo") / "vless_nodes.txt"
-EMBEDDED_NODE_CACHE_REL = Path(".embedded_mihomo") / "nodes.txt"
+# 内嵌 mihomo 节点缓存（VLESS/Hysteria2/AnyTLS/Trojan；与订阅拉取解耦；启动只读此文件）
+EMBEDDED_VLESS_CACHE_REL = Path("state") / "embedded_mihomo" / "vless_nodes.txt"
+EMBEDDED_NODE_CACHE_REL = Path("state") / "embedded_mihomo" / "nodes.txt"
 
 
 def normalize_proxy_pool_source(value: object) -> str:
@@ -743,17 +831,12 @@ PROXY_FAILURE_MARKERS = (
     "打开注册页 HTTP 403",
     "HTTP 403",
     "cf-ray",
-    # Local headless Turnstile empty-timeouts are often egress-quality related.
-    # Fail fast and switch embedded node instead of burning 3x long waits.
-    "Turnstile 求解失败",
-    "未捕获到可用 Turnstile token",
     "与页面的连接已断开",
     "浏览器启动/连接失败",
     "token_len=0",
 )
 
-# Pure mail / token-verify issues should not burn embedded proxy node retries.
-# Note: empty Turnstile capture timeouts ARE treated as proxy/egress failures above.
+# Challenge, mail, and token-verify issues should not burn embedded proxy retries.
 # IMPORTANT: do NOT use bare keywords like "邮箱" — normal success logs also contain
 # "邮箱验证码已通过校验", which would falsely suppress proxy rotation.
 NON_PROXY_FAILURE_MARKERS = (
@@ -761,6 +844,9 @@ NON_PROXY_FAILURE_MARKERS = (
     "Turnstile consume 后 token 无效",
     "返回的 Turnstile token 无效",
     "solver pool busy",
+    "turnstile timeout",
+    "turnstile challenge error",
+    "未捕获到可用 turnstile token",
     "YYDS create HTTP",
     "YYDS create",
     "shared_domain_restricted",
@@ -777,9 +863,9 @@ NON_PROXY_FAILURE_MARKERS = (
 def _looks_like_proxy_failure(text: str) -> bool:
     """Heuristics for embedded-proxy node failures / bad egress.
 
-    Local Turnstile empty-timeouts and browser disconnects usually correlate with
-    bad egress or overloaded browser+proxy pairs, so they should rotate nodes.
-    Pure email/token-verify failures stay excluded.
+    Browser disconnects and transport errors rotate nodes. Challenge timeouts and
+    Turnstile error families stay with the browser retry classifier instead of
+    charging an infrastructure failure to the route.
     """
     blob = str(text or "")
     if not blob:
@@ -788,8 +874,6 @@ def _looks_like_proxy_failure(text: str) -> bool:
 
     # Strong proxy/browser signals first (may coexist with earlier successful mail logs).
     strong_proxy_signals = (
-        "turnstile 求解失败",
-        "未捕获到可用 turnstile token",
         "与页面的连接已断开",
         "浏览器启动/连接失败",
         "token_len=0",
@@ -805,29 +889,27 @@ def _looks_like_proxy_failure(text: str) -> bool:
         "connection refused",
         "打开注册页 http 403",
     )
-    if any(sig in lower for sig in strong_proxy_signals):
-        # Still exclude pure mail-provider failures if that is the only/terminal issue.
-        mail_only = (
-            "yyds create http" in lower
-            or "shared_domain_restricted" in lower
-            or "email-domain-rejected" in lower
-            or "email domain has been rejected" in lower
-        )
-        if not mail_only:
-            return True
+    last_strong_signal = max((lower.rfind(sig) for sig in strong_proxy_signals), default=-1)
+    last_non_proxy_signal = max(
+        (lower.rfind(marker.lower()) for marker in NON_PROXY_FAILURE_MARKERS),
+        default=-1,
+    )
+    # Worker logs are chronological.  Let the later terminal diagnosis win so
+    # an earlier token_len=0 does not mask a subsequent token-verification
+    # rejection, while a later transport error still rotates the route.
+    if last_non_proxy_signal > last_strong_signal:
+        return False
+    if last_strong_signal >= 0:
+        return True
 
-    for marker in NON_PROXY_FAILURE_MARKERS:
-        if marker.lower() in lower:
-            return False
+    if last_non_proxy_signal >= 0:
+        return False
     if "没有可用的内嵌代理节点" in blob or "内嵌代理已启用但管理器未就绪" in blob:
         return True
     for marker in PROXY_FAILURE_MARKERS:
         if marker.lower() in lower:
             return True
     if "tls" in lower and ("error" in lower or "connect" in lower):
-        return True
-    # Generic timeout while solving turnstile: rotate egress.
-    if "turnstile" in lower and ("timeout" in lower or "超时" in blob or "elapsed_ms=50" in lower):
         return True
     return False
 
@@ -939,16 +1021,30 @@ def _read_config(path: Path) -> Dict[str, object]:
         raise TuiConfigError(f"无法读取配置 JSON: {exc}") from exc
     if not isinstance(data, dict):
         raise TuiConfigError("配置 JSON 根节点必须是对象")
+    # Retire settings whose implementations were removed. Keeping them out of
+    # memory also removes them the next time configuration is persisted.
+    for retired_key in (
+        "proxy_parent",
+        "grok2api_auto_add_local",
+        "grok2api_local_token_file",
+        "grok2api_pool_name",
+        "grok2api_auto_add_remote",
+        "grok2api_remote_base",
+        "grok2api_remote_app_key",
+        "cloudflare_path_domains",
+        "cloudflare_path_token",
+        "enable_nsfw",
+        "xai_oauth_auto",
+        "xai_oauth_callback_port",
+    ):
+        data.pop(retired_key, None)
     return data
 
 
 def _write_config(path: Path, data: Dict[str, object]) -> None:
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
         payload = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
-        tmp.write_text(payload, encoding="utf-8")
-        os.replace(tmp, path)
+        atomic_write_private_text(path, payload)
     except OSError as exc:
         raise TuiConfigError(f"无法写入配置文件: {exc}") from exc
 
@@ -1146,8 +1242,12 @@ def _load_runtime_fields(settings: Settings) -> None:
     settings.submit_workers = max(
         1,
         min(
-            MAX_WORKERS,
-            _positive_int(config.get("submit_workers", DEFAULT_SUBMIT_WORKERS), "提交并发", MAX_WORKERS),
+            MAX_SUBMIT_WORKERS,
+            _positive_int(
+                config.get("submit_workers", DEFAULT_SUBMIT_WORKERS),
+                "提交并发",
+                MAX_SUBMIT_WORKERS,
+            ),
         ),
     )
     settings.sso_convert_retries = _bounded_int(
@@ -1213,9 +1313,9 @@ def settings_from_args(args: argparse.Namespace) -> Settings:
     elif getattr(args, "mode", None):
         settings.run_mode = _normalize_run_mode(args.mode)
     if "output_dir" in explicit and getattr(args, "output_dir", None):
-        settings.output_dir = _absolute_path(args.output_dir)
+        settings.output_dir = _absolute_path(args.output_dir, settings.config_path.parent)
     elif getattr(args, "output_dir", None):
-        settings.output_dir = _absolute_path(args.output_dir)
+        settings.output_dir = _absolute_path(args.output_dir, settings.config_path.parent)
     if bool(getattr(args, "no_proxy", False)):
         settings.no_proxy = True
         settings.proxy_mode = "none"
@@ -1235,7 +1335,7 @@ def _resolve_proxy_args(settings: Settings) -> Tuple[str, List[str]]:
 
     config = settings.config
     direct_proxy = str(config.get("proxy") or "").strip()
-    proxy_file_value = str(config.get("proxy_file") or "").strip()
+    proxy_file_value = str(config.get("proxy_file") or "fixtures/proxies.txt").strip()
     proxy_file = _absolute_path(proxy_file_value, settings.config_path.parent) if proxy_file_value else None
     if mode == "auto":
         mode = "direct" if direct_proxy else "pool" if proxy_file and proxy_file.is_file() else "none"
@@ -1254,9 +1354,6 @@ def _resolve_proxy_args(settings: Settings) -> Tuple[str, List[str]]:
     elif mode != "none":
         raise TuiConfigError(f"不支持的代理模式: {mode}")
 
-    parent_proxy = str(config.get("proxy_parent") or "").strip()
-    if mode != "none" and parent_proxy:
-        args.extend(["--proxy-parent", parent_proxy])
     return mode, args
 
 
@@ -1340,7 +1437,7 @@ def build_plan(settings: Settings) -> RunPlan:
         )
         if turnstile_headless:
             warnings.append(
-                "本地无头会映射为 virtual-headed（Xvfb）；"
+                "本地浏览器无头使用原生 Chrome --headless=new（不会启动可见窗口或有头回退）；"
                 f"建议账号并发 ≤ {local_cap}"
                 "（配置 concurrent_workers / local_turnstile_max_workers）。"
             )
@@ -1392,7 +1489,7 @@ def build_plan(settings: Settings) -> RunPlan:
     submit_workers = max(
         1,
         min(
-            MAX_WORKERS,
+            MAX_SUBMIT_WORKERS,
             int(
                 config.get("submit_workers")
                 or settings.submit_workers
@@ -1403,7 +1500,7 @@ def build_plan(settings: Settings) -> RunPlan:
     turnstile_broker_url = str(
         settings.turnstile_broker_url or config.get("turnstile_broker_url") or ""
     ).strip()
-    # Local headless/virtual-headed capture is process-local and stable only when
+    # Local native-headless capture is process-local and stable only when
     # each register worker solves independently. The shared HTTP broker path has
     # repeatedly timed out under concurrency (browser_starts=0 / Read timed out),
     # so default local runs force direct capture unless an external broker URL is
@@ -1440,6 +1537,7 @@ def build_plan(settings: Settings) -> RunPlan:
         maximum=20,
         default=3,
     )
+    proxy_slot_sticky = _as_bool(config.get("proxy_slot_sticky"))
     if target_mode == TARGET_MODE_CONTINUOUS:
         if target_success > 0:
             warnings.append(
@@ -1474,6 +1572,7 @@ def build_plan(settings: Settings) -> RunPlan:
         warnings=warnings,
         embedded_proxy_enabled=embedded_proxy_enabled,
         embedded_proxy_max_node_retries=embedded_proxy_max_node_retries,
+        proxy_slot_sticky=proxy_slot_sticky,
         target_mode=target_mode,
         target_success=target_success,
         continuous_max_runtime_min=continuous_max_runtime_min,
@@ -1619,6 +1718,13 @@ class BatchRunner:
         self._last_browser_residue_cleanup_at: float = 0.0
         self._hybrid_proxy_seq: int = 0
         self._manual_proxy_rotator = None
+        self._proxy_pool_snapshot_path: Optional[Path] = None
+        self._static_proxy_health: Dict[int, Dict[str, object]] = {}
+        self._static_proxy_entries: Tuple[str, ...] = tuple()
+        # A stopped static-route attempt is replaced by a fresh WorkerState.
+        # Carry its proxy-attempt budget across that replacement so a fixed
+        # count run cannot refill forever on permanently failing routes.
+        self._static_proxy_retry_queue: Deque[int] = deque()
 
     @staticmethod
     def _free_loopback_port() -> int:
@@ -1912,9 +2018,365 @@ class BatchRunner:
         self.workers = new_workers
 
     def _log(self, source: str, message: str) -> None:
-        message = _safe_text(message)
+        message = _safe_text(
+            _redact_sensitive_runtime_text(self._redact_proxy_text(message))
+        )
         if message:
             self.logs.append(f"[{source}] {message}")
+
+    def _redact_proxy_text(self, value: object) -> str:
+        """Return secret-free text for UI state and persisted worker logs."""
+        proxies: Sequence[str] = self._static_proxy_entries
+        rotator = getattr(self, "_manual_proxy_rotator", None)
+        if rotator is not None:
+            try:
+                proxies = tuple(rotator.proxies())
+            except Exception:
+                pass
+        try:
+            from proxy_pool import redact_proxy_text
+
+            return redact_proxy_text(value, proxies)
+        except Exception:
+            return str(value or "")
+
+    def _uses_static_proxy_leases(self) -> bool:
+        return bool(
+            getattr(self.plan, "proxy_slot_sticky", False)
+            and self._http_proxy_pool_active()
+        )
+
+    def _manual_proxy_source_path(self) -> Optional[Path]:
+        args = list(self.plan.proxy_args or [])
+        for index, token in enumerate(args):
+            if token == "--proxy-file" and index + 1 < len(args):
+                return Path(args[index + 1]).expanduser().resolve()
+        try:
+            cfg = _read_config(self.plan.config_path)
+        except Exception:
+            cfg = {}
+        raw = str((cfg or {}).get("proxy_file") or "").strip()
+        if not raw:
+            return None
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            path = self.plan.config_path.parent / path
+        return path.resolve()
+
+    def _prepare_static_proxy_snapshot(self) -> None:
+        """Freeze the HTTP pool once for this batch and build its lease owner."""
+        if not self._uses_static_proxy_leases():
+            return
+        try:
+            from proxy_pool import ProxyRotator, load_proxy_lines, normalize_proxy_pool
+        except Exception as exc:  # pragma: no cover - import failure is fatal
+            raise TuiConfigError(f"加载静态代理租约组件失败: {exc}") from exc
+
+        configured = tuple(getattr(self.plan, "proxy_pool_entries", ()) or ())
+        if configured:
+            entries = normalize_proxy_pool(configured)
+            source_name = "plan"
+        else:
+            source = self._manual_proxy_source_path()
+            entries = load_proxy_lines(str(source)) if source is not None else []
+            source_name = source.name if source is not None else "proxy-file"
+        if not entries:
+            raise TuiConfigError("静态 HTTP 代理租约缺少有效的启动快照条目")
+
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        target = self.run_dir / "proxy_pool.snapshot.txt"
+        temp = target.with_name(
+            f".{target.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+        )
+        fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write("\n".join(entries) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp, target)
+            try:
+                os.chmod(target, 0o600)
+            except OSError:
+                pass
+        finally:
+            try:
+                temp.unlink()
+            except FileNotFoundError:
+                pass
+
+        self._proxy_pool_snapshot_path = target
+        self._static_proxy_entries = tuple(entries)
+        self.plan.proxy_pool_entries = tuple(entries)
+        self._manual_proxy_rotator = ProxyRotator(
+            entries,
+            stats_file=str(self.plan.config_path.parent / "state" / "proxy_stats.log"),
+        )
+        self._log(
+            "SYSTEM",
+            f"[Proxy] 本批次静态 HTTP 池已冻结 | source={source_name} valid={len(entries)}",
+        )
+
+    def _perform_static_proxy_health_request(
+        self,
+        proxy_url: str,
+        target: str,
+    ) -> Tuple[int, str]:
+        """Probe one real registration dependency through a prepared route."""
+        from curl_cffi import requests as curl_requests
+
+        common = {
+            "proxies": {"http": proxy_url, "https": proxy_url},
+            "timeout": STATIC_PROXY_HEALTH_TIMEOUT_SEC,
+            "impersonate": "chrome136",
+            "allow_redirects": False,
+        }
+        if target == "signup":
+            response = curl_requests.get(STATIC_PROXY_SIGNUP_URL, **common)
+        elif target == "ms_token":
+            response = curl_requests.post(
+                STATIC_PROXY_MS_TOKEN_URL,
+                data={
+                    "client_id": "PROXY_HEALTH_CHECK",
+                    "grant_type": "refresh_token",
+                    "refresh_token": "PROXY_HEALTH_CHECK",
+                },
+                **common,
+            )
+        else:  # pragma: no cover - internal programming error
+            raise ValueError(f"unknown proxy health target: {target}")
+        return (
+            int(getattr(response, "status_code", 0) or 0),
+            str(getattr(response, "text", "") or "")[:4096],
+        )
+
+    @staticmethod
+    def _static_proxy_transport_reason(exc: BaseException) -> str:
+        text_value = f"{type(exc).__name__}: {exc}".lower()
+        if any(
+            marker in text_value
+            for marker in (
+                "curl: (35)",
+                "tls connect",
+                "ssl connect",
+                "openssl",
+                "unexpected eof",
+                "certificate verify",
+            )
+        ):
+            return "curl_tls_error"
+        if any(
+            marker in text_value
+            for marker in (
+                "curl: (5)",
+                "curl: (6)",
+                "curl: (7)",
+                "curl: (28)",
+                "curl: (56)",
+                "proxy",
+                "connect",
+                "timeout",
+                "timed out",
+            )
+        ):
+            return "proxy_transport_error"
+        return "target_transport_error"
+
+    @staticmethod
+    def _classify_static_proxy_target(
+        target: str,
+        status_code: int,
+        body: str,
+    ) -> Tuple[bool, str]:
+        status = int(status_code or 0)
+        lowered = str(body or "").lower()
+        region_markers = (
+            "unsupported region",
+            "unsupported_region",
+            "restricted region",
+            "restricted_region",
+            "not available in your region",
+            "not available in your country",
+            "unsupported country",
+            "unsupported_country",
+            "country_block",
+            "cf_country",
+            "geo_block",
+        )
+        if target == "signup":
+            if status == 403 or (
+                status == 451 and any(marker in lowered for marker in region_markers)
+            ):
+                return False, "signup_region_403"
+            if 200 <= status < 400:
+                return True, "ok"
+            return False, f"signup_http_{status or 0}"
+        if target == "ms_token":
+            if 200 <= status < 500 and status not in {403, 407, 429}:
+                return True, "ok"
+            return False, f"ms_token_http_{status or 0}"
+        return False, "unknown_target"
+
+    def _probe_static_proxy_slot(
+        self,
+        slot_index: int,
+        proxy_raw: str,
+    ) -> Dict[str, object]:
+        """Probe signup and Microsoft token routes for one frozen entry."""
+        forwarder_key = (
+            f"batch-proxy-health-{self.run_id}-{int(slot_index)}-"
+            f"{secrets.token_hex(3)}"
+        )
+        target_results: Dict[str, Dict[str, object]] = {}
+        try:
+            from local_proxy_forwarder import ensure_local_forwarder
+
+            proxy_url, _ = ensure_local_forwarder(
+                proxy_raw,
+                preferred_local_port=0,
+                instance_key=forwarder_key,
+            )
+        except Exception as exc:
+            try:
+                from local_proxy_forwarder import stop_local_forwarder
+
+                stop_local_forwarder(instance_key=forwarder_key)
+            except Exception:
+                pass
+            return {
+                "index": int(slot_index),
+                "ok": False,
+                "reason": self._static_proxy_transport_reason(exc),
+                "targets": target_results,
+            }
+
+        try:
+            for target in ("signup", "ms_token"):
+                for attempt in range(1, STATIC_PROXY_HEALTH_ATTEMPTS + 1):
+                    try:
+                        status, body = self._perform_static_proxy_health_request(
+                            proxy_url,
+                            target,
+                        )
+                        ok, reason = self._classify_static_proxy_target(
+                            target,
+                            status,
+                            body,
+                        )
+                        target_results[target] = {
+                            "ok": ok,
+                            "status_code": status,
+                            "reason": reason,
+                            "attempts": attempt,
+                        }
+                    except Exception as exc:
+                        reason = self._static_proxy_transport_reason(exc)
+                        target_results[target] = {
+                            "ok": False,
+                            "status_code": None,
+                            "reason": reason,
+                            "attempts": attempt,
+                        }
+                    item = target_results[target]
+                    if item.get("ok"):
+                        break
+                    reason = str(item.get("reason") or "")
+                    retryable = reason in {
+                        "curl_tls_error",
+                        "proxy_transport_error",
+                        "target_transport_error",
+                    } or reason.endswith("_429") or bool(
+                        re.search(r"_http_5\d\d$", reason)
+                    )
+                    if not retryable or attempt >= STATIC_PROXY_HEALTH_ATTEMPTS:
+                        break
+                    time.sleep(
+                        STATIC_PROXY_HEALTH_BACKOFF_SEC * attempt
+                        + min(0.2, int(slot_index) * 0.04)
+                    )
+        finally:
+            try:
+                from local_proxy_forwarder import stop_local_forwarder
+
+                stop_local_forwarder(instance_key=forwarder_key)
+            except Exception:
+                pass
+
+        failures = [
+            str(item.get("reason") or "target_probe_failed")
+            for item in target_results.values()
+            if not item.get("ok")
+        ]
+        return {
+            "index": int(slot_index),
+            "ok": not failures and len(target_results) == 2,
+            "reason": ",".join(dict.fromkeys(failures)) if failures else "ok",
+            "targets": target_results,
+        }
+
+    def _probe_static_proxy_slots(self) -> None:
+        """Run the bounded two-target gate before any registration starts."""
+        if not self._uses_static_proxy_leases():
+            return
+        entries = list(self._static_proxy_entries)
+        if not entries:
+            raise TuiConfigError("静态 HTTP 代理探测缺少完整的启动快照")
+
+        results: Dict[int, Dict[str, object]] = {}
+        with ThreadPoolExecutor(
+            max_workers=max(1, min(len(entries), STATIC_PROXY_HEALTH_PROBE_WORKERS)),
+            thread_name_prefix="static-proxy-health",
+        ) as executor:
+            futures = {
+                executor.submit(self._probe_static_proxy_slot, index, proxy): index
+                for index, proxy in enumerate(entries)
+            }
+            for future in as_completed(futures):
+                index = int(futures[future])
+                try:
+                    results[index] = dict(future.result())
+                except Exception as exc:  # one bad probe must not hide peers
+                    results[index] = {
+                        "index": index,
+                        "ok": False,
+                        "reason": self._static_proxy_transport_reason(exc),
+                        "targets": {},
+                    }
+
+        self._static_proxy_health = results
+        rotator = self._manual_proxy_rotator
+        healthy = 0
+        isolated: List[int] = []
+        for index, proxy in enumerate(entries):
+            item = results.get(index) or {
+                "ok": False,
+                "reason": "target_probe_missing",
+            }
+            ok = bool(item.get("ok"))
+            reason = str(item.get("reason") or ("ok" if ok else "target_probe_failed"))
+            if rotator is not None:
+                rotator.record_result(proxy, ok, f"preflight:{reason}")
+                if ok:
+                    rotator.mark_good(proxy)
+                else:
+                    rotator.mark_bad(proxy)
+            if ok:
+                healthy += 1
+            else:
+                isolated.append(index)
+                self._log(
+                    "SYSTEM",
+                    f"[Proxy] 静态 HTTP 槽位 #{index + 1} 启动隔离: {reason}",
+                )
+        suffix = ""
+        if isolated:
+            suffix = "；隔离 " + ", ".join(f"#{index + 1}" for index in isolated)
+        self._log(
+            "SYSTEM",
+            f"[Proxy] 双目标启动探测完成: 健康 {healthy}/{len(entries)}{suffix}",
+        )
+        if healthy <= 0 and not self.plan.embedded_proxy_enabled:
+            raise TuiConfigError("静态 HTTP 代理均未通过注册依赖探测")
 
     def start(self) -> None:
         if self.started:
@@ -1927,6 +2389,8 @@ class BatchRunner:
                 os.chmod(directory, 0o700)
             except OSError:
                 pass
+        self._prepare_static_proxy_snapshot()
+        self._probe_static_proxy_slots()
         if self.plan.provider == "local":
             cleanup = cleanup_browser_residues(kill_playwright=True, kill_all_chrome=False)
             self._last_browser_residue_cleanup_at = time.monotonic()
@@ -1954,8 +2418,7 @@ class BatchRunner:
         assert worker.accounts_path is not None
         command = [
             sys.executable,
-            str(ROOT_DIR / "grok_register_ttk.py"),
-            "http",
+            str(ROOT_DIR / "xai_http_flow.py"),
             "register",
             "--mail-config",
             str(self.plan.config_path),
@@ -1990,15 +2453,8 @@ class BatchRunner:
         if self.plan.embedded_proxy_enabled and worker.proxy_local_http:
             command.extend(["--proxy", worker.proxy_local_http])
         elif str(worker.manual_proxy or "").strip():
-            # Parent-side pool assignment: one concrete proxy per worker.
+            # Batch-side pool assignment: one concrete proxy per worker.
             command.extend(["--proxy", str(worker.manual_proxy).strip()])
-            parent_proxy = ""
-            for i, tok in enumerate(self.plan.proxy_args):
-                if tok == "--proxy-parent" and i + 1 < len(self.plan.proxy_args):
-                    parent_proxy = self.plan.proxy_args[i + 1]
-                    break
-            if parent_proxy:
-                command.extend(["--proxy-parent", parent_proxy])
         else:
             command.extend(self.plan.proxy_args)
         # Independent Turnstile solve proxy (optional).
@@ -2009,12 +2465,15 @@ class BatchRunner:
             )
         except Exception:
             ts_proxy = ""
+        worker.uses_independent_turnstile_proxy = bool(ts_proxy)
         if ts_proxy:
             command.extend(["--turnstile-proxy", ts_proxy])
         return command
 
     def _append_worker_log(self, worker: WorkerState, message: str) -> None:
-        text_line = _safe_text(message)
+        text_line = _safe_text(
+            _redact_sensitive_runtime_text(self._redact_proxy_text(message))
+        )
         if not text_line:
             return
         self.events.put((worker.index, text_line))
@@ -2050,13 +2509,14 @@ class BatchRunner:
         fail_messages: List[str] = []
         self.plan.output_dir.mkdir(parents=True, exist_ok=True)
         for email, _password, sso in rows:
+            display_email = _redact_sensitive_runtime_text(email)
             if self.stopping:
-                fail_messages.append(f"{email}: 批次停止，跳过")
+                fail_messages.append(f"{display_email}: 批次停止，跳过")
                 continue
             sso = str(sso or "").strip().lstrip("-")
             if not sso:
-                fail_messages.append(f"{email}: SSO 为空，跳过转换")
-                self._append_worker_log(worker, f"SSO 为空，跳过转换 | email={email}")
+                fail_messages.append(f"{display_email}: SSO 为空，跳过转换")
+                self._append_worker_log(worker, f"SSO 为空，跳过转换 | email={display_email}")
                 continue
             last_error = "未知错误"
             success = False
@@ -2068,7 +2528,7 @@ class BatchRunner:
                 write_sso_file(sso_path, sso)
                 self._append_worker_log(
                     worker,
-                    f"SSO 已单独保存 | email={email} | {sso_path.name}",
+                    f"SSO 已单独保存 | email={display_email}",
                 )
             except Exception as exc:
                 self._append_worker_log(worker, f"SSO 单文件保存失败: {exc}")
@@ -2093,7 +2553,7 @@ class BatchRunner:
                     command.extend(["--email", email])
                 self._append_worker_log(
                     worker,
-                    f"开始 SSO→凭证转换 | email={email} | 尝试 {attempt}/{retries}",
+                    f"开始 SSO→凭证转换 | email={display_email} | 尝试 {attempt}/{retries}",
                 )
                 output_lines: List[str] = []
                 try:
@@ -2115,7 +2575,6 @@ class BatchRunner:
                     try:
                         for line in iter(process.stdout.readline, ""):
                             output_lines.append(line)
-                            self._append_worker_log(worker, line)
                     finally:
                         try:
                             process.stdout.close()
@@ -2131,14 +2590,14 @@ class BatchRunner:
                         last_error += " (限流/slow_down)"
                     self._append_worker_log(
                         worker,
-                        f"SSO 转换失败 | email={email} | 尝试 {attempt}/{retries} | {last_error}",
+                        f"SSO 转换失败 | email={display_email} | 尝试 {attempt}/{retries} | {last_error}",
                     )
                 if attempt < retries and not self.stopping:
                     wait_s = cooldown
                     # 限流时至少冷却配置秒数，避免连打 device/code
                     self._append_worker_log(
                         worker,
-                        f"SSO 转换冷却 {wait_s}s 后重试 | email={email} | 下一轮 {attempt + 1}/{retries}",
+                        f"SSO 转换冷却 {wait_s}s 后重试 | email={display_email} | 下一轮 {attempt + 1}/{retries}",
                     )
                     # 分段 sleep，便于 stop 时尽快退出
                     deadline = time.monotonic() + wait_s
@@ -2149,7 +2608,7 @@ class BatchRunner:
             if success:
                 ok_count += 1
             else:
-                fail_messages.append(f"{email}: {last_error}")
+                fail_messages.append(f"{display_email}: {last_error}")
 
         if ok_count == len(rows):
             return True, f"SSO 转换完成 {ok_count}/{len(rows)}"
@@ -2420,7 +2879,8 @@ class BatchRunner:
             worker.last_log = "没有可用的内嵌代理节点"
             self._log(f"W{worker.index:02d}", worker.last_log)
             return False
-        worker.manual_proxy = ""
+        if worker.manual_proxy or worker.manual_proxy_lease_token:
+            self._release_manual_proxy(worker, success=None, reason="switch_to_embedded")
         worker.proxy_node_id = str(node.id)
         worker.proxy_node_name = str(getattr(node, "name", "") or "")
         worker.proxy_local_http = str(getattr(node, "local_http", "") or "")
@@ -2444,7 +2904,7 @@ class BatchRunner:
             return
         manager = self.embedded_proxy_manager
         node_id = worker.proxy_node_id
-        reason_text = str(reason or worker.last_log or "")
+        reason_text = self._redact_proxy_text(reason or worker.last_log or "")
         if manager is not None:
             try:
                 manager.release(node_id, failed=failed, reason=reason_text)
@@ -2470,7 +2930,7 @@ class BatchRunner:
         """True when HTTP proxy pool (proxies.txt) is configured for this run.
 
         Can be combined with embedded mihomo: registration workers may use either
-        embedded VLESS/Hy2/AnyTLS nodes or subscription HTTP proxies.
+        embedded VLESS/Hy2/AnyTLS/Trojan nodes or subscription HTTP proxies.
         """
         mode = str(self.plan.proxy_mode or "").strip().lower()
         if mode in {"none", "direct"}:
@@ -2485,7 +2945,7 @@ class BatchRunner:
         return self._http_proxy_pool_active()
 
     def _ensure_manual_proxy_rotator(self):
-        """Lazily build process-level ProxyRotator from plan proxy-file."""
+        """Build the rotator from the frozen snapshot or legacy live pool."""
         if getattr(self, "_manual_proxy_rotator", None) is not None:
             return self._manual_proxy_rotator
         try:
@@ -2494,29 +2954,31 @@ class BatchRunner:
             self._log("SYSTEM", f"[Proxy] 无法加载 proxy_pool: {exc}")
             self._manual_proxy_rotator = None
             return None
-        proxy_file = ""
-        args = list(self.plan.proxy_args or [])
-        for i, tok in enumerate(args):
-            if tok == "--proxy-file" and i + 1 < len(args):
-                proxy_file = args[i + 1]
-                break
-        if not proxy_file:
-            cfg_path = getattr(self.plan, "config_path", None)
-            try:
-                cfg = _read_config(cfg_path) if cfg_path else {}
-            except Exception:
-                cfg = {}
-            proxy_file = str((cfg or {}).get("proxy_file") or "proxies.txt")
-            if not os.path.isabs(proxy_file):
-                base = Path(cfg_path).parent if cfg_path else ROOT_DIR
-                proxy_file = str(base / proxy_file)
-        proxies = load_proxy_lines(proxy_file)
-        stats = str(ROOT_DIR / "proxy_stats.log")
-        rotator = configure_global_rotator(proxies, stats_file=stats, force=True)
+        source = self._manual_proxy_source_path()
+        proxy_file = str(source or "")
+        if self._uses_static_proxy_leases():
+            proxies = list(
+                self._static_proxy_entries
+                or tuple(getattr(self.plan, "proxy_pool_entries", ()) or ())
+            )
+            if not proxies and source is not None:
+                # Direct unit/integration callers may acquire before start();
+                # production start() always freezes the file first.
+                proxies = load_proxy_lines(str(source))
+                self._static_proxy_entries = tuple(proxies)
+            stats_file = str(self.plan.config_path.parent / "state" / "proxy_stats.log")
+            rotator = ProxyRotator(proxies, stats_file=stats_file)
+        else:
+            proxies = load_proxy_lines(proxy_file)
+            rotator = configure_global_rotator(
+                proxies,
+                stats_file=str(self.plan.config_path.parent / "state" / "proxy_stats.log"),
+                force=True,
+            )
         self._manual_proxy_rotator = rotator
         self._log(
             "SYSTEM",
-            f"[Proxy] 手动代理池已就绪 | file={os.path.basename(proxy_file)} valid={len(rotator)}",
+            f"[Proxy] 手动代理池已就绪 | file={os.path.basename(proxy_file) or 'snapshot'} valid={len(rotator)}",
         )
         if len(rotator) == 0:
             self._log("SYSTEM", "[Proxy][warn] 手动代理池有效条目为 0（可能全是 null host）")
@@ -2531,16 +2993,21 @@ class BatchRunner:
             worker.last_log = "HTTP 代理池无有效条目（请检查 proxies.txt / 订阅 HTTP 节点）"
             self._log(f"W{worker.index:02d}", worker.last_log)
             return False
-        proxy = str(rotator.next() or "").strip()
+        lease = None
+        if self._uses_static_proxy_leases():
+            lease = rotator.acquire_lease(owner=f"worker-{worker.index}")
+            proxy = str(getattr(lease, "proxy", "") or "").strip()
+        else:
+            proxy = str(rotator.next() or "").strip()
         if not proxy:
-            worker.last_log = "HTTP 代理池暂时无可用代理（可能全部冷却）"
+            worker.last_log = "HTTP 代理池暂时无空闲健康租约（可能占用中或冷却中）"
             self._log(f"W{worker.index:02d}", worker.last_log)
             return False
-        # Clear any previous embedded lease fields; one worker one egress.
-        worker.proxy_node_id = None
-        worker.proxy_node_name = ""
-        worker.proxy_local_http = ""
+        # Clear any previous embedded lease; one worker owns one egress.
+        if worker.proxy_node_id:
+            self._release_embedded_proxy(worker, failed=False)
         worker.manual_proxy = proxy
+        worker.manual_proxy_lease_token = str(getattr(lease, "token", "") or "")
         worker.proxy_attempt = int(worker.proxy_attempt or 0) + 1
         try:
             from proxy_pool import extract_country, mask_proxy
@@ -2581,7 +3048,7 @@ class BatchRunner:
         for source in order:
             if source == "embedded":
                 # Ensure no stale HTTP assignment remains.
-                worker.manual_proxy = ""
+                self._release_manual_proxy(worker, success=None, reason="switch_to_embedded")
                 if self._acquire_embedded_proxy(worker):
                     return True
                 errors.append(worker.last_log or "内嵌代理无可用节点")
@@ -2597,10 +3064,18 @@ class BatchRunner:
         self._log(f"W{worker.index:02d}", worker.last_log)
         return False
 
-    def _report_manual_proxy_outcome(self, worker: WorkerState, *, success: bool, reason: str = "") -> None:
+    def _release_manual_proxy(
+        self,
+        worker: WorkerState,
+        *,
+        success: Optional[bool] = None,
+        reason: str = "",
+    ) -> bool:
+        """Release a worker's HTTP route exactly once and attribute an outcome."""
         proxy = str(worker.manual_proxy or "").strip()
-        if not proxy:
-            return
+        token = str(worker.manual_proxy_lease_token or "").strip()
+        if not proxy and not token:
+            return False
         rotator = getattr(self, "_manual_proxy_rotator", None)
         if rotator is None:
             try:
@@ -2609,16 +3084,45 @@ class BatchRunner:
                 rotator = get_global_rotator()
             except Exception:
                 rotator = None
-        if rotator is None:
-            return
+        released = False
         try:
-            rotator.record_result(proxy, bool(success), reason=str(reason or "")[:120])
-            if success:
-                rotator.mark_good(proxy)
+            clean_reason = self._redact_proxy_text(reason)[:120]
+            if rotator is not None and token:
+                released = bool(
+                    rotator.release_lease(
+                        token,
+                        success=success,
+                        reason=clean_reason,
+                    )
+                )
+            elif rotator is not None and proxy:
+                # Legacy non-sticky rotation has no token, but clearing the
+                # assignment still makes duplicate exit-path calls idempotent.
+                if success is not None:
+                    rotator.record_result(proxy, bool(success), reason=clean_reason)
+                    if success:
+                        rotator.mark_good(proxy)
+                    else:
+                        rotator.mark_bad(proxy)
+                released = True
             else:
-                rotator.mark_bad(proxy)
+                released = bool(proxy or token)
         except Exception:
-            pass
+            released = False
+        finally:
+            worker.manual_proxy = ""
+            worker.manual_proxy_lease_token = ""
+        return released
+
+    def _report_manual_proxy_outcome(
+        self,
+        worker: WorkerState,
+        *,
+        success: bool,
+        reason: str = "",
+    ) -> None:
+        """Compatibility wrapper for callers using the pre-lease method name."""
+        self._release_manual_proxy(worker, success=success, reason=reason)
 
     def _worker_proxy_failure_blob(self, worker: WorkerState, reason_text: str = "") -> str:
         parts = [reason_text, worker.last_log]
@@ -2628,6 +3132,55 @@ class BatchRunner:
             except OSError:
                 pass
         return "\n".join(str(p) for p in parts if p)
+
+    @staticmethod
+    def _uses_independent_turnstile_route_for_failure(
+        worker: WorkerState,
+        failure_blob: str,
+    ) -> bool:
+        text_value = str(failure_blob or "").lower()
+        return bool(
+            worker.uses_independent_turnstile_proxy
+            and ("turnstile" in text_value or "captcha" in text_value)
+        )
+
+    def _isolate_static_proxy_lease(
+        self,
+        worker: WorkerState,
+        reason: str,
+    ) -> bool:
+        """Cooldown one runtime-bad static route and return its lease once."""
+        if not self._uses_static_proxy_leases() or not worker.manual_proxy_lease_token:
+            return False
+        proxy = str(worker.manual_proxy or "")
+        try:
+            index = self._static_proxy_entries.index(proxy)
+        except ValueError:
+            index = -1
+        released = self._release_manual_proxy(
+            worker,
+            success=False,
+            reason=self._redact_proxy_text(reason)[:120],
+        )
+        if not released:
+            return False
+        if index >= 0:
+            self._static_proxy_health[index] = {
+                "index": index,
+                "ok": False,
+                "reason": "runtime_proxy_failure",
+                "targets": {},
+            }
+        self._log(
+            "SYSTEM",
+            f"[Proxy] 静态 HTTP 槽位 "
+            f"#{index + 1 if index >= 0 else '?'} 运行期隔离并进入冷却",
+        )
+        return True
+
+    # Compatibility hook retained for callers of the previous indexed-slot API.
+    def _isolate_static_proxy_slot(self, worker: WorkerState, reason: str) -> bool:
+        return self._isolate_static_proxy_lease(worker, reason)
 
     def _maybe_retry_proxy_node(self, worker: WorkerState, reason_text: str = "") -> bool:
         """If failure looks proxy-related and retries remain, switch egress and respawn.
@@ -2642,8 +3195,30 @@ class BatchRunner:
             return False
         max_retries = max(1, int(self.plan.embedded_proxy_max_node_retries or 3))
         blob = self._worker_proxy_failure_blob(worker, reason_text)
+        if self._uses_independent_turnstile_route_for_failure(worker, blob):
+            # A dedicated solver route owns this failure.  Keep the registration
+            # route out of proxy retry/isolation attribution.
+            return False
         if not _looks_like_proxy_failure(blob):
             return False
+
+        if self._isolate_static_proxy_lease(worker, blob):
+            attempt = max(1, int(worker.proxy_attempt or 0))
+            if attempt >= max_retries:
+                worker.last_log = (
+                    f"[Proxy] 静态 HTTP 路由失败已达上限 "
+                    f"({attempt}/{max_retries})，计入失败"
+                )
+                self._log(f"W{worker.index:02d}", worker.last_log)
+                return False
+            # This attempt diagnosed infrastructure rather than a business
+            # account result.  Refill creates a replacement logical task while
+            # retaining the attempt budget in _static_proxy_retry_queue.
+            self._static_proxy_retry_queue.append(attempt)
+            worker.last_log = "[Proxy] 静态 HTTP 路由已隔离，任务将重排"
+            self._mark_terminal(worker, "stopped")
+            self.started_tasks = max(0, int(self.started_tasks) - 1)
+            return True
 
         current_id = worker.proxy_node_id
         if current_id and current_id not in worker.tried_node_ids:
@@ -2706,6 +3281,11 @@ class BatchRunner:
             if worker.proxy_node_id:
                 self._release_embedded_proxy(worker, failed=False)
 
+    def _release_all_manual_proxies(self) -> None:
+        for worker in self.workers:
+            if worker.manual_proxy or worker.manual_proxy_lease_token:
+                self._release_manual_proxy(worker, success=None, reason="batch_finalize")
+
     def _spawn_one(self, worker: WorkerState, *, acquire_proxy: bool = True) -> bool:
         """Try to launch one worker process.
 
@@ -2720,10 +3300,27 @@ class BatchRunner:
                     worker.last_log = "没有可用代理"
                 # Do not mark failed / do not write failure counters.
                 return False
-        command = self._command_for(worker)
+        try:
+            command = self._command_for(worker)
+        except Exception as exc:
+            self._mark_terminal(worker, "failed")
+            worker.last_log = self._redact_proxy_text(f"构建工作进程命令失败: {exc}")
+            self._release_manual_proxy(
+                worker,
+                success=False,
+                reason="command_build_failed",
+            )
+            self._release_embedded_proxy(worker, failed=False, reason=worker.last_log)
+            self._record_failure(worker, worker.last_log)
+            self._log(f"W{worker.index:02d}", worker.last_log)
+            return False
         log_handle = None
         try:
             log_handle = worker.log_path.open("w", encoding="utf-8", buffering=1)
+            try:
+                os.chmod(worker.log_path, 0o600)
+            except OSError:
+                pass
             child_env = os.environ.copy()
             try:
                 cfg_for_env = _read_config(self.plan.config_path)
@@ -2747,9 +3344,14 @@ class BatchRunner:
                 bufsize=1,
                 env=child_env,
             )
-        except OSError as exc:
+        except Exception as exc:
             self._mark_terminal(worker, "failed")
-            worker.last_log = f"无法启动进程: {exc}"
+            worker.last_log = self._redact_proxy_text(f"无法启动进程: {exc}")
+            self._release_manual_proxy(
+                worker,
+                success=False,
+                reason="process_spawn_failed",
+            )
             self._release_embedded_proxy(worker, failed=True, reason=worker.last_log)
             self._record_failure(worker, worker.last_log)
             self._log(f"W{worker.index:02d}", worker.last_log)
@@ -2769,11 +3371,14 @@ class BatchRunner:
             assert process.stdout is not None
             try:
                 for line in iter(process.stdout.readline, ""):
+                    safe_line = _redact_sensitive_runtime_text(
+                        self._redact_proxy_text(line)
+                    )
                     try:
-                        log_handle.write(line)
+                        log_handle.write(safe_line)
                     except OSError:
                         pass
-                    self.events.put((worker.index, line))
+                    self.events.put((worker.index, safe_line))
             finally:
                 try:
                     process.stdout.close()
@@ -2837,6 +3442,24 @@ class BatchRunner:
         # Touch progress so next recovery waits another full window if spawn still fails.
         self._last_progress_at = now
 
+    def _available_spawn_slots(self) -> int:
+        """Return general worker slots, capped only for HTTP-only sticky runs."""
+        slots = max(0, int(self.plan.workers) - len(self.active))
+        if (
+            slots > 0
+            and self._uses_static_proxy_leases()
+            and not self.plan.embedded_proxy_enabled
+        ):
+            rotator = self._ensure_manual_proxy_rotator()
+            free_leases = 0
+            if rotator is not None:
+                try:
+                    free_leases = int(rotator.available_lease_count())
+                except Exception:
+                    free_leases = 0
+            slots = min(slots, max(0, free_leases))
+        return slots
+
     def _spawn_available(self) -> None:
         if self.done:
             return
@@ -2856,12 +3479,18 @@ class BatchRunner:
             return
 
         # Hard cap attempts in one tick: never create more than worker slots.
-        slots = max(0, int(self.plan.workers) - len(self.active))
+        slots = self._available_spawn_slots()
         attempts = 0
         while slots > 0 and attempts < int(self.plan.workers) and self._should_refill():
             if self._refill_pause_active():
                 break
-            worker = WorkerState(index=self.next_index)
+            static_retry_attempt: Optional[int] = None
+            if self._static_proxy_retry_queue:
+                static_retry_attempt = self._static_proxy_retry_queue.popleft()
+            worker = WorkerState(
+                index=self.next_index,
+                proxy_attempt=int(static_retry_attempt or 0),
+            )
             self.next_index += 1
             attempts += 1
             # staged until process actually starts
@@ -2872,7 +3501,7 @@ class BatchRunner:
             if launched:
                 self.started_tasks += 1
                 self._last_progress_at = time.monotonic()
-                slots = max(0, int(self.plan.workers) - len(self.active))
+                slots = self._available_spawn_slots()
                 continue
             # Launch failed without becoming active.
             reason = worker.last_log or "启动失败"
@@ -2881,8 +3510,13 @@ class BatchRunner:
             resource_shortage = (
                 "没有可用的内嵌代理节点" in reason
                 or "内嵌代理已启用但管理器未就绪" in reason
+                or "无空闲健康租约" in reason
+                or "HTTP 代理池无有效条目" in reason
+                or "没有可用代理" in reason
             )
             if resource_shortage:
+                if static_retry_attempt is not None:
+                    self._static_proxy_retry_queue.appendleft(static_retry_attempt)
                 # Remove non-started worker so it does not pollute active/queues.
                 try:
                     self.workers.remove(worker)
@@ -2895,8 +3529,13 @@ class BatchRunner:
             if worker.status not in {"failed", "stopped", "succeeded"}:
                 self._mark_terminal(worker, "failed")
                 self._record_failure(worker, reason)
+            if static_retry_attempt is not None:
+                # The original launched attempt was removed from started_tasks
+                # when it was scheduled for replacement.  A hard replacement
+                # launch failure terminates that same logical task.
+                self.started_tasks += 1
             # Still respect one-tick budget; avoid tight-loop storm.
-            slots = max(0, int(self.plan.workers) - len(self.active))
+            slots = self._available_spawn_slots()
             # brief pause after hard spawn errors too
             self._pause_refill(reason, seconds=min(DEFAULT_REFILL_PAUSE_SEC, 1.0))
             break
@@ -2923,8 +3562,10 @@ class BatchRunner:
                     self._record_failure(worker, msg)
                 self._log(f"W{worker_index:02d}", worker.last_log)
                 continue
-            worker.last_log = _safe_text(raw)
-            self._log(f"W{worker_index:02d}", raw)
+            worker.last_log = _safe_text(
+                _redact_sensitive_runtime_text(self._redact_proxy_text(raw))
+            )
+            self._log(f"W{worker_index:02d}", worker.last_log)
 
     def _check_processes(self) -> None:
         for worker in list(self.workers):
@@ -2938,6 +3579,7 @@ class BatchRunner:
             if self.stopping:
                 self._mark_terminal(worker, "stopped")
                 worker.last_log = "已被操作者停止"
+                self._release_manual_proxy(worker, success=None, reason="batch_stopped")
                 self._release_embedded_proxy(worker, failed=False)
                 self._log(f"W{worker.index:02d}", worker.last_log)
             elif return_code == 0:
@@ -2960,11 +3602,18 @@ class BatchRunner:
                     continue
                 blob = self._worker_proxy_failure_blob(worker, reason)
                 category = classify_failure_text(blob)
-                self._report_manual_proxy_outcome(
-                    worker,
-                    success=False,
-                    reason=category if category != "unknown" else reason,
-                )
+                if self._uses_independent_turnstile_route_for_failure(worker, blob):
+                    self._release_manual_proxy(
+                        worker,
+                        success=None,
+                        reason="independent_turnstile_failure",
+                    )
+                else:
+                    self._report_manual_proxy_outcome(
+                        worker,
+                        success=False,
+                        reason=category if category != "unknown" else reason,
+                    )
                 self._mark_terminal(worker, "failed")
                 # Attribute proxy/TLS failure to the node only when it looks like egress/TLS.
                 self._release_embedded_proxy(
@@ -2979,7 +3628,9 @@ class BatchRunner:
         if self.done:
             return
         try:
-            summary = ROOT_DIR / f"accounts_http_{self.run_id}.txt"
+            summary_dir = self.run_dir.parent.parent / "accounts"
+            summary_dir.mkdir(parents=True, exist_ok=True)
+            summary = summary_dir / f"accounts_http_{self.run_id}.txt"
             lines: List[str] = []
             account_files = sorted(self.run_dir.glob("accounts_*.txt"))
             for accounts_path in account_files:
@@ -3007,6 +3658,7 @@ class BatchRunner:
                 f"批量完成: 成功={self.succeeded}, 失败={self.failed}, 账号数={self.account_count}",
             )
         finally:
+            self._release_all_manual_proxies()
             self._release_all_embedded_proxies()
             self._stop_shared_broker()
             self.phase = "done"
@@ -3042,6 +3694,7 @@ class BatchRunner:
             if worker.status == "queued":
                 self._mark_terminal(worker, "stopped")
                 worker.last_log = "因批次被停止而未启动"
+                self._release_manual_proxy(worker, success=None, reason="batch_stopped")
                 self._release_embedded_proxy(worker, failed=False)
                 self._log(f"W{worker.index:02d}", worker.last_log)
         for worker in list(self.workers):
@@ -3101,8 +3754,8 @@ class BatchRunner:
             "stopping": self.stopping,
             "phase": self.phase,
             "refill_paused": bool(self.refill_paused),
-            "refill_pause_reason": self.refill_pause_reason or "",
-            "pause_reason": self.refill_pause_reason or "",
+            "refill_pause_reason": self._redact_proxy_text(self.refill_pause_reason or ""),
+            "pause_reason": self._redact_proxy_text(self.refill_pause_reason or ""),
             "circuit_open": bool(self.circuit_open),
             "proxy_unhealthy": bool(self._proxy_unhealthy),
             "target_mode": getattr(self.plan, "target_mode", TARGET_MODE_COUNT),
@@ -3132,7 +3785,9 @@ class BatchRunner:
                 {
                     "index": worker.index,
                     "status": worker.status,
-                    "last_log": worker.last_log,
+                    "last_log": _redact_sensitive_runtime_text(
+                        self._redact_proxy_text(worker.last_log)
+                    ),
                     "return_code": worker.return_code,
                 }
                 for worker in shown_workers
@@ -3143,7 +3798,10 @@ class BatchRunner:
         payload = self.snapshot()
         target = self.run_dir / "summary.json"
         try:
-            target.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            atomic_write_private_text(
+                target,
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            )
         except OSError as exc:
             self._log("SYSTEM", f"无法写入 summary.json: {exc}")
 
@@ -3233,7 +3891,6 @@ SENSITIVE_CONFIG_KEYS = (
     "yyds_jwt",
     "duckmail_api_key",
     "cloudflare_api_key",
-    "grok2api_remote_app_key",
     "cpa_api_key",
 )
 
@@ -3274,7 +3931,7 @@ def _settings_to_public_dict(settings: Settings) -> Dict[str, object]:
         "turnstile_headless": settings.turnstile_headless,
         "local_turnstile_max_workers": resolve_local_turnstile_max_workers(settings.config or {}, strict=False),
         "local_turnstile_max_inflight": resolve_local_turnstile_max_inflight_cfg(settings.config or {}, strict=False),
-        "submit_workers": max(1, min(MAX_WORKERS, int((settings.config or {}).get("submit_workers") or settings.submit_workers or DEFAULT_SUBMIT_WORKERS))),
+        "submit_workers": max(1, min(MAX_SUBMIT_WORKERS, int((settings.config or {}).get("submit_workers") or settings.submit_workers or DEFAULT_SUBMIT_WORKERS))),
         "turnstile_solve_timeout": _bounded_int((settings.config or {}).get("turnstile_solve_timeout"), "Turnstile单次超时", minimum=5, maximum=600, default=90),
         "turnstile_solve_retries": _bounded_int((settings.config or {}).get("turnstile_solve_retries"), "Turnstile重试次数", minimum=1, maximum=10, default=1),
         "mail_code_timeout_sec": _bounded_int((settings.config or {}).get("mail_code_timeout_sec"), "邮箱验证码等待", minimum=10, maximum=180, default=40),
@@ -3286,7 +3943,9 @@ def _settings_to_public_dict(settings: Settings) -> Dict[str, object]:
 
 
 def _proxy_file_path(settings: Settings) -> Path:
-    raw = str((settings.config or {}).get("proxy_file") or "proxies.txt").strip() or "proxies.txt"
+    raw = str(
+        (settings.config or {}).get("proxy_file") or "fixtures/proxies.txt"
+    ).strip() or "fixtures/proxies.txt"
     return _absolute_path(raw, settings.config_path.parent)
 
 
@@ -3295,7 +3954,7 @@ def _ms_mail_file_path(settings: Settings) -> Path:
     raw = str((settings.config or {}).get("ms_mail_file") or "").strip()
     if not raw:
         # Sensible default next to config; user can change path in UI.
-        raw = "need/outlook_mail.txt"
+        raw = "fixtures/outlook_mail.txt"
     return _absolute_path(raw, settings.config_path.parent)
 
 
@@ -3305,12 +3964,14 @@ def read_ms_mail_pool_text(settings: Settings) -> Dict[str, object]:
     exists = path.is_file()
     if exists:
         try:
+            ensure_private_file(path)
             text_value = path.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
-            raise TuiConfigError(f"读取微软邮箱池失败: {exc}") from exc
+            raise TuiConfigError("读取微软邮箱池失败") from exc
     valid = 0
     invalid = 0
-    for ln in text_value.splitlines():
+    errors: List[str] = []
+    for idx, ln in enumerate(text_value.splitlines(), start=1):
         s = ln.strip()
         if not s or s.startswith("#"):
             continue
@@ -3319,13 +3980,16 @@ def read_ms_mail_pool_text(settings: Settings) -> Dict[str, object]:
 
             parse_ms_mail_line(s)
             valid += 1
-        except Exception:
+        except Exception as exc:
             invalid += 1
+            if len(errors) < 8:
+                errors.append(f"L{idx}: {_safe_text(exc)}")
     return {
         "path": str(path),
         "exists": exists,
         "line_count": valid,
         "invalid_count": invalid,
+        "errors": errors,
         "text": text_value,
         "format": "email----password----client_id----refresh_token",
     }
@@ -3333,7 +3997,6 @@ def read_ms_mail_pool_text(settings: Settings) -> Dict[str, object]:
 
 def write_ms_mail_pool_text(settings: Settings, text_value: str) -> Dict[str, object]:
     path = _ms_mail_file_path(settings)
-    path.parent.mkdir(parents=True, exist_ok=True)
     content = str(text_value or "")
     if content and not content.endswith("\n"):
         content += "\n"
@@ -3364,14 +4027,17 @@ def write_ms_mail_pool_text(settings: Settings, text_value: str) -> Dict[str, ob
     out = "\n".join(normalized_lines)
     if out and not out.endswith("\n"):
         out += "\n"
+    lock_path = path.with_suffix(path.suffix + ".lock")
     try:
-        path.write_text(out, encoding="utf-8")
-        try:
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
+        with CrossProcessFileLock(
+            lock_path,
+            timeout=MS_MAIL_POOL_UI_LOCK_TIMEOUT_SEC,
+        ):
+            atomic_write_private_text(path, out)
+    except CrossProcessLockTimeout as exc:
+        raise TuiConfigError("写入微软邮箱池时锁等待超时") from exc
     except OSError as exc:
-        raise TuiConfigError(f"写入微软邮箱池失败: {exc}") from exc
+        raise TuiConfigError("写入微软邮箱池失败") from exc
     cfg = dict(settings.config or {})
     cfg["ms_mail_file"] = _config_path_value(path, settings.config_path.parent)
     # When user edits pool, prefer msgraph provider if they had empty path before.
@@ -3583,7 +4249,7 @@ def export_credential_page_and_delete(
 
 def resolve_export_dir(root_dir: Path | None = None) -> Path:
     """Dedicated folder for grok+timestamp.txt exports."""
-    root = Path(root_dir or ROOT_DIR)
+    root = Path(root_dir or LOCAL_ROOT)
     export_dir = (root / "exports").expanduser()
     try:
         export_dir = export_dir.resolve(strict=False)
@@ -3732,7 +4398,10 @@ def write_proxy_pool_text(settings: Settings, text_value: str, *, sync_proxies_a
 
 
 def turnstile_proxy_file_path(settings: Settings) -> Path:
-    raw = str((settings.config or {}).get("turnstile_proxy_file") or "turnstile_proxies.txt").strip() or "turnstile_proxies.txt"
+    raw = str(
+        (settings.config or {}).get("turnstile_proxy_file")
+        or "fixtures/turnstile_proxies.txt"
+    ).strip() or "fixtures/turnstile_proxies.txt"
     return _absolute_path(raw, settings.config_path.parent)
 
 
@@ -3791,14 +4460,16 @@ def pick_turnstile_proxy(config: Dict[str, object], *, base_dir: Optional[Path] 
     if mode == "direct":
         return str(cfg.get("turnstile_proxy") or "").strip()
     # pool mode
-    file_raw = str(cfg.get("turnstile_proxy_file") or "turnstile_proxies.txt").strip() or "turnstile_proxies.txt"
+    file_raw = str(
+        cfg.get("turnstile_proxy_file") or "fixtures/turnstile_proxies.txt"
+    ).strip() or "fixtures/turnstile_proxies.txt"
     try:
         path = Path(file_raw).expanduser()
         if not path.is_absolute():
             bases = []
             if base_dir is not None:
                 bases.append(Path(base_dir))
-            bases.append(ROOT_DIR)
+            bases.extend([LOCAL_ROOT, ROOT_DIR])
             # Keep first existing candidate; otherwise fall back to preferred base.
             resolved = None
             for base in bases:
@@ -3808,11 +4479,11 @@ def pick_turnstile_proxy(config: Dict[str, object], *, base_dir: Optional[Path] 
                     break
                 if resolved is None:
                     resolved = candidate
-            path = resolved if resolved is not None else (ROOT_DIR / path).resolve()
+            path = resolved if resolved is not None else (LOCAL_ROOT / path).resolve()
         else:
             path = path.resolve()
     except Exception:
-        path = ROOT_DIR / "turnstile_proxies.txt"
+        path = LOCAL_FIXTURES_DIR / "turnstile_proxies.txt"
     lines: List[str] = []
     if path.is_file():
         try:
@@ -4065,7 +4736,7 @@ def build_config_center(settings: Settings) -> Dict[str, object]:
             "submit_workers": max(
                 1,
                 min(
-                    MAX_WORKERS,
+                    MAX_SUBMIT_WORKERS,
                     int(raw.get("submit_workers") or settings.submit_workers or DEFAULT_SUBMIT_WORKERS),
                 ),
             ),
@@ -4108,7 +4779,7 @@ def build_config_center(settings: Settings) -> Dict[str, object]:
                 )
             ),
             "proxy": str(raw.get("proxy") or ""),
-            "proxy_file": str(raw.get("proxy_file") or "proxies.txt"),
+            "proxy_file": str(raw.get("proxy_file") or "fixtures/proxies.txt"),
             "proxy_pool_source": resolve_proxy_pool_source(raw, strict=False),
             "proxy_subscription_url": str(raw.get("proxy_subscription_url") or ""),
             "proxy_subscription_urls": _subscription_urls_for_fields(raw),
@@ -4146,21 +4817,17 @@ def build_config_center(settings: Settings) -> Dict[str, object]:
                 maximum=20,
                 default=3,
             ),
-            "proxy_parent": str(raw.get("proxy_parent") or ""),
             "proxy_random": _as_bool(raw.get("proxy_random")),
             "proxy_rotate_session": _as_bool(raw.get("proxy_rotate_session")),
             "turnstile_proxy_enabled": _as_bool(raw.get("turnstile_proxy_enabled")),
             "turnstile_proxy_mode": str(raw.get("turnstile_proxy_mode") or "pool") or "pool",
             "turnstile_proxy": str(raw.get("turnstile_proxy") or ""),
-            "turnstile_proxy_file": str(raw.get("turnstile_proxy_file") or "turnstile_proxies.txt"),
+            "turnstile_proxy_file": str(
+                raw.get("turnstile_proxy_file") or "fixtures/turnstile_proxies.txt"
+            ),
             "turnstile_proxy_random": _as_bool(raw.get("turnstile_proxy_random", True)),
             "local_proxy_port": int(raw.get("local_proxy_port") or 17890),
             "xai_oauth_output_dir": str(settings.output_dir),
-            "grok2api_remote_base": str(raw.get("grok2api_remote_base") or ""),
-            "grok2api_remote_app_key": str(raw.get("grok2api_remote_app_key") or ""),
-            "grok2api_pool_name": str(raw.get("grok2api_pool_name") or ""),
-            "grok2api_auto_add_local": _as_bool(raw.get("grok2api_auto_add_local")),
-            "grok2api_auto_add_remote": _as_bool(raw.get("grok2api_auto_add_remote")),
             "cpa_api_url": str(raw.get("cpa_api_url") or ""),
             "cpa_api_key": str(raw.get("cpa_api_key") or ""),
             "cpa_auto_upload": _as_bool(raw.get("cpa_auto_upload")),
@@ -4180,7 +4847,7 @@ class BatchService:
         root_dir: Optional[Path] = None,
     ) -> None:
         self.root_dir = Path(root_dir or ROOT_DIR)
-        self.config_path = Path(config_path or (self.root_dir / "config.json"))
+        self.config_path = Path(config_path or DEFAULT_CONFIG_PATH)
         self.settings = self._load_settings()
         self._runner: Optional[BatchRunner] = None
         self._listeners: List[Callable[[str], None]] = []
@@ -4204,7 +4871,10 @@ class BatchService:
             config_path=self.config_path,
             count=_positive_int(config.get("register_count", 1), "注册数量", MAX_COUNT),
             workers=_positive_int(config.get("concurrent_workers", 1), "并发数", MAX_WORKERS),
-            output_dir=_absolute_path(str(config.get("xai_oauth_output_dir") or DEFAULT_OUTPUT_DIR), self.root_dir),
+            output_dir=_absolute_path(
+                str(config.get("xai_oauth_output_dir") or DEFAULT_OUTPUT_DIR),
+                self.config_path.parent,
+            ),
             run_mode=_normalize_run_mode(config.get("tui_run_mode") or DEFAULT_RUN_MODE),
             proxy_mode=str(config.get("tui_proxy_mode") or "auto"),
             no_proxy=str(config.get("tui_proxy_mode") or "auto").strip().lower() == "none",
@@ -4213,11 +4883,11 @@ class BatchService:
             submit_workers=max(
                 1,
                 min(
-                    MAX_WORKERS,
+                    MAX_SUBMIT_WORKERS,
                     _positive_int(
                         config.get("submit_workers", DEFAULT_SUBMIT_WORKERS),
                         "提交并发",
-                        MAX_WORKERS,
+                        MAX_SUBMIT_WORKERS,
                     ),
                 ),
             ),
@@ -4263,7 +4933,9 @@ class BatchService:
         if "workers" in data:
             self.settings.workers = _positive_int(data.get("workers"), "并发数", MAX_WORKERS)
         if "output_dir" in data and str(data.get("output_dir") or "").strip():
-            self.settings.output_dir = _absolute_path(str(data.get("output_dir")), self.root_dir)
+            self.settings.output_dir = _absolute_path(
+                str(data.get("output_dir")), self.config_path.parent
+            )
         if "run_mode" in data:
             self.settings.run_mode = _normalize_run_mode(data.get("run_mode"))
         if "egress_mode" in data and str(data.get("egress_mode") or "").strip():
@@ -4303,7 +4975,7 @@ class BatchService:
             )
             speed_touched = True
         if "submit_workers" in data:
-            sw = _positive_int(data.get("submit_workers"), "提交并发", MAX_WORKERS)
+            sw = _positive_int(data.get("submit_workers"), "提交并发", MAX_SUBMIT_WORKERS)
             self.settings.submit_workers = sw
             cfg_speed["submit_workers"] = int(sw)
             speed_touched = True
@@ -4425,7 +5097,9 @@ class BatchService:
         if "turnstile_headless" in fields:
             self.settings.turnstile_headless = _as_bool(fields.get("turnstile_headless"))
         if "xai_oauth_output_dir" in fields and str(fields.get("xai_oauth_output_dir") or "").strip():
-            self.settings.output_dir = _absolute_path(str(fields.get("xai_oauth_output_dir")), self.root_dir)
+            self.settings.output_dir = _absolute_path(
+                str(fields.get("xai_oauth_output_dir")), self.config_path.parent
+            )
 
         cfg = dict(self.settings.config or {})
         plain_keys = [
@@ -4441,13 +5115,9 @@ class BatchService:
             "embedded_proxy_binary",
             "embedded_proxy_listen_host",
             "embedded_proxy_probe_host",
-            "proxy_parent",
             "turnstile_proxy",
             "turnstile_proxy_file",
             "turnstile_proxy_mode",
-            "grok2api_remote_base",
-            "grok2api_pool_name",
-            "grok2api_local_token_file",
             "cpa_api_url",
             "defaultDomains",
             "user_agent",
@@ -4467,13 +5137,9 @@ class BatchService:
         bool_keys = [
             "proxy_random",
             "proxy_rotate_session",
-            "grok2api_auto_add_local",
-            "grok2api_auto_add_remote",
             "cpa_auto_upload",
             "cpa_use_local_name",
             "cpa_skip_duplicates",
-            "enable_nsfw",
-            "xai_oauth_auto",
             "embedded_proxy_enabled",
             "turnstile_proxy_enabled",
             "turnstile_proxy_random",
@@ -4571,7 +5237,7 @@ class BatchService:
             self.settings.submit_workers = _positive_int(
                 fields.get("submit_workers"),
                 "提交并发",
-                MAX_WORKERS,
+                MAX_SUBMIT_WORKERS,
             )
             cfg["submit_workers"] = int(self.settings.submit_workers)
 
@@ -4638,7 +5304,7 @@ class BatchService:
             "turnstile_proxy_file",
             "turnstile_proxy_random",
         )) and not str(cfg_now.get("turnstile_proxy_file") or "").strip():
-            cfg_now["turnstile_proxy_file"] = "turnstile_proxies.txt"
+            cfg_now["turnstile_proxy_file"] = "fixtures/turnstile_proxies.txt"
             self.settings.config = cfg_now
             persist_settings(self.settings)
             self.settings.config = _read_config(self.settings.config_path)
@@ -4650,7 +5316,7 @@ class BatchService:
         return list_credential_pairs(self.settings.output_dir, page=page, page_size=page_size)
 
     def export_dir(self) -> Path:
-        return resolve_export_dir(self.root_dir)
+        return resolve_export_dir(self.config_path.parent)
 
     def export_credentials_page(self, *, page: int = 1, page_size: int = 1000) -> Dict[str, object]:
         """Export one credentials page to exports/grok+timestamp.txt, then delete local pairs."""
@@ -4662,13 +5328,13 @@ class BatchService:
         )
 
     def list_export_files(self) -> Dict[str, object]:
-        return list_export_files(self.root_dir)
+        return list_export_files(self.config_path.parent)
 
     def delete_export_file(self, name: str) -> Dict[str, object]:
-        return delete_export_file(self.root_dir, name)
+        return delete_export_file(self.config_path.parent, name)
 
     def resolve_export_file(self, name: str) -> Path:
-        return resolve_export_file(self.root_dir, name)
+        return resolve_export_file(self.config_path.parent, name)
 
     def check_cpa_connection(self, payload: Optional[Dict[str, object]] = None) -> Dict[str, object]:
         """Test CPA management endpoint connectivity (override fields optional)."""
@@ -4840,13 +5506,16 @@ class BatchService:
     def import_clean_embedded_proxy_list(self, *, write_pool: bool = False) -> Dict[str, object]:
         """Load verified clean embedded local endpoints for the proxy pool editor."""
         candidates = [
-            self.root_dir / "proxies.clean_embedded.txt",
+            self.config_path.parent / "fixtures" / "proxies.clean_embedded.txt",
+            LOCAL_FIXTURES_DIR / "proxies.clean_embedded.txt",
             Path("/tmp/xai_good_proxies.txt"),
+            # Compatibility fallback for older local layouts.
+            self.root_dir / "proxies.clean_embedded.txt",
         ]
         path = next((p for p in candidates if p.is_file()), None)
         if path is None:
             raise TuiConfigError(
-                "未找到 clean 本地口文件（proxies.clean_embedded.txt 或 /tmp/xai_good_proxies.txt）"
+                "未找到 clean 本地口文件（.local/fixtures/proxies.clean_embedded.txt 或 /tmp/xai_good_proxies.txt）"
             )
         try:
             text_value = path.read_text(encoding="utf-8", errors="replace")
@@ -4950,6 +5619,7 @@ class BatchService:
             + int(schemes.get("hysteria2") or 0)
             + int(schemes.get("hy2") or 0)
             + int(schemes.get("anytls") or 0)
+            + int(schemes.get("trojan") or 0)
         )
         if _as_bool(cfg.get("embedded_proxy_enabled")):
             if embedded_candidate_n > 0 and not result.usable_pool_lines:
@@ -4984,7 +5654,7 @@ class BatchService:
             cfg["proxy"] = local_http
         elif not result.usable_pool_lines and embedded_enabled and embedded_candidate_n > 0:
             data.setdefault("warnings", []).append(
-                f"订阅含 {embedded_candidate_n} 个可内嵌节点（VLESS/Hysteria2/AnyTLS）。"
+                f"订阅含 {embedded_candidate_n} 个可内嵌节点（VLESS/Hysteria2/AnyTLS/Trojan）。"
                 "HTTP 代理池不可直接使用它们；请到左列“内嵌 mihomo”先「拉取订阅节点」再「启动/重载」。"
             )
             data["vless_for_embedded"] = True
@@ -5043,11 +5713,11 @@ class BatchService:
 
     def embedded_vless_cache_path(self) -> Path:
         """Legacy path (vless-only). Prefer embedded_node_cache_path."""
-        return Path(self.root_dir) / EMBEDDED_VLESS_CACHE_REL
+        return self.config_path.parent / EMBEDDED_VLESS_CACHE_REL
 
     def embedded_node_cache_path(self) -> Path:
-        """Primary cache for embedded nodes (vless/hysteria2/anytls)."""
-        return Path(self.root_dir) / EMBEDDED_NODE_CACHE_REL
+        """Primary cache for embedded nodes (vless/hysteria2/anytls/trojan)."""
+        return self.config_path.parent / EMBEDDED_NODE_CACHE_REL
 
     def _embedded_proxy_cfg_from_settings(self):
         from embedded_proxy_manager import EmbeddedProxyConfig
@@ -5077,7 +5747,7 @@ class BatchService:
             parsed = None
             if raw_line:
                 parsed = parse_embedded_node(raw_line)
-            if not parsed and scheme in {"vless", "hysteria2", "anytls"}:
+            if not parsed and scheme in {"vless", "hysteria2", "anytls", "trojan"}:
                 # Fallback: reconstruct is not available without raw; skip incomplete inventory.
                 continue
             if not parsed:
@@ -5113,7 +5783,7 @@ class BatchService:
         path.parent.mkdir(parents=True, exist_ok=True)
         lines = [
             f"# embedded node cache written_at={time.strftime('%Y-%m-%dT%H:%M:%S')}",
-            f"# protocols=vless,hysteria2,anytls",
+            f"# protocols=vless,hysteria2,anytls,trojan",
             f"# urls={', '.join(urls or [])}",
             f"# count={len(slots)}",
         ]
@@ -5174,6 +5844,8 @@ class BatchService:
                 key = "hysteria2"
             elif lower.startswith("anytls://"):
                 key = "anytls"
+            elif lower.startswith("trojan://"):
+                key = "trojan"
             else:
                 key = "other"
             by_proto[key] = by_proto.get(key, 0) + 1
@@ -5321,7 +5993,7 @@ class BatchService:
         all_slots = self._embedded_slots_from_nodes(result.nodes or [], max_nodes=0)
         if not all_slots:
             raise TuiConfigError(
-                "订阅中没有可用的内嵌节点（VLESS / Hysteria2 / AnyTLS），无法缓存内嵌池"
+                "订阅中没有可用的内嵌节点（VLESS / Hysteria2 / AnyTLS / Trojan），无法缓存内嵌池"
             )
         path = self._write_embedded_node_cache(all_slots, urls=url_list)
         _apply_subscription_urls_to_config(cfg, url_list)
@@ -5392,6 +6064,8 @@ class BatchService:
                     self.scheme = "hysteria2"
                 elif lower.startswith("anytls://"):
                     self.scheme = "anytls"
+                elif lower.startswith("trojan://"):
+                    self.scheme = "trojan"
                 else:
                     self.scheme = ""
                 self.raw = raw_line
@@ -5896,4 +6570,3 @@ class BatchService:
             return
         runner.tick()
         self._sync_logs()
-

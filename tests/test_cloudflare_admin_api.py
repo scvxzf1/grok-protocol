@@ -1,130 +1,94 @@
 import unittest
 from unittest.mock import patch
 
-import cf_mail_debug
-import grok_register_ttk as app
+import xai_http_flow as flow
 
 
 class DummyResponse:
-    def __init__(self, payload):
+    def __init__(self, payload, status_code=200):
         self._payload = payload
+        self.status_code = status_code
         self.text = ""
-
-    def raise_for_status(self):
-        return None
 
     def json(self):
         return self._payload
 
 
 class CloudflareAdminCreateTests(unittest.TestCase):
-    def setUp(self):
-        self.original_config = app.config.copy()
-        self.original_cf_domain_index = app._cf_domain_index
-        app._cf_domain_index = 0
+    def _mailbox(self, **overrides):
+        config = {"cloudflare_api_base": "https://mail.invalid.test"}
+        config.update(overrides)
+        return flow.CloudflareTempMailbox(config)
 
-    def tearDown(self):
-        app.config = self.original_config
-        app._cf_domain_index = self.original_cf_domain_index
-
-    def test_default_config_keeps_cloudflare_temp_email_new_address(self):
-        app.config = app.DEFAULT_CONFIG.copy()
+    def test_default_config_uses_anonymous_new_address(self):
+        mailbox = self._mailbox()
         captured = {}
 
-        def fake_post(url, **kwargs):
-            captured["url"] = url
-            captured.update(kwargs)
-            return DummyResponse({"address": "anon@example.com", "jwt": "default-jwt"})
+        def fake_request(method, url, **kwargs):
+            captured.update({"method": method, "url": url, **kwargs})
+            return DummyResponse({"address": "anon@invalid.test", "jwt": "default-jwt"})
 
-        with patch.object(app, "http_post", side_effect=fake_post):
-            address, jwt = app.cloudflare_create_temp_address("https://temp-mail.example.com")
+        with patch.object(mailbox, "_request", side_effect=fake_request):
+            address, jwt = mailbox.create()
 
-        self.assertEqual(address, "anon@example.com")
-        self.assertEqual(jwt, "default-jwt")
-        self.assertEqual(captured["url"], "https://temp-mail.example.com/api/new_address")
+        self.assertEqual((address, jwt), ("anon@invalid.test", "default-jwt"))
+        self.assertEqual(captured["method"], "post")
+        self.assertEqual(captured["url"], "https://mail.invalid.test/api/new_address")
         self.assertEqual(captured["json"], {})
-        self.assertEqual(captured["headers"], {"Content-Type": "application/json"})
+        self.assertEqual(captured["headers"], {"content-type": "application/json"})
 
-    def test_app_uses_admin_new_address_with_x_admin_auth(self):
-        app.config.update({
-            "cloudflare_api_key": "admin-secret",
-            "cloudflare_auth_mode": "x-admin-auth",
-            "cloudflare_path_accounts": "/admin/new_address",
-            "defaultDomains": "vitassk.com",
-        })
+    def test_admin_new_address_uses_x_admin_auth(self):
+        mailbox = self._mailbox(
+            cloudflare_api_key="admin-secret",
+            cloudflare_auth_mode="x-admin-auth",
+            cloudflare_path_accounts="/admin/new_address",
+            defaultDomains="mail.invalid.test",
+        )
         captured = {}
 
-        def fake_post(url, **kwargs):
-            captured["url"] = url
-            captured.update(kwargs)
-            return DummyResponse({"address": "adminuser@vitassk.com", "jwt": "address-jwt"})
+        def fake_request(method, url, **kwargs):
+            captured.update({"method": method, "url": url, **kwargs})
+            return DummyResponse({"address": "xaiaaaaaaaaaa@mail.invalid.test", "jwt": "address-jwt"})
 
-        with patch.object(app, "generate_username", return_value="adminuser"), \
-                patch.object(app, "http_post", side_effect=fake_post):
-            address, jwt = app.cloudflare_create_temp_address("https://temp-mail.ikun.day")
+        with patch.object(flow.secrets, "choice", return_value="a"), patch.object(
+            mailbox, "_request", side_effect=fake_request
+        ):
+            address, jwt = mailbox.create()
 
-        self.assertEqual(address, "adminuser@vitassk.com")
+        self.assertEqual(address, "xaiaaaaaaaaaa@mail.invalid.test")
         self.assertEqual(jwt, "address-jwt")
-        self.assertEqual(captured["url"], "https://temp-mail.ikun.day/admin/new_address")
-        self.assertEqual(captured["json"], {
-            "name": "adminuser",
-            "domain": "vitassk.com",
-            "enablePrefix": True,
-        })
-        self.assertEqual(captured["headers"]["Content-Type"], "application/json")
+        self.assertEqual(captured["url"], "https://mail.invalid.test/admin/new_address")
+        self.assertEqual(
+            captured["json"],
+            {
+                "name": "xaiaaaaaaaaaa",
+                "domain": "mail.invalid.test",
+                "enablePrefix": True,
+            },
+        )
+        self.assertEqual(captured["headers"]["content-type"], "application/json")
         self.assertEqual(captured["headers"]["x-admin-auth"], "admin-secret")
 
-    def test_app_keeps_anonymous_new_address_with_none_auth(self):
-        app.config.update({
-            "cloudflare_api_key": "",
-            "cloudflare_auth_mode": "none",
-            "cloudflare_path_accounts": "/api/new_address",
-            "defaultDomains": "vitassk.com",
-        })
+    def test_anonymous_new_address_keeps_domain_without_auth(self):
+        mailbox = self._mailbox(
+            cloudflare_api_key="",
+            cloudflare_auth_mode="none",
+            cloudflare_path_accounts="api/new_address",
+            defaultDomains="mail.invalid.test",
+        )
         captured = {}
 
-        def fake_post(url, **kwargs):
-            captured["url"] = url
-            captured.update(kwargs)
-            return DummyResponse({"address": "anon@vitassk.com", "jwt": "anon-jwt"})
+        def fake_request(method, url, **kwargs):
+            captured.update({"method": method, "url": url, **kwargs})
+            return DummyResponse({"address": "anon@mail.invalid.test", "jwt": "anon-jwt"})
 
-        with patch.object(app, "http_post", side_effect=fake_post):
-            address, jwt = app.cloudflare_create_temp_address("https://temp-mail.ikun.day")
+        with patch.object(mailbox, "_request", side_effect=fake_request):
+            address, jwt = mailbox.create()
 
-        self.assertEqual(address, "anon@vitassk.com")
-        self.assertEqual(jwt, "anon-jwt")
-        self.assertEqual(captured["url"], "https://temp-mail.ikun.day/api/new_address")
-        self.assertEqual(captured["json"], {"domain": "vitassk.com"})
-        self.assertEqual(captured["headers"], {"Content-Type": "application/json"})
-
-    def test_debug_tool_can_create_address_through_admin_api(self):
-        captured = {}
-
-        def fake_post(url, **kwargs):
-            captured["url"] = url
-            captured.update(kwargs)
-            return DummyResponse({"address": "debuguser@vitassk.com", "jwt": "debug-jwt"})
-
-        with patch.object(cf_mail_debug.requests, "post", side_effect=fake_post):
-            address, jwt = cf_mail_debug.create_address(
-                "https://temp-mail.ikun.day",
-                auth_mode="x-admin-auth",
-                api_key="admin-secret",
-                create_path="/admin/new_address",
-                domain="vitassk.com",
-                name="debuguser",
-            )
-
-        self.assertEqual(address, "debuguser@vitassk.com")
-        self.assertEqual(jwt, "debug-jwt")
-        self.assertEqual(captured["url"], "https://temp-mail.ikun.day/admin/new_address")
-        self.assertEqual(captured["json"], {
-            "name": "debuguser",
-            "domain": "vitassk.com",
-            "enablePrefix": True,
-        })
-        self.assertEqual(captured["headers"]["Content-Type"], "application/json")
-        self.assertEqual(captured["headers"]["x-admin-auth"], "admin-secret")
+        self.assertEqual((address, jwt), ("anon@mail.invalid.test", "anon-jwt"))
+        self.assertEqual(captured["url"], "https://mail.invalid.test/api/new_address")
+        self.assertEqual(captured["json"], {"domain": "mail.invalid.test"})
+        self.assertEqual(captured["headers"], {"content-type": "application/json"})
 
 
 if __name__ == "__main__":

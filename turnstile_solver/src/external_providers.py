@@ -143,7 +143,9 @@ def _build_task(request: BrokerSolveRequest, provider: str) -> Dict[str, Any]:
         "websiteURL": request.page_url,
         "websiteKey": request.sitekey,
     }
-    if provider_proxy is not None and spec.get("proxy_task_type"):
+    # CapSolver's current integration stays on its proxyless task contract;
+    # forwarding registration proxy credentials here would widen secret scope.
+    if provider != "capsolver" and provider_proxy is not None and spec.get("proxy_task_type"):
         task["type"] = spec["proxy_task_type"]
         if provider in {"2captcha", "capsolver"}:
             task.update(

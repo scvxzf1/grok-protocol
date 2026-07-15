@@ -1,4 +1,6 @@
 import json
+import os
+import stat
 import tempfile
 import unittest
 from unittest import mock
@@ -199,6 +201,37 @@ class RunHistoryTests(unittest.TestCase):
 
 
 class ConfigCenterTests(unittest.TestCase):
+    def test_retired_parent_proxy_is_not_exposed_or_persisted(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            cfg = root / "config.json"
+            cfg.write_text(
+                json.dumps(
+                    {
+                        "email_provider": "yyds",
+                        "turnstile_provider": "local",
+                        "tui_proxy_mode": "direct",
+                        "proxy": "http://127.0.0.1:8080",
+                        "proxy_parent": "http://127.0.0.1:7890",
+                        "register_count": 1,
+                        "concurrent_workers": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            service = svc.BatchService(config_path=cfg, root_dir=root)
+            data = service.get_config_center()
+            self.assertNotIn("proxy_parent", data["fields"])
+            plan = svc.build_plan(service.settings)
+            self.assertNotIn("--proxy-parent", plan.proxy_args)
+
+            service.update_config_center(
+                {"fields": {"proxy_parent": "http://127.0.0.1:7891"}}
+            )
+            disk = json.loads(cfg.read_text(encoding="utf-8"))
+            self.assertNotIn("proxy_parent", disk)
+
     def test_config_center_masks_and_updates_proxy_pool(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
@@ -1056,6 +1089,7 @@ class EmbeddedProxyBatchServiceTests(unittest.TestCase):
                 "vless://11111111-1111-1111-1111-111111111111@jp.example:443?security=tls#jp\n"
                 "hy2://secret@hy.example:8443?sni=hy.example#hy\n"
                 "anytls://pwd@any.example:443?sni=any.example#any\n"
+                "trojan://synthetic-secret@trojan.example:443?sni=edge.example#trojan\n"
                 "http://1.1.1.1:80\n"
             )
             with mock.patch(
@@ -1065,16 +1099,18 @@ class EmbeddedProxyBatchServiceTests(unittest.TestCase):
                 data = service.fetch_embedded_subscription_nodes(
                     urls=["https://example.test/sub"]
                 )
-            self.assertEqual(data.get("cached_node_count"), 3)
+            self.assertEqual(data.get("cached_node_count"), 4)
             self.assertEqual(data.get("cached_vless_count"), 1)
             self.assertEqual((data.get("cached_by_protocol") or {}).get("hysteria2"), 1)
             self.assertEqual((data.get("cached_by_protocol") or {}).get("anytls"), 1)
+            self.assertEqual((data.get("cached_by_protocol") or {}).get("trojan"), 1)
             cache_path = service.embedded_node_cache_path()
             self.assertTrue(cache_path.is_file())
             text = cache_path.read_text(encoding="utf-8")
             self.assertIn("vless://11111111-1111-1111-1111-111111111111@jp.example:443", text)
             self.assertIn("hy2://secret@hy.example:8443", text)
             self.assertIn("anytls://pwd@any.example:443", text)
+            self.assertIn("trojan://synthetic-secret@trojan.example:443", text)
             disk = json.loads((Path(d) / "config.json").read_text(encoding="utf-8"))
             self.assertEqual(disk.get("proxy_subscription_urls"), ["https://example.test/sub"])
 
@@ -1425,6 +1461,452 @@ class EmbeddedProxyAssignmentTests(unittest.TestCase):
                 service.start_run()
             ensure.assert_called()
             self.assertIs(service._runner.embedded_proxy_manager, manager)
+
+
+class StaticHttpProxyLeaseTests(unittest.TestCase):
+    def _runner(
+        self,
+        root: Path,
+        *,
+        proxy_count: int = 2,
+        workers: int = 4,
+        count: int = 8,
+        embedded: bool = False,
+    ):
+        source = root / "proxies.txt"
+        entries = [
+            f"http://user{i}:secret{i}@p{i}.example:8080"
+            for i in range(proxy_count)
+        ]
+        source.write_text("\n".join(entries) + "\n", encoding="utf-8")
+        cfg = root / "config.json"
+        cfg.write_text(
+            json.dumps(
+                {
+                    "proxy_file": str(source),
+                    "proxy_slot_sticky": True,
+                    "turnstile_proxy_enabled": False,
+                }
+            ),
+            encoding="utf-8",
+        )
+        plan = svc.RunPlan(
+            config_path=cfg,
+            run_mode=svc.RUN_MODE_REGISTER_OTP,
+            count=count,
+            workers=workers,
+            output_dir=root / "creds",
+            provider="capsolver",
+            email_provider="yyds",
+            proxy_mode="pool",
+            proxy_args=["--proxy-file", str(source), "--proxy-random"],
+            embedded_proxy_enabled=embedded,
+            embedded_proxy_max_node_retries=3,
+            proxy_slot_sticky=True,
+        )
+        runner = svc.BatchRunner(plan)
+        runner.run_dir = root / "run"
+        runner.run_dir.mkdir(parents=True, exist_ok=True)
+        runner._prepare_static_proxy_snapshot()
+        # Keep test health output out of the repository-level stats file.
+        runner._manual_proxy_rotator._stats_file = str(root / "proxy_stats.log")
+        return runner, source, entries
+
+    @staticmethod
+    def _fake_spawn(runner):
+        def spawn(worker, *, acquire_proxy=True):
+            if acquire_proxy and not runner._acquire_worker_proxy(worker):
+                return False
+            worker.status = "running"
+            worker.process = mock.Mock()
+            worker.process.poll.return_value = None
+            return True
+
+        return spawn
+
+    def test_snapshot_is_private_and_frozen_during_source_edits(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            runner, source, entries = self._runner(root, proxy_count=2)
+            snapshot = runner._proxy_pool_snapshot_path
+            self.assertIsNotNone(snapshot)
+            self.assertEqual(snapshot.read_text(encoding="utf-8").splitlines(), entries)
+            if os.name != "nt":
+                self.assertEqual(stat.S_IMODE(snapshot.stat().st_mode), 0o600)
+
+            source.write_text(
+                "http://changed:new-secret@replacement.example:9000\n",
+                encoding="utf-8",
+            )
+            workers = [svc.WorkerState(index=i) for i in (1, 2)]
+            self.assertTrue(runner._acquire_manual_proxy(workers[0]))
+            self.assertTrue(runner._acquire_manual_proxy(workers[1]))
+            self.assertEqual({worker.manual_proxy for worker in workers}, set(entries))
+            self.assertNotIn("replacement.example", runner._static_proxy_entries)
+
+    def test_worker_leases_are_unique_and_release_exactly_once(self):
+        with tempfile.TemporaryDirectory() as d:
+            runner, _source, _entries = self._runner(Path(d), proxy_count=2)
+            first = svc.WorkerState(index=1)
+            second = svc.WorkerState(index=2)
+            self.assertTrue(runner._acquire_manual_proxy(first))
+            self.assertTrue(runner._acquire_manual_proxy(second))
+            self.assertNotEqual(first.manual_proxy, second.manual_proxy)
+            rotator = runner._manual_proxy_rotator
+            with mock.patch.object(
+                rotator,
+                "release_lease",
+                wraps=rotator.release_lease,
+            ) as release:
+                self.assertTrue(
+                    runner._release_manual_proxy(first, success=True, reason="ok")
+                )
+                self.assertFalse(
+                    runner._release_manual_proxy(first, success=True, reason="duplicate")
+                )
+            self.assertEqual(release.call_count, 1)
+            replacement = svc.WorkerState(index=3)
+            self.assertTrue(runner._acquire_manual_proxy(replacement))
+
+    def test_probe_gate_is_bounded_and_cools_failed_routes(self):
+        with tempfile.TemporaryDirectory() as d:
+            runner, _source, _entries = self._runner(Path(d), proxy_count=3)
+
+            def probe(index, _proxy):
+                return {
+                    "index": index,
+                    "ok": index != 1,
+                    "reason": "ok" if index != 1 else "signup_region_403",
+                    "targets": {},
+                }
+
+            with mock.patch.object(
+                runner,
+                "_probe_static_proxy_slot",
+                side_effect=probe,
+            ) as mocked:
+                runner._probe_static_proxy_slots()
+            self.assertEqual(mocked.call_count, 3)
+            self.assertEqual(svc.STATIC_PROXY_HEALTH_TIMEOUT_SEC, 12.0)
+            self.assertEqual(svc.STATIC_PROXY_HEALTH_PROBE_WORKERS, 2)
+            self.assertEqual(svc.STATIC_PROXY_HEALTH_ATTEMPTS, 3)
+            self.assertEqual(svc.STATIC_PROXY_HEALTH_BACKOFF_SEC, 0.35)
+            self.assertEqual(runner._manual_proxy_rotator.available_lease_count(), 2)
+            self.assertFalse(runner._static_proxy_health[1]["ok"])
+
+    def test_start_freezes_and_probes_before_spawning(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            runner, _source, _entries = self._runner(root, proxy_count=2)
+            # Exercise the real start orchestration from a fresh pre-start state.
+            runner._manual_proxy_rotator = None
+            runner._static_proxy_entries = tuple()
+            runner._proxy_pool_snapshot_path = None
+            runner.plan.proxy_pool_entries = tuple()
+
+            def healthy(index, _proxy):
+                return {
+                    "index": index,
+                    "ok": True,
+                    "reason": "ok",
+                    "targets": {
+                        "signup": {"ok": True},
+                        "ms_token": {"ok": True},
+                    },
+                }
+
+            with mock.patch.object(
+                runner,
+                "_probe_static_proxy_slot",
+                side_effect=healthy,
+            ) as probe, mock.patch.object(
+                runner,
+                "_spawn_available",
+            ) as spawn, mock.patch("proxy_pool.ProxyRotator._append_log"):
+                runner.start()
+            self.assertTrue(runner.started)
+            self.assertEqual(probe.call_count, 2)
+            self.assertTrue(runner._proxy_pool_snapshot_path.is_file())
+            spawn.assert_called_once_with()
+
+    def test_http_only_capacity_refills_as_leases_return(self):
+        with tempfile.TemporaryDirectory() as d:
+            runner, _source, _entries = self._runner(
+                Path(d), proxy_count=2, workers=5, count=5
+            )
+            runner.started = True
+            runner.phase = "running"
+            with mock.patch.object(
+                runner,
+                "_spawn_one",
+                side_effect=self._fake_spawn(runner),
+            ):
+                runner._spawn_available()
+                self.assertEqual(len(runner.active), 2)
+                self.assertEqual(
+                    len({worker.manual_proxy for worker in runner.active}),
+                    2,
+                )
+                completed = runner.active[0]
+                runner._release_manual_proxy(completed, success=True, reason="ok")
+                runner._mark_terminal(completed, "succeeded")
+                runner._spawn_available()
+            self.assertEqual(len(runner.active), 2)
+            self.assertEqual(runner.started_tasks, 3)
+
+    def test_hybrid_keeps_node_capacity_when_http_pool_is_small(self):
+        class Manager:
+            def __init__(self):
+                self.next_id = 0
+                self.released = []
+
+            def status(self):
+                return {"running": True, "healthy": 10, "total": 10}
+
+            def acquire(self, exclude_ids=()):
+                from embedded_proxy_manager import NodeSlot
+
+                self.next_id += 1
+                return NodeSlot(
+                    id=f"node-{self.next_id}",
+                    name=f"node-{self.next_id}",
+                    server="node.example",
+                    port=443,
+                    protocol="vless",
+                    local_http=f"http://127.0.0.1:{28000 + self.next_id}",
+                    healthy=True,
+                    ref_count=1,
+                )
+
+            def release(self, node_id, **kwargs):
+                self.released.append((node_id, kwargs))
+
+        with tempfile.TemporaryDirectory() as d:
+            runner, _source, _entries = self._runner(
+                Path(d), proxy_count=1, workers=4, count=4, embedded=True
+            )
+            runner.embedded_proxy_manager = Manager()
+            runner.started = True
+            runner.phase = "running"
+            with mock.patch.object(
+                runner,
+                "_spawn_one",
+                side_effect=self._fake_spawn(runner),
+            ):
+                runner._spawn_available()
+            self.assertEqual(len(runner.active), 4)
+            self.assertEqual(sum(bool(w.manual_proxy) for w in runner.active), 1)
+            self.assertEqual(sum(bool(w.proxy_node_id) for w in runner.active), 3)
+
+    def test_local_turnstile_shares_registration_route_unless_dedicated(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            runner, _source, _entries = self._runner(root, proxy_count=1)
+            worker = svc.WorkerState(index=1, accounts_path=root / "accounts.txt")
+            self.assertTrue(runner._acquire_manual_proxy(worker))
+            command = runner._command_for(worker)
+            proxy_index = command.index("--proxy")
+            self.assertEqual(command[proxy_index + 1], worker.manual_proxy)
+            self.assertNotIn("--turnstile-proxy", command)
+            self.assertFalse(worker.uses_independent_turnstile_proxy)
+
+            cfg = json.loads(runner.plan.config_path.read_text(encoding="utf-8"))
+            cfg.update(
+                {
+                    "turnstile_proxy_enabled": True,
+                    "turnstile_proxy_mode": "direct",
+                    "turnstile_proxy": "http://solver:secret@solver.example:8080",
+                }
+            )
+            runner.plan.config_path.write_text(json.dumps(cfg), encoding="utf-8")
+            command = runner._command_for(worker)
+            self.assertIn("--turnstile-proxy", command)
+            self.assertTrue(worker.uses_independent_turnstile_proxy)
+
+    def test_runtime_bad_route_is_not_charged_as_business_failure(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            runner, _source, _entries = self._runner(root, proxy_count=1, count=1)
+            worker = svc.WorkerState(index=1)
+            worker.log_path = runner.run_dir / "worker.log"
+            worker.log_path.write_text("curl: (35) TLS connect error\n", encoding="utf-8")
+            self.assertTrue(runner._acquire_manual_proxy(worker))
+            worker.status = "running"
+            worker.process = mock.Mock()
+            worker.process.poll.return_value = 1
+            runner.workers = [worker]
+            runner.worker_by_index = {1: worker}
+            runner.started_tasks = 1
+            runner._check_processes()
+            self.assertEqual(worker.status, "stopped")
+            self.assertEqual(runner.failed, 0)
+            self.assertEqual(runner.started_tasks, 0)
+            self.assertEqual(runner._manual_proxy_rotator.active_lease_count(), 0)
+            self.assertEqual(runner._manual_proxy_rotator.available_lease_count(), 0)
+
+    def test_permanently_bad_static_route_exhausts_logical_retry_budget(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            runner, _source, entries = self._runner(
+                root,
+                proxy_count=1,
+                workers=1,
+                count=1,
+            )
+            runner.started = True
+            runner.phase = "running"
+
+            with mock.patch.object(
+                runner,
+                "_spawn_one",
+                side_effect=self._fake_spawn(runner),
+            ):
+                runner._spawn_available()
+                self.assertEqual(runner.started_tasks, 1)
+                self.assertEqual(len(runner.active), 1)
+
+                for attempt in range(1, 4):
+                    worker = runner.active[0]
+                    worker.log_path = runner.run_dir / f"worker_{attempt}.log"
+                    worker.log_path.write_text(
+                        "curl: (35) TLS connect error\n",
+                        encoding="utf-8",
+                    )
+                    worker.process.poll.return_value = 1
+                    runner._check_processes()
+
+                    if attempt < 3:
+                        self.assertEqual(worker.status, "stopped")
+                        self.assertEqual(runner.failed, 0)
+                        self.assertEqual(runner.started_tasks, 0)
+                        runner._spawn_available()
+                        self.assertEqual(len(runner.active), 0)
+                        runner._manual_proxy_rotator.mark_good(entries[0])
+                        runner._spawn_available()
+                        self.assertEqual(len(runner.active), 1)
+                        self.assertEqual(runner.active[0].proxy_attempt, attempt + 1)
+                    else:
+                        self.assertEqual(worker.status, "failed")
+
+            self.assertEqual(runner.failed, 1)
+            self.assertEqual(runner.stopped, 2)
+            self.assertEqual(runner.started_tasks, 1)
+            self.assertEqual(runner.failure_counts["tls_error"], 1)
+            self.assertFalse(runner._should_refill())
+            self.assertEqual(runner._manual_proxy_rotator.active_lease_count(), 0)
+            runner.tick()
+            self.assertTrue(runner.done)
+
+    def test_dedicated_turnstile_failure_does_not_cool_registration_route(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            runner, _source, _entries = self._runner(root, proxy_count=1, count=1)
+            worker = svc.WorkerState(index=1)
+            worker.log_path = runner.run_dir / "worker.log"
+            worker.log_path.write_text(
+                "Turnstile dedicated proxy ProxyError\n",
+                encoding="utf-8",
+            )
+            self.assertTrue(runner._acquire_manual_proxy(worker))
+            worker.uses_independent_turnstile_proxy = True
+            worker.status = "running"
+            worker.process = mock.Mock()
+            worker.process.poll.return_value = 1
+            runner.workers = [worker]
+            runner.worker_by_index = {1: worker}
+            runner.started_tasks = 1
+            runner._check_processes()
+            self.assertEqual(worker.status, "failed")
+            self.assertEqual(runner.failed, 1)
+            self.assertEqual(runner._manual_proxy_rotator.active_lease_count(), 0)
+            self.assertEqual(runner._manual_proxy_rotator.available_lease_count(), 1)
+
+    def test_success_then_finalize_does_not_double_release(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            runner, _source, _entries = self._runner(root, proxy_count=1, count=1)
+            worker = svc.WorkerState(index=1)
+            self.assertTrue(runner._acquire_manual_proxy(worker))
+            worker.status = "running"
+            worker.process = mock.Mock()
+            worker.process.poll.return_value = 0
+            runner.workers = [worker]
+            runner.worker_by_index = {1: worker}
+            rotator = runner._manual_proxy_rotator
+            with mock.patch.object(
+                rotator,
+                "release_lease",
+                wraps=rotator.release_lease,
+            ) as release:
+                runner._check_processes()
+                runner._release_all_manual_proxies()
+            self.assertEqual(release.call_count, 1)
+            self.assertEqual(worker.status, "succeeded")
+
+    def test_spawn_exception_and_stop_paths_return_leases(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            runner, _source, _entries = self._runner(root, proxy_count=1)
+            worker = svc.WorkerState(index=1)
+            with mock.patch.object(
+                runner,
+                "_command_for",
+                side_effect=RuntimeError("boom"),
+            ):
+                self.assertFalse(runner._spawn_one(worker))
+            self.assertEqual(runner._manual_proxy_rotator.active_lease_count(), 0)
+
+            # Restore the failed route without waiting for its cooldown, then
+            # verify a queued cancellation is neutral and idempotent.
+            proxy = runner._static_proxy_entries[0]
+            runner._manual_proxy_rotator.mark_good(proxy)
+            queued = svc.WorkerState(index=2)
+            self.assertTrue(runner._acquire_manual_proxy(queued))
+            queued.status = "queued"
+            runner.workers = [queued]
+            runner.worker_by_index = {2: queued}
+            runner.stop()
+            self.assertEqual(runner._manual_proxy_rotator.active_lease_count(), 0)
+
+            second_root = root / "second"
+            second_root.mkdir()
+            running_runner, _source, _entries = self._runner(
+                second_root,
+                proxy_count=1,
+            )
+            running = svc.WorkerState(index=3)
+            self.assertTrue(running_runner._acquire_manual_proxy(running))
+            running.status = "running"
+            running.process = mock.Mock()
+            running.process.poll.return_value = None
+            running_runner.workers = [running]
+            running_runner.worker_by_index = {3: running}
+            running_runner.stop()
+            running.process.terminate.assert_called_once_with()
+            running.process.poll.return_value = -15
+            running_runner._check_processes()
+            self.assertEqual(
+                running_runner._manual_proxy_rotator.active_lease_count(),
+                0,
+            )
+
+    def test_logs_and_snapshot_state_do_not_expose_credentials(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            runner, _source, entries = self._runner(root, proxy_count=1)
+            worker = svc.WorkerState(
+                index=1,
+                status="failed",
+                last_log=f"failure through {entries[0]}",
+            )
+            runner.workers = [worker]
+            runner.worker_by_index = {1: worker}
+            runner._log("W01", worker.last_log)
+            state = json.dumps(runner.snapshot(), ensure_ascii=False)
+            logs = "\n".join(runner.logs)
+            for secret in ("user0", "secret0"):
+                self.assertNotIn(secret, state)
+                self.assertNotIn(secret, logs)
 
 
 

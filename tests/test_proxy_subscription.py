@@ -62,6 +62,18 @@ class ProxySubscriptionParseTests(unittest.TestCase):
         self.assertEqual(anytls.password, "pwd")
         self.assertFalse(anytls.usable_http)
 
+    def test_parse_trojan_not_usable_as_http(self):
+        node = sub.parse_share_link(
+            "trojan://synthetic%2Dsecret@trojan.example:443?sni=edge.example#trojan-a"
+        )
+        self.assertIsNotNone(node)
+        self.assertEqual(node.scheme, "trojan")
+        self.assertEqual(node.host, "trojan.example")
+        self.assertEqual(node.port, 443)
+        self.assertEqual(node.password, "synthetic-secret")
+        self.assertFalse(node.usable_http)
+        self.assertEqual(node.pool_line, "")
+
     def test_import_base64_subscription_only_http_goes_to_pool(self):
         plain = "\n".join(
             [
@@ -172,6 +184,15 @@ proxies:
   port: 8443
   password: secret
   sni: h.example
+- name: trojan-a
+  type: trojan
+  server: trojan.example
+  port: 443
+  password: synthetic-secret
+  sni: edge.example
+  skip-cert-verify: true
+  udp: true
+  ip-version: ipv4
 proxy-groups:
 - name: PROXY
   type: select
@@ -180,16 +201,53 @@ proxy-groups:
   - 🇭🇰 HK|60|M523ms|2406:4440:0:106::11:a|YT|http
 """
         nodes = sub.parse_subscription_text(yaml_text)
-        self.assertEqual(len(nodes), 4)
+        self.assertEqual(len(nodes), 5)
         http_nodes = [n for n in nodes if n.usable_http]
         self.assertEqual(len(http_nodes), 1)
         self.assertEqual(http_nodes[0].pool_line, "10.0.0.1:8080:u:p")
         self.assertTrue(any(n.scheme == "vless" and n.raw.startswith("vless://") for n in nodes))
         self.assertTrue(any(n.scheme == "hysteria2" and n.raw.startswith("hysteria2://") for n in nodes))
+        trojan = next(n for n in nodes if n.scheme == "trojan")
+        self.assertTrue(trojan.raw.startswith("trojan://synthetic-secret@trojan.example:443"))
+        self.assertIn("skip-cert-verify=1", trojan.raw)
+        self.assertIn("ip-version=ipv4", trojan.raw)
         # Proxy-group list names must not become fake http pool lines.
         self.assertIsNone(
             sub.parse_share_link("- 🇭🇰 HK|60|M523ms|2406:4440:0:106::11:a|YT|http")
         )
+
+    def test_parse_clash_trojan_ipv6_round_trip(self):
+        from embedded_proxy_manager import parse_trojan_node
+
+        yaml_text = """proxies:
+- name: v6-bare
+  type: trojan
+  server: 2001:db8::1
+  port: 443
+  password: synthetic-secret
+- name: v6-bracketed
+  type: trojan
+  server: "[2001:db8::2]"
+  port: 8443
+  password: synthetic-secret-2
+"""
+        nodes = sub.parse_subscription_text(yaml_text)
+        self.assertEqual(len(nodes), 2)
+
+        bare = next(node for node in nodes if node.name == "v6-bare")
+        self.assertIn("@[2001:db8::1]:443", bare.raw)
+        parsed_bare = parse_trojan_node(bare.raw)
+        self.assertIsNotNone(parsed_bare)
+        self.assertEqual(parsed_bare["server"], "2001:db8::1")
+        self.assertEqual(parsed_bare["port"], 443)
+
+        bracketed = next(node for node in nodes if node.name == "v6-bracketed")
+        self.assertIn("@[2001:db8::2]:8443", bracketed.raw)
+        self.assertNotIn("[[2001:db8::2]]", bracketed.raw)
+        parsed_bracketed = parse_trojan_node(bracketed.raw)
+        self.assertIsNotNone(parsed_bracketed)
+        self.assertEqual(parsed_bracketed["server"], "2001:db8::2")
+        self.assertEqual(parsed_bracketed["port"], 8443)
 
     def test_hostport_rejects_yaml_like_names(self):
         self.assertIsNone(sub.parse_share_link("PROXY:select:http-a:extra"))

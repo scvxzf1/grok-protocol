@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 from urllib.parse import parse_qs, unquote, urlparse
 
+from local_paths import FIXTURES_DIR, PROJECT_ROOT, STATE_DIR
+
 try:
     import yaml
 except ImportError:  # pragma: no cover - fallback for environments without PyYAML
@@ -35,7 +37,9 @@ def _preferred_local_ports() -> list[str]:
         candidates.append(Path(env))
     candidates.extend(
         [
+            FIXTURES_DIR / "proxies.clean_embedded.txt",
             Path("/tmp/xai_good_proxies.txt"),
+            # Compatibility fallback for older checkouts.
             Path(__file__).resolve().parent / "proxies.clean_embedded.txt",
         ]
     )
@@ -214,18 +218,57 @@ def parse_anytls_node(raw: str) -> Optional[dict]:
     }
 
 
+def parse_trojan_node(raw: str) -> Optional[dict]:
+    """Parse trojan://password@host:port?params#name for mihomo."""
+    line = str(raw or "").strip()
+    if not line or not line.lower().startswith("trojan://"):
+        return None
+    try:
+        parsed = urlparse(line)
+    except Exception:
+        return None
+
+    password = unquote(parsed.username or "")
+    host = parsed.hostname or ""
+    try:
+        port = int(parsed.port or 0)
+    except (TypeError, ValueError):
+        port = 0
+    if not password or not host or port <= 0:
+        return None
+
+    qs = parse_qs(parsed.query or "", keep_blank_values=True)
+    params: Dict[str, str] = {}
+    for key, values in qs.items():
+        if values:
+            params[key] = unquote(values[0])
+
+    name = unquote(parsed.fragment or "") or f"{host}:{port}"
+    return {
+        "protocol": "trojan",
+        "uuid": "",
+        "password": password,
+        "server": host,
+        "port": port,
+        "name": name,
+        "params": params,
+        "raw": line,
+    }
+
+
 # Protocols the embedded mihomo pool can run (share-link schemes → mihomo type).
-EMBEDDED_PROTOCOLS = ("vless", "hysteria2", "anytls")
+EMBEDDED_PROTOCOLS = ("vless", "hysteria2", "anytls", "trojan")
 EMBEDDED_LINK_PREFIXES = (
     "vless://",
     "hy2://",
     "hysteria2://",
     "anytls://",
+    "trojan://",
 )
 
 
 def parse_embedded_node(raw: str) -> Optional[dict]:
-    """Parse any supported embedded share link (vless / hy2 / anytls)."""
+    """Parse any supported embedded share link (vless / hy2 / anytls / trojan)."""
     line = str(raw or "").strip()
     if not line:
         return None
@@ -236,6 +279,8 @@ def parse_embedded_node(raw: str) -> Optional[dict]:
         return parse_hysteria2_node(line)
     if lower.startswith("anytls://"):
         return parse_anytls_node(line)
+    if lower.startswith("trojan://"):
+        return parse_trojan_node(line)
     return None
 
 
@@ -444,6 +489,70 @@ def _node_to_anytls_proxy(node: NodeSlot, proxy_name: str) -> Optional[Dict[str,
     return proxy
 
 
+def _node_to_trojan_proxy(node: NodeSlot, proxy_name: str) -> Optional[Dict[str, Any]]:
+    protocol = (node.protocol or "").lower().strip()
+    if protocol and protocol != "trojan":
+        return None
+    password = str(node.password or node.uuid or "").strip()
+    if not node.server or not node.port or not password:
+        logger.warning("skip incomplete trojan node (server/port/password required)")
+        return None
+
+    params = dict(node.params or {})
+    network = str(params.get("type") or params.get("network") or "tcp").lower()
+    sni = params.get("sni") or params.get("servername") or params.get("peer") or ""
+    alpn_raw = params.get("alpn") or ""
+    client_fp = (
+        params.get("client-fingerprint")
+        or params.get("client_fingerprint")
+        or params.get("fp")
+        or params.get("fingerprint")
+        or ""
+    )
+    insecure = _as_bool_param(
+        params.get("insecure")
+        or params.get("allowInsecure")
+        or params.get("allow_insecure")
+        or params.get("skip-cert-verify")
+        or ""
+    )
+
+    proxy: Dict[str, Any] = {
+        "name": proxy_name,
+        "type": "trojan",
+        "server": node.server,
+        "port": int(node.port),
+        "password": password,
+    }
+    if sni:
+        proxy["sni"] = sni
+    if alpn_raw:
+        proxy["alpn"] = [x.strip() for x in str(alpn_raw).split(",") if x.strip()]
+    if client_fp:
+        proxy["client-fingerprint"] = client_fp
+    if insecure:
+        proxy["skip-cert-verify"] = True
+    if "udp" in params and str(params.get("udp") or "").strip() != "":
+        proxy["udp"] = _as_bool_param(params.get("udp"))
+    ip_version = params.get("ip-version") or params.get("ip_version") or ""
+    if ip_version:
+        proxy["ip-version"] = ip_version
+
+    if network in {"ws", "grpc"}:
+        proxy["network"] = network
+    if network == "ws":
+        ws_opts: Dict[str, Any] = {"path": params.get("path") or "/"}
+        host_header = params.get("host") or sni or node.server
+        if host_header:
+            ws_opts["headers"] = {"Host": host_header}
+        proxy["ws-opts"] = ws_opts
+    elif network == "grpc":
+        service_name = params.get("serviceName") or params.get("service-name") or ""
+        if service_name:
+            proxy["grpc-opts"] = {"grpc-service-name": service_name}
+    return proxy
+
+
 def _node_to_mihomo_proxy(node: NodeSlot, proxy_name: str) -> Optional[Dict[str, Any]]:
     protocol = (node.protocol or "").lower().strip()
     if not protocol and node.raw:
@@ -456,6 +565,8 @@ def _node_to_mihomo_proxy(node: NodeSlot, proxy_name: str) -> Optional[Dict[str,
         return _node_to_hysteria2_proxy(node, proxy_name)
     if protocol == "anytls":
         return _node_to_anytls_proxy(node, proxy_name)
+    if protocol == "trojan":
+        return _node_to_trojan_proxy(node, proxy_name)
     logger.warning("skip unsupported protocol %r for node %s", node.protocol, node.id)
     return None
 
@@ -758,8 +869,15 @@ class EmbeddedProxyManager:
     def _project_root(self) -> Path:
         return Path(__file__).resolve().parent
 
+    def _local_state_dir(self) -> Path:
+        project_root = self._project_root().resolve()
+        if project_root == PROJECT_ROOT:
+            return STATE_DIR
+        # Tests and embedded callers may provide an isolated project root.
+        return project_root / ".local" / "state"
+
     def _runtime_paths(self) -> tuple[Path, Path, Path]:
-        runtime_dir = self._project_root() / ".embedded_mihomo"
+        runtime_dir = self._local_state_dir() / "embedded_mihomo"
         runtime_dir.mkdir(parents=True, exist_ok=True)
         config_path = runtime_dir / "config.yaml"
         log_path = runtime_dir / "mihomo.log"
@@ -778,8 +896,10 @@ class EmbeddedProxyManager:
 
     def _cleanup_stale_project_mihomo(self) -> None:
         """Best-effort kill leftover project-local mihomo processes."""
-        runtime_dir = str((self._project_root() / ".embedded_mihomo").resolve())
+        runtime_dir = str(self._runtime_paths()[0].resolve())
         marker = runtime_dir
+        if os.name == "nt" or not Path("/proc").is_dir():
+            return
         try:
             import signal
             import os as _os
@@ -854,7 +974,9 @@ class EmbeddedProxyManager:
             base_port=base_port,
         )
         if not mihomo_cfg.get("listeners"):
-            raise ValueError("no usable embedded nodes (vless/hysteria2/anytls) for mihomo config")
+            raise ValueError(
+                "no usable embedded nodes (vless/hysteria2/anytls/trojan) for mihomo config"
+            )
 
         runtime_dir, config_path, log_path = self._runtime_paths()
         config_path.write_text(render_mihomo_yaml(mihomo_cfg), encoding="utf-8")
@@ -1149,4 +1271,3 @@ class EmbeddedProxyManager:
             daemon=True,
         )
         thread.start()
-

@@ -19,10 +19,12 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from http_batch_service import (
+    DEFAULT_CONFIG_PATH,
     ROOT_DIR,
     BatchBusyError,
     BatchService,
     TuiConfigError,
+    _redact_sensitive_runtime_text,
     browser_health_status,
     cleanup_browser_residues,
     format_browser_health,
@@ -117,6 +119,7 @@ def _slim_run_snapshot(snap: Optional[Dict[str, Any]], *, worker_limit: int = 16
     limit = max(0, int(worker_limit or 0))
     for _, _, w in ranked[:limit]:
         last_log = str(w.get("last_log") or "")
+        last_log = _redact_sensitive_runtime_text(last_log)
         if len(last_log) > 120:
             last_log = last_log[:120]
         slim_workers.append(
@@ -148,8 +151,12 @@ def _slim_run_snapshot(snap: Optional[Dict[str, Any]], *, worker_limit: int = 16
         "success_rate": snap.get("success_rate"),
         "failure_counts": snap.get("failure_counts") or {},
         "refill_paused": snap.get("refill_paused"),
-        "refill_pause_reason": snap.get("refill_pause_reason"),
-        "pause_reason": snap.get("pause_reason") or snap.get("refill_pause_reason"),
+        "refill_pause_reason": _redact_sensitive_runtime_text(
+            snap.get("refill_pause_reason") or ""
+        ),
+        "pause_reason": _redact_sensitive_runtime_text(
+            snap.get("pause_reason") or snap.get("refill_pause_reason") or ""
+        ),
         "circuit_open": snap.get("circuit_open"),
         "proxy_unhealthy": snap.get("proxy_unhealthy"),
         "recent_fail_count": snap.get("recent_fail_count"),
@@ -159,6 +166,27 @@ def _slim_run_snapshot(snap: Optional[Dict[str, Any]], *, worker_limit: int = 16
         "workers_truncated": max(0, len(workers) - len(slim_workers)),
         "workers": slim_workers,
     }
+
+
+def _public_run_file_name(value: object) -> bool:
+    """Limit ordinary run downloads to redacted logs and aggregate summary."""
+
+    raw = str(value or "").strip()
+    if not raw or "/" in raw or "\\" in raw:
+        return False
+    return raw.startswith("worker_") and raw.endswith(".log")
+
+
+def _public_run_detail(detail: Dict[str, Any]) -> Dict[str, Any]:
+    public = _slim_run_snapshot(detail)
+    public["started_at"] = detail.get("started_at")
+    public["account_count"] = int(detail.get("account_count") or 0)
+    public["files"] = [
+        {"name": str(item.get("name") or ""), "size": int(item.get("size") or 0)}
+        for item in (detail.get("files") or [])
+        if isinstance(item, dict) and _public_run_file_name(item.get("name"))
+    ]
+    return public
 
 
 def _ensure_poller(service: BatchService) -> None:
@@ -813,7 +841,10 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
                 log_budget["dropped"] = int(log_budget["dropped"] or 0) + 1
                 return
             log_budget["sent"] = int(log_budget["sent"] or 0) + 1
-            payload = json.dumps({"line": line}, ensure_ascii=False)
+            payload = json.dumps(
+                {"line": _redact_sensitive_runtime_text(line)},
+                ensure_ascii=False,
+            )
             msg = "event: log\ndata: " + payload + "\n\n"
 
             def _put() -> None:
@@ -876,12 +907,14 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
 
     @app.get("/api/runs")
     def runs_list(limit: int = Query(50, ge=1, le=200)) -> Dict[str, Any]:
-        return {"runs": list_runs(limit=limit)}
+        return {
+            "runs": [_public_run_detail(item) for item in list_runs(limit=limit)]
+        }
 
     @app.get("/api/runs/{run_id}")
     def runs_detail(run_id: str) -> Dict[str, Any]:
         try:
-            return get_run_detail(run_id)
+            return _public_run_detail(get_run_detail(run_id))
         except TuiConfigError as exc:
             raise _err(exc, 404) from exc
 
@@ -890,7 +923,11 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
         try:
             if worker is not None:
                 path = resolve_run_file(run_id, f"worker_{int(worker):03d}.log")
-                return PlainTextResponse(path.read_text(encoding="utf-8", errors="replace"))
+                return PlainTextResponse(
+                    _redact_sensitive_runtime_text(
+                        path.read_text(encoding="utf-8", errors="replace")
+                    )
+                )
             detail = get_run_detail(run_id)
             chunks = []
             for item in detail.get("files") or []:
@@ -898,7 +935,11 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
                 if name.startswith("worker_") and name.endswith(".log"):
                     path = resolve_run_file(run_id, name)
                     chunks.append(f"===== {name} =====\n")
-                    chunks.append(path.read_text(encoding="utf-8", errors="replace"))
+                    chunks.append(
+                        _redact_sensitive_runtime_text(
+                            path.read_text(encoding="utf-8", errors="replace")
+                        )
+                    )
                     chunks.append("\n")
             return PlainTextResponse("".join(chunks) if chunks else "")
         except TuiConfigError as exc:
@@ -906,18 +947,29 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
 
     @app.get("/api/runs/{run_id}/files")
     def runs_file(run_id: str, path: str = Query(..., min_length=1)) -> PlainTextResponse:
+        if not _public_run_file_name(path):
+            raise HTTPException(status_code=403, detail="该运行文件包含私有数据")
         try:
             file_path = resolve_run_file(run_id, path)
         except TuiConfigError as exc:
             code = 403 if "非法" in str(exc) else 404
             raise _err(exc, code) from exc
-        return PlainTextResponse(file_path.read_text(encoding="utf-8", errors="replace"))
+        return PlainTextResponse(
+            _redact_sensitive_runtime_text(
+                file_path.read_text(encoding="utf-8", errors="replace")
+            )
+        )
 
     return app
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="xAI HTTP 协议 WebUI（仅本机）")
+    parser.add_argument(
+        "--config",
+        default=os.environ.get("XAI_CONFIG_PATH") or str(DEFAULT_CONFIG_PATH),
+        help="配置文件路径（默认 .local/config.json，也可用 XAI_CONFIG_PATH）",
+    )
     parser.add_argument("--host", default=os.environ.get("XAI_WEBUI_HOST", DEFAULT_WEBUI_HOST))
     parser.add_argument(
         "--port",
@@ -935,7 +987,11 @@ def main(argv: Optional[list] = None) -> int:
         # Soft guard: still allow override but warn loudly.
         print(f"[!] 警告: 绑定 {host} 会超出本机 loopback；规格默认仅 127.0.0.1")
     port = int(args.port or DEFAULT_WEBUI_PORT)
-    app = create_app()
+    config_path = Path(
+        str(args.config or DEFAULT_CONFIG_PATH)
+    ).expanduser().resolve()
+    service = BatchService(config_path=config_path, root_dir=ROOT_DIR)
+    app = create_app(service=service)
     print(f"xAI HTTP WebUI -> http://{host}:{port}")
     if args.open:
         try:

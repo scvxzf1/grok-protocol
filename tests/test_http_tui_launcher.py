@@ -1,4 +1,5 @@
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -17,6 +18,7 @@ SCRIPT = ROOT / "tui.sh"
 
 @unittest.skipUnless(shutil.which("bash"), "bash is required for the HTTP TUI launcher")
 class HttpTuiLauncherTests(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "POSIX launcher paths require a POSIX host")
     def test_dry_run_uses_requested_count_and_concurrency_without_exposing_key(self):
         with tempfile.TemporaryDirectory() as directory:
             directory_path = Path(directory)
@@ -33,7 +35,6 @@ class HttpTuiLauncherTests(unittest.TestCase):
                         "proxy": "",
                         "proxy_file": "",
                         "proxy_random": False,
-                        "proxy_parent": "",
                     }
                 ),
                 encoding="utf-8",
@@ -67,6 +68,7 @@ class HttpTuiLauncherTests(unittest.TestCase):
         self.assertNotIn("test-secret-key", result.stdout)
         self.assertNotIn("test-secret-key", result.stderr)
 
+    @unittest.skipIf(os.name == "nt", "POSIX launcher paths require a POSIX host")
     def test_mode2_dry_run_mentions_sso_converter(self):
         with tempfile.TemporaryDirectory() as directory:
             directory_path = Path(directory)
@@ -83,7 +85,6 @@ class HttpTuiLauncherTests(unittest.TestCase):
                         "proxy": "",
                         "proxy_file": "",
                         "proxy_random": False,
-                        "proxy_parent": "",
                     }
                 ),
                 encoding="utf-8",
@@ -115,7 +116,7 @@ class HttpTuiLauncherTests(unittest.TestCase):
     def test_batch_runner_streams_child_logs_and_merges_worker_accounts(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            fake_entry = root / "grok_register_ttk.py"
+            fake_entry = root / "xai_http_flow.py"
             fake_entry.write_text(
                 """
 import argparse
@@ -161,7 +162,7 @@ print('[HTTP] fake backend completed', flush=True)
     def test_mode2_runner_converts_sso_after_register(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            fake_entry = root / "grok_register_ttk.py"
+            fake_entry = root / "xai_http_flow.py"
             fake_entry.write_text(
                 "\n".join(
                     [
@@ -250,7 +251,6 @@ print('[HTTP] fake backend completed', flush=True)
                         "proxy": "",
                         "proxy_file": "",
                         "proxy_random": False,
-                        "proxy_parent": "",
                     }
                 ),
                 encoding="utf-8",
@@ -287,7 +287,7 @@ print('[HTTP] fake backend completed', flush=True)
     def test_mode2_starts_convert_without_blocking_main_loop(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "grok_register_ttk.py").write_text(
+            (root / "xai_http_flow.py").write_text(
                 "\n".join(
                     [
                         "import argparse",
@@ -372,7 +372,7 @@ print('[HTTP] fake backend completed', flush=True)
                 "'demo@example.test----password----sso-token\\n', encoding='utf-8')\n"
                 "print('register done', flush=True)\n"
             )
-            (root / "grok_register_ttk.py").write_text(register_script, encoding="utf-8")
+            (root / "xai_http_flow.py").write_text(register_script, encoding="utf-8")
             counter = root / "convert_count.txt"
             counter.write_text("0", encoding="utf-8")
             converter_script = (
@@ -471,15 +471,22 @@ print('[HTTP] fake backend completed', flush=True)
             root = Path(directory)
             # fake temp profiles
             (root / "xai-ts-chrome-aaa").mkdir()
+            os.utime(root / "xai-ts-chrome-aaa", (1, 1))
             (root / "xai-ts-probe-bbb").mkdir()
             (root / "xai-chrome-raw-ccc").mkdir()
             (root / "playwright_chromiumdev_profile-ddd").mkdir()
             (root / "keep-me").mkdir()
 
-            with mock.patch.object(batch_service, "_pgrep_count", side_effect=[12, 34]):
+            with mock.patch.object(
+                batch_service,
+                "_pgrep_count",
+                side_effect=[12, 34, 2],
+            ), mock.patch.object(batch_service, "_count_zombie_chrome", return_value=1):
                 status = tui.browser_health_status()
             self.assertEqual(status["chrome_count"], 12)
             self.assertEqual(status["playwright_count"], 34)
+            self.assertEqual(status["solver_count"], 2)
+            self.assertEqual(status["zombie_chrome_count"], 1)
             self.assertIn("chrome=12", tui.format_browser_health(status))
 
             result = tui.cleanup_browser_residues(
@@ -488,9 +495,12 @@ print('[HTTP] fake backend completed', flush=True)
                 kill_all_chrome=False,
                 pkill_fn=lambda pattern: 3 if "ms-playwright" in pattern else 0,
             )
-            self.assertEqual(result["killed_playwright"], 3)
-            self.assertEqual(result["removed_temp_dirs"], 4)
+            self.assertEqual(result["killed_playwright"], 0)
+            self.assertEqual(result["removed_temp_dirs"], 1)
             self.assertFalse((root / "xai-ts-chrome-aaa").exists())
+            self.assertTrue((root / "xai-ts-probe-bbb").exists())
+            self.assertTrue((root / "xai-chrome-raw-ccc").exists())
+            self.assertTrue((root / "playwright_chromiumdev_profile-ddd").exists())
             self.assertTrue((root / "keep-me").exists())
             summary = tui.format_cleanup_result(result)
             self.assertIn("Playwright", summary)

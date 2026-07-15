@@ -31,11 +31,11 @@ render() {
   echo "==== 项目进程汇总 ===="
   ps -eo pid,ppid,%cpu,%mem,rss,etime,cmd --no-headers \
   | awk '
-    /webui_app\.py|grok_register_ttk\.py|xai-ts-chrome|\.embedded_mihomo|http_runs\// {
+    /webui_app\.py|xai_http_flow\.py|xai-ts-chrome|embedded_mihomo|\.local\/runs\// {
       n++; cpu+=$3; rss+=$5
       if ($0 ~ /webui_app\.py/) { w_n++; w_cpu+=$3; w_rss+=$5 }
-      else if ($0 ~ /grok_register_ttk\.py/) { r_n++; r_cpu+=$3; r_rss+=$5 }
-      else if ($0 ~ /\.embedded_mihomo/) { m_n++; m_cpu+=$3; m_rss+=$5 }
+      else if ($0 ~ /xai_http_flow\.py/) { r_n++; r_cpu+=$3; r_rss+=$5 }
+      else if ($0 ~ /embedded_mihomo/) { m_n++; m_cpu+=$3; m_rss+=$5 }
       else if ($0 ~ /xai-ts-chrome/) { c_n++; c_cpu+=$3; c_rss+=$5 }
       else { o_n++; o_cpu+=$3; o_rss+=$5 }
     }
@@ -83,7 +83,7 @@ print(
   echo "==== Top 10 CPU (项目相关) ===="
   ps -eo pid,%cpu,%mem,rss,etime,cmd --sort=-%cpu --no-headers \
   | awk '
-    /webui_app\.py|grok_register_ttk\.py|xai-ts-chrome|\.embedded_mihomo/ { print }
+    /webui_app\.py|xai_http_flow\.py|xai-ts-chrome|embedded_mihomo/ { print }
   ' \
   | head -10 \
   | awk '{

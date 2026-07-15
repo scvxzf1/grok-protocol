@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import os
-import signal
 import re
+import signal
 import shutil
-import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -13,8 +13,17 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
+# ``turnstile_solver`` is also launched with its directory as the working
+# directory (``python -m src``).  Make the parent repository utilities
+# importable without relying on the caller's PYTHONPATH.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from project_browser_registry import register_project_browser, unregister_project_browser
+
 from .browser_worker import BrowserWorker, prepare_browser_proxy, stop_browser_proxy
-from .config import SolverConfig
+from .config import SolverConfig, detect_chrome_full_version
 from .models import PoolStats, SolveRequest, SolveResult
 from .proxy import normalize_proxy
 
@@ -22,6 +31,81 @@ from .proxy import normalize_proxy
 _DEFAULT_BROWSER_CONTEXT_IDS = frozenset(
     {"default", "default-context", "default_context", "defaultcontext"}
 )
+_TURNSTILE_ERROR_CODE_RE = re.compile(
+    r"(?:turnstile[^\r\n]{0,80}?(?:error|code)|challenge\s+error)\D*([0-9]{3,6})",
+    re.IGNORECASE,
+)
+_TURNSTILE_RETRYABLE_CODES = frozenset({"110600", "110620", "200500"})
+_TURNSTILE_CONFIGURATION_CODES = frozenset(
+    {"110100", "110110", "110200", "400020", "400070"}
+)
+
+
+def classify_turnstile_failure(result: SolveResult) -> Dict[str, object]:
+    """Classify one solve failure and choose the smallest safe retry scope."""
+
+    if result.ok:
+        return {
+            "category": "",
+            "error_code": "",
+            "retryable": False,
+            "rebuild": "none",
+        }
+    extras = result.extras if isinstance(result.extras, dict) else {}
+    raw_code = str(extras.get("turnstile_error") or "").strip()
+    error_text = str(result.error or "").strip()
+    code = raw_code if raw_code.isdigit() else ""
+    if not code:
+        match = _TURNSTILE_ERROR_CODE_RE.search(error_text)
+        code = str(match.group(1)) if match else ""
+
+    if code.startswith(("300", "600")):
+        return {
+            "category": "turnstile_challenge_transient",
+            "error_code": code,
+            "retryable": True,
+            "rebuild": "browser",
+        }
+    if code in _TURNSTILE_RETRYABLE_CODES:
+        return {
+            "category": "turnstile_challenge_transient",
+            "error_code": code,
+            "retryable": True,
+            "rebuild": "context",
+        }
+    if code in _TURNSTILE_CONFIGURATION_CODES:
+        return {
+            "category": "turnstile_configuration",
+            "error_code": code,
+            "retryable": False,
+            "rebuild": "none",
+        }
+
+    lowered = error_text.lower()
+    if "turnstile" in lowered and (
+        "timeout" in lowered
+        or "timed out" in lowered
+        or "未捕获到可用 turnstile token" in lowered
+    ):
+        return {
+            "category": "turnstile_timeout",
+            "error_code": raw_code,
+            "retryable": True,
+            "rebuild": "context",
+        }
+    if code or "turnstile" in lowered:
+        return {
+            "category": "turnstile_error",
+            "error_code": code or raw_code,
+            "retryable": False,
+            "rebuild": "none",
+        }
+    return {
+        "category": "solver_error",
+        "error_code": "",
+        "retryable": False,
+        "rebuild": "none",
+    }
 
 
 def _digest_secret(value: str) -> str:
@@ -54,22 +138,10 @@ def _read_browser_full_version(browser_path: str) -> str:
     path = str(browser_path or "").strip()
     if not path:
         raise RuntimeError("browser_path is required to determine the Chrome version")
-    try:
-        completed = subprocess.run(
-            [path, "--version"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-            shell=False,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise RuntimeError(f"无法执行 browser_path --version: {exc}") from exc
-    output = f"{completed.stdout or ''} {completed.stderr or ''}".strip()
-    match = re.search(r"\b(\d+\.\d+\.\d+\.\d+)\b", output)
-    if not match:
-        raise RuntimeError(f"无法从 browser_path --version 解析完整 Chrome 版本: {output!r}")
-    return match.group(1)
+    version = detect_chrome_full_version(path)
+    if not version:
+        raise RuntimeError("无法从 browser_path 解析完整 Chrome 版本")
+    return version
 
 
 def _require_browser_version(browser_path: str, expected_major: int) -> str:
@@ -243,7 +315,6 @@ class BrowserAffinity:
     """Only process-level browser settings belong in this immutable key."""
 
     proxy_digest: str
-    parent_proxy_digest: str
     user_agent_digest: str
     accept_language_digest: str
     ua_policy: str
@@ -260,7 +331,6 @@ class BrowserAffinity:
         cls,
         *,
         proxy: str,
-        parent_proxy: str,
         user_agent: str,
         headless: bool,
         locale: str,
@@ -275,7 +345,6 @@ class BrowserAffinity:
         language = str(accept_language or "").strip()
         return cls(
             proxy_digest=_digest_secret(proxy),
-            parent_proxy_digest=_digest_secret(parent_proxy),
             user_agent_digest=hashlib.sha256(ua.encode("utf-8")).hexdigest()[:16] if ua else "native",
             accept_language_digest=(
                 hashlib.sha256(language.encode("utf-8")).hexdigest()[:16] if language else "native"
@@ -295,7 +364,6 @@ class BrowserAffinity:
         raw = "|".join(
             (
                 self.proxy_digest,
-                self.parent_proxy_digest,
                 self.user_agent_digest,
                 self.accept_language_digest,
                 self.ua_policy,
@@ -321,14 +389,12 @@ class BrowserSlot:
         *,
         affinity: BrowserAffinity,
         upstream_proxy: str,
-        parent_proxy: str,
         user_agent: str,
     ):
         self.config = config
         self.worker = worker
         self.affinity = affinity
         self.upstream_proxy_raw = str(upstream_proxy or "")
-        self.parent_proxy_raw = str(parent_proxy or "")
         self.user_agent = str(user_agent or "").strip()
         self.slot_id = uuid.uuid4().hex[:12]
         self.browser = None
@@ -337,6 +403,8 @@ class BrowserSlot:
         self.upstream_proxy = ""
         self.forwarder_instance = ""
         self.profile_dir = ""
+        self.browser_pid = 0
+        self._registry_registered = False
         self.browser_version = ""
         self.created_monotonic = 0.0
         self.last_used_monotonic = 0.0
@@ -346,7 +414,6 @@ class BrowserSlot:
         self._seen_context_ids: set[str] = set()
         self._dispose_attempted_context_ids: set[str] = set()
         self._closed = False
-        self._virtual_display = None
         self._browser_mode = "headed"
         self._launch_display = ""
 
@@ -468,55 +535,15 @@ class BrowserSlot:
 
 
     def _resolve_launch_headless(self) -> bool:
-        """Map requested headless affinity to an actual Chrome launch mode.
+        """Keep the requested launch family stable for the full solve attempt."""
 
-        accounts.x.ai consistently hard-blocks pure headless Chrome. When the
-        caller asks for headless, prefer Xvfb virtual-headed (or real headed if
-        a display exists) so local Turnstile capture stays viable.
-        """
-        want_headless = bool(self.affinity.headless)
-        if not want_headless:
+        use_headless = bool(self.affinity.headless)
+        if use_headless:
+            self._browser_mode = "headless-new"
+        else:
             self._browser_mode = "headed"
-            self._launch_display = str(os.environ.get("DISPLAY") or "")
-            return False
-        try:
-            from xai_http_flow import (
-                _resolve_local_browser_mode,
-                _VirtualDisplaySession,
-            )
-        except Exception:
-            self._browser_mode = "headless-new"
-            self._launch_display = str(os.environ.get("DISPLAY") or "")
-            return True
-
-        mode, use_headless = _resolve_local_browser_mode(want_headless=True)
-        if mode == "virtual-headed":
-            virtual = _VirtualDisplaySession(log_callback=self.worker.log_callback)
-            if virtual.start():
-                self._virtual_display = virtual
-                self._browser_mode = "virtual-headed"
-                self._launch_display = str(os.environ.get("DISPLAY") or "")
-                return False
-            self._browser_mode = "headless-new"
-            self._launch_display = str(os.environ.get("DISPLAY") or "")
-            return True
-        if mode == "headed":
-            self._browser_mode = "headed-fallback"
-            self._launch_display = str(os.environ.get("DISPLAY") or "")
-            return False
-        self._browser_mode = "headless-new"
         self._launch_display = str(os.environ.get("DISPLAY") or "")
-        return bool(use_headless)
-
-    def _stop_virtual_display(self) -> None:
-        virtual = self._virtual_display
-        self._virtual_display = None
-        if virtual is None:
-            return
-        try:
-            virtual.stop()
-        except Exception:
-            pass
+        return use_headless
 
     def start(self) -> None:
         if self.browser is not None:
@@ -542,7 +569,6 @@ class BrowserSlot:
         try:
             self.browser_proxy, self.upstream_proxy, self.forwarder_instance = prepare_browser_proxy(
                 self.upstream_proxy_raw,
-                parent_proxy=self.parent_proxy_raw,
                 preferred_local_port=0,
                 instance_key=f"ts-slot-{self.slot_id}",
             )
@@ -612,6 +638,9 @@ class BrowserSlot:
             self.options = options
             self.profile_dir = str(getattr(options, "_xai_profile_dir", "") or "")
             self.browser = Chromium(options)
+            self.browser_pid = _browser_pid(self.browser)
+            register_project_browser(self.browser_pid, self.profile_dir)
+            self._registry_registered = bool(self.browser_pid > 1 or self.profile_dir)
 
             # Feature-probe real browser-context isolation. Never silently fall
             # back to a cookie-sharing normal tab in strict mode.
@@ -638,7 +667,6 @@ class BrowserSlot:
             self.created_monotonic = time.monotonic()
             self.last_used_monotonic = self.created_monotonic
         except Exception:
-            self._stop_virtual_display()
             self.close()
             raise
 
@@ -649,7 +677,6 @@ class BrowserSlot:
         locale = self.config.locale or accept_language.split(",", 1)[0].split(";", 1)[0].strip()
         expected = BrowserAffinity.build(
             proxy=request.proxy or self.config.proxy,
-            parent_proxy=str((request.metadata or {}).get("parent_proxy") or self.config.parent_proxy or ""),
             user_agent=request.user_agent or self.config.user_agent,
             headless=bool(request.headless or self.config.headless),
             locale=locale,
@@ -761,7 +788,7 @@ class BrowserSlot:
             return
         self._closed = True
         browser, self.browser = self.browser, None
-        browser_pid = _browser_pid(browser)
+        browser_pid = self.browser_pid or _browser_pid(browser)
         if browser is not None:
             try:
                 browser.quit()
@@ -777,6 +804,13 @@ class BrowserSlot:
             _reap_zombie_children()
         except Exception:
             pass
+        if self._registry_registered:
+            try:
+                unregister_project_browser(browser_pid, self.profile_dir)
+            except Exception:
+                pass
+            self._registry_registered = False
+        self.browser_pid = 0
         stop_browser_proxy(self.forwarder_instance)
         self.forwarder_instance = ""
         if self.profile_dir:
@@ -784,7 +818,6 @@ class BrowserSlot:
                 shutil.rmtree(Path(self.profile_dir), ignore_errors=True)
             except Exception:
                 pass
-        self._stop_virtual_display()
 
 
 class PersistentBrowserPool:
@@ -876,15 +909,13 @@ class PersistentBrowserPool:
             self.stats.recycle_reasons[reason] = self.stats.recycle_reasons.get(reason, 0) + 1
             self._refresh_stats_locked()
 
-    def _request_parts(self, request: SolveRequest) -> Tuple[BrowserAffinity, str, str, str]:
+    def _request_parts(self, request: SolveRequest) -> Tuple[BrowserAffinity, str, str]:
         proxy = str(request.proxy or self.config.proxy or "").strip()
-        parent = str((request.metadata or {}).get("parent_proxy") or self.config.parent_proxy or "").strip()
         ua = str(request.user_agent or self.config.user_agent or "").strip()
         accept_language = str(request.accept_language or self.config.accept_language or "").strip()
         locale = self.config.locale or accept_language.split(",", 1)[0].split(";", 1)[0].strip()
         affinity = BrowserAffinity.build(
             proxy=proxy,
-            parent_proxy=parent,
             user_agent=ua,
             headless=bool(request.headless or self.config.headless),
             locale=locale,
@@ -895,10 +926,10 @@ class PersistentBrowserPool:
             expected_browser_major=request.expected_browser_major,
             no_sandbox=self.config.resolved_no_sandbox(),
         )
-        return affinity, proxy, parent, ua
+        return affinity, proxy, ua
 
     def _acquire(self, request: SolveRequest, deadline: float) -> Optional[BrowserSlot]:
-        affinity, proxy, parent, ua = self._request_parts(request)
+        affinity, proxy, ua = self._request_parts(request)
         waiter_counted = False
         try:
             while True:
@@ -949,7 +980,6 @@ class PersistentBrowserPool:
                         self.worker,
                         affinity=affinity,
                         upstream_proxy=proxy,
-                        parent_proxy=parent,
                         user_agent=ua,
                     )
                     try:
@@ -976,13 +1006,19 @@ class PersistentBrowserPool:
                     self._waiters = max(0, self._waiters - 1)
                     self._refresh_stats_locked()
 
-    def _release(self, slot: BrowserSlot, result: SolveResult) -> None:
+    def _release(
+        self,
+        slot: BrowserSlot,
+        result: SolveResult,
+        *,
+        force_recycle_reason: str = "",
+    ) -> None:
         slot.completed_tasks += 1
         if result.ok:
             slot.consecutive_failures = 0
         else:
             slot.consecutive_failures += 1
-        reason = slot.recycle_reason()
+        reason = str(force_recycle_reason or "").strip() or slot.recycle_reason()
         close_slot = False
         with self._condition:
             self._busy.discard(slot.slot_id)
@@ -1004,29 +1040,125 @@ class PersistentBrowserPool:
         started = time.monotonic()
         total_budget = max(1, int(request.timeout_sec or self.config.queue_timeout_sec))
         deadline = started + total_budget
+        max_attempts = max(1, int(self.config.browser_solve_max_attempts or 1))
+        backoff_base = max(0.0, float(self.config.browser_retry_backoff_sec or 0.0))
         slot: Optional[BrowserSlot] = None
+        slot_release_reason = ""
         result = SolveResult(ok=False, error="solver did not run")
+        attempt_history = []
+        attempt = 0
         try:
-            slot = self._acquire(request, deadline)
-            if slot is None:
-                result = SolveResult(
-                    ok=False,
-                    error="solver pool busy: acquire timeout",
-                    elapsed_ms=int((time.monotonic() - started) * 1000),
+            while attempt < max_attempts:
+                attempt += 1
+                slot = self._acquire(request, deadline)
+                slot_release_reason = ""
+                if slot is None:
+                    result = SolveResult(
+                        ok=False,
+                        error="solver pool busy: acquire timeout",
+                        elapsed_ms=int((time.monotonic() - started) * 1000),
+                    )
+                    break
+                remaining = deadline - time.monotonic()
+                # SolveRequest timeout granularity is one second.  Starting a
+                # capture with less than that would round up and violate the
+                # overall solve deadline.
+                if remaining < 1.0:
+                    result = SolveResult(
+                        ok=False,
+                        error="solver deadline has insufficient capture budget",
+                    )
+                    break
+                effective = replace(request, timeout_sec=max(1, int(remaining)))
+                result = slot.solve(effective)
+                diagnosis = classify_turnstile_failure(result)
+                diagnosis_rebuild = str(diagnosis.get("rebuild") or "none")
+                diagnosis_code = str(diagnosis.get("error_code") or "generic")
+                if not result.ok and diagnosis_rebuild == "browser":
+                    slot_release_reason = (
+                        f"turnstile_challenge_{diagnosis_code}_rebuild"
+                    )
+                attempt_history.append(
+                    {
+                        "attempt": attempt,
+                        "category": str(diagnosis.get("category") or ""),
+                        "error_code": str(diagnosis.get("error_code") or ""),
+                        "retryable": bool(diagnosis.get("retryable")),
+                        "rebuild": str(diagnosis.get("rebuild") or "none"),
+                        "elapsed_ms": max(0, int(result.elapsed_ms or 0)),
+                    }
                 )
-                return result
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                result = SolveResult(ok=False, error="solver deadline exhausted before capture")
-                return result
-            effective = replace(request, timeout_sec=max(1, int(remaining)))
-            result = slot.solve(effective)
-            with self._condition:
+                extras = dict(result.extras or {})
+                extras.update(
+                    {
+                        "failure_category": str(diagnosis.get("category") or ""),
+                        "error_code": str(diagnosis.get("error_code") or ""),
+                        "retryable": bool(diagnosis.get("retryable")),
+                        "solve_attempt": attempt,
+                        "solve_max_attempts": max_attempts,
+                        "retry_count": max(0, attempt - 1),
+                        "retry_history": list(attempt_history),
+                        "total_elapsed_ms": int((time.monotonic() - started) * 1000),
+                    }
+                )
+                result.extras = extras
                 if result.ok:
-                    self.stats.completed += 1
-                else:
-                    self.stats.failed += 1
-                    self.stats.last_error = result.error
+                    with self._condition:
+                        self.stats.completed += 1
+                        if attempt > 1:
+                            self.stats.retry_successes += 1
+                    return result
+
+                retryable = bool(diagnosis.get("retryable"))
+                backoff = backoff_base * (2 ** max(0, attempt - 1))
+                remaining = deadline - time.monotonic()
+                can_retry = (
+                    retryable
+                    and attempt < max_attempts
+                    and remaining > max(1.0, backoff)
+                )
+                if not can_retry:
+                    break
+
+                with self._condition:
+                    self.stats.retry_attempts += 1
+                retry_slot, slot = slot, None
+                self._release(
+                    retry_slot,
+                    result,
+                    force_recycle_reason=slot_release_reason,
+                )
+                slot_release_reason = ""
+                wait_for = min(backoff, max(0.0, deadline - time.monotonic() - 1.0))
+                if wait_for > 0 and self._maintenance_stop.wait(wait_for):
+                    result = SolveResult(ok=False, error="browser pool closed during retry")
+                    break
+
+            final_diagnosis = classify_turnstile_failure(result)
+            final_extras = dict(result.extras or {})
+            final_extras.update(
+                {
+                    "failure_category": str(final_diagnosis.get("category") or ""),
+                    "error_code": str(final_diagnosis.get("error_code") or ""),
+                    "retryable": bool(final_diagnosis.get("retryable")),
+                    "solve_attempt": max(1, attempt),
+                    "solve_max_attempts": max_attempts,
+                    "retry_count": max(0, attempt - 1),
+                    "retry_history": list(attempt_history),
+                    "total_elapsed_ms": int((time.monotonic() - started) * 1000),
+                }
+            )
+            result.extras = final_extras
+            category = str(final_diagnosis.get("category") or "solver_error")
+            error_code = str(final_diagnosis.get("error_code") or "")
+            with self._condition:
+                self.stats.failed += 1
+                self.stats.last_error = result.error
+                self.stats.last_failure_category = category
+                self.stats.last_error_code = error_code
+                self.stats.failure_categories[category] = (
+                    self.stats.failure_categories.get(category, 0) + 1
+                )
             return result
         except Exception as exc:
             result = SolveResult(
@@ -1034,13 +1166,24 @@ class PersistentBrowserPool:
                 error=str(exc),
                 elapsed_ms=int((time.monotonic() - started) * 1000),
             )
+            diagnosis = classify_turnstile_failure(result)
+            category = str(diagnosis.get("category") or "solver_error")
             with self._condition:
                 self.stats.failed += 1
                 self.stats.last_error = result.error
+                self.stats.last_failure_category = category
+                self.stats.last_error_code = str(diagnosis.get("error_code") or "")
+                self.stats.failure_categories[category] = (
+                    self.stats.failure_categories.get(category, 0) + 1
+                )
             return result
         finally:
             if slot is not None:
-                self._release(slot, result)
+                self._release(
+                    slot,
+                    result,
+                    force_recycle_reason=slot_release_reason,
+                )
 
     def close(self) -> None:
         with self._condition:

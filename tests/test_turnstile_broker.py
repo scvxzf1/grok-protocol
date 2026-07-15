@@ -1,21 +1,43 @@
 import asyncio
+import concurrent.futures
 import threading
 import time
 import unittest
 from unittest import mock
 
 from turnstile_broker import (
+    BrokerQueueFull,
     FingerprintProfile,
     SolveRequest,
     SolveResult,
     TokenLease,
     TokenLeaseError,
     TurnstileBroker,
+    build_chrome_brand_version_list,
+    serialize_sec_ch_ua,
 )
 import xai_http_flow as flow
 
 
 class TurnstileBrokerTests(unittest.TestCase):
+    def test_chrome_brand_list_uses_full_version_and_product_brand(self):
+        reduced = build_chrome_brand_version_list("136")
+        full = build_chrome_brand_version_list("136.0.7103.92", full_version=True)
+
+        self.assertEqual([brand for brand, _version in reduced], [
+            "Chromium",
+            "Google Chrome",
+            "Not.A/Brand",
+        ])
+        self.assertEqual(dict(reduced)["Chromium"], "136")
+        self.assertEqual(dict(reduced)["Google Chrome"], "136")
+        self.assertEqual(dict(full)["Chromium"], "136.0.7103.92")
+        self.assertEqual(dict(full)["Google Chrome"], "136.0.7103.92")
+        self.assertEqual(
+            serialize_sec_ch_ua("136"),
+            '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
+        )
+
     def test_token_lease_is_single_use_and_uses_240_second_default(self):
         result = SolveResult("t" * 100, "local", 10.0, 1)
         lease = TokenLease(result)
@@ -155,6 +177,92 @@ class TurnstileBrokerTests(unittest.TestCase):
         self.assertEqual(ensure_errors, [])
         self.assertTrue(broker.closed)
         broker.close()
+
+    def test_submit_close_race_closes_unscheduled_coroutine(self):
+        broker = TurnstileBroker(provider_limits={"local": 1})
+        loop = mock.Mock()
+        coroutine = mock.Mock()
+
+        def close_then_return_loop():
+            broker.close()
+            return loop
+
+        with mock.patch.object(
+            broker,
+            "_ensure_loop",
+            side_effect=close_then_return_loop,
+        ), mock.patch.object(
+            broker,
+            "_solve_on_loop",
+            new=lambda *_args, **_kwargs: coroutine,
+        ), mock.patch(
+            "turnstile_broker.asyncio.run_coroutine_threadsafe"
+        ) as schedule:
+            with self.assertRaisesRegex(RuntimeError, "broker is closed"):
+                broker._submit(
+                    SolveRequest("local", "sitekey", "https://example.test"),
+                    mock.Mock(),
+                )
+
+        coroutine.close.assert_called_once_with()
+        schedule.assert_not_called()
+
+    def test_queue_limit_bounds_active_and_waiting_work(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        async def solver(request, sleep):
+            started.set()
+            while not release.is_set():
+                await sleep(0.01)
+            return SolveResult(
+                token="t" * 100,
+                provider=request.provider,
+                received_at=time.monotonic(),
+                elapsed_ms=1,
+            )
+
+        broker = TurnstileBroker(provider_limits={"local": 1}, queue_limit=1)
+        self.addCleanup(broker.close)
+        first = broker._submit(
+            SolveRequest("local", "first", "https://example.test", timeout_sec=5),
+            solver,
+        )
+        self.assertTrue(started.wait(timeout=1.0))
+        second = broker._submit(
+            SolveRequest("local", "second", "https://example.test", timeout_sec=5),
+            solver,
+        )
+        with self.assertRaises(BrokerQueueFull):
+            second.result(timeout=1.0)
+        release.set()
+        self.assertEqual(first.result(timeout=2.0).token, "t" * 100)
+        self.assertEqual(broker._pending, 0)
+
+    def test_close_cancels_active_solver_and_drains_pending(self):
+        started = threading.Event()
+        finalized = threading.Event()
+
+        async def solver(_request, sleep):
+            started.set()
+            try:
+                while True:
+                    await sleep(0.01)
+            finally:
+                finalized.set()
+
+        broker = TurnstileBroker(provider_limits={"local": 1})
+        future = broker._submit(
+            SolveRequest("local", "sitekey", "https://example.test", timeout_sec=30),
+            solver,
+        )
+        self.assertTrue(started.wait(timeout=1.0))
+        broker.close()
+
+        self.assertTrue(finalized.wait(timeout=1.0))
+        with self.assertRaises(concurrent.futures.CancelledError):
+            future.result(timeout=1.0)
+        self.assertEqual(broker._pending, 0)
 
     def test_lease_only_solve_response_is_accepted_until_consume(self):
         class LeaseOnlyBroker:
