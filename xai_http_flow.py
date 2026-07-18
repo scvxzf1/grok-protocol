@@ -19,6 +19,7 @@ import asyncio
 import concurrent.futures
 import functools
 import html as html_lib
+import imaplib
 import json
 import os
 import random
@@ -32,6 +33,9 @@ import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
+from email import policy as email_policy
+from email.parser import BytesParser
+from email.utils import parseaddr, parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
@@ -3453,10 +3457,17 @@ class YydsTempMailbox:
         raise MailboxError(f"在 {timeout}s 内未收到 {mask_email(email)} 的 xAI 验证码")
 
 
-# Common first-party / public Azure app ids used by many Outlook OAuth dumps.
+# Microsoft OAuth profiles used by Outlook mailbox exports.  Thunderbird tokens
+# are issued for the Outlook/IMAP resource, while other public clients in the
+# four-field format historically used Microsoft Graph Mail.Read.
 MS_GRAPH_TOKEN_URL = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
 MS_GRAPH_SCOPE = "https://graph.microsoft.com/Mail.Read offline_access"
 MS_GRAPH_MESSAGES_URL = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages"
+MS_THUNDERBIRD_CLIENT_ID = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
+MS_IMAP_TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+MS_IMAP_SCOPE = "https://outlook.office.com/IMAP.AccessAsUser.All offline_access"
+MS_IMAP_HOST = "outlook.office365.com"
+MS_IMAP_PORT = 993
 MS_MAIL_POOL_LOCK_TIMEOUT_SEC = configured_lock_timeout(
     "XAI_MS_MAIL_POOL_LOCK_TIMEOUT_SEC",
     default=60.0,
@@ -3511,7 +3522,7 @@ def _atomic_write_utf8_lines(path: Path, lines: Sequence[str]) -> None:
 
 
 class MicrosoftGraphMailbox:
-    """Claim an Outlook/Hotmail line and poll Microsoft Graph for xAI codes.
+    """Claim an Outlook/Hotmail line and poll its matching OAuth mail backend.
 
     File format (one account per line):
       email----password----client_id----refresh_token
@@ -3520,7 +3531,7 @@ class MicrosoftGraphMailbox:
       1. mailbox address used for xAI signup
       2. account password (not needed for Graph mail read when refresh token works)
       3. Azure public client_id used when the refresh token was issued
-      4. MSA refresh token (usually starts with M.C...) for Graph Mail.Read
+      4. MSA refresh token (usually starts with M.C...) for Graph or IMAP mail read
     """
 
     def __init__(
@@ -3551,6 +3562,10 @@ class MicrosoftGraphMailbox:
         self.account: Dict[str, str] = {}
         self.access_token = ""
         self.access_expires_at = 0.0
+        self.mail_backend = "graph"
+        self._imap_client: Any = None
+        self._imap_access_token = ""
+        self._imap_message_cache: Dict[str, Dict[str, Any]] = {}
         self._claimed_for_return = False
         self._claim_committed = False
 
@@ -3726,15 +3741,25 @@ class MicrosoftGraphMailbox:
     def _update_used_account(self, account: Dict[str, str]) -> None:
         self._update_account_record(account)
 
+    @staticmethod
+    def _oauth_profile(account: Dict[str, str]) -> Tuple[str, str, str]:
+        """Return ``(backend, token_url, scope)`` for an imported token."""
+
+        client_id = str(account.get("client_id") or "").strip().lower()
+        if client_id == MS_THUNDERBIRD_CLIENT_ID:
+            return "imap", MS_IMAP_TOKEN_URL, MS_IMAP_SCOPE
+        return "graph", MS_GRAPH_TOKEN_URL, MS_GRAPH_SCOPE
+
     def _refresh_access_token(self, account: Dict[str, str]) -> str:
+        backend, token_url, scope = self._oauth_profile(account)
         response = self._request(
             "post",
-            MS_GRAPH_TOKEN_URL,
+            token_url,
             data={
                 "client_id": account["client_id"],
                 "grant_type": "refresh_token",
                 "refresh_token": account["refresh_token"],
-                "scope": MS_GRAPH_SCOPE,
+                "scope": scope,
             },
         )
         code = int(getattr(response, "status_code", 0) or 0)
@@ -3746,6 +3771,9 @@ class MicrosoftGraphMailbox:
         access = str(data.get("access_token") or "").strip()
         if not access:
             raise MailboxError("微软 token 响应缺少 access_token")
+        if backend != self.mail_backend:
+            self._close_imap()
+        self.mail_backend = backend
         new_refresh = str(data.get("refresh_token") or "").strip()
         if new_refresh and new_refresh != account.get("refresh_token"):
             account["refresh_token"] = new_refresh
@@ -3793,6 +3821,7 @@ class MicrosoftGraphMailbox:
         """Return the current uncommitted reservation exactly once."""
 
         del reason  # Failure categories are intentionally not persisted here.
+        self._close_imap()
         if (
             not self.mark_used
             or not self._claimed_for_return
@@ -3864,6 +3893,7 @@ class MicrosoftGraphMailbox:
     def commit_success(self) -> bool:
         """Mark the current reservation consumed so later release is a no-op."""
 
+        self._close_imap()
         if not self._claimed_for_return or self._claim_committed:
             return False
         self._claim_committed = True
@@ -3880,9 +3910,173 @@ class MicrosoftGraphMailbox:
             self.access_token = token
             self.access_expires_at = time.monotonic() + 600
             return token
-        raise MailboxError("Microsoft Graph 访问令牌不可用")
+        raise MailboxError("Microsoft OAuth 访问令牌不可用")
+
+    def _close_imap(self) -> None:
+        client = self._imap_client
+        self._imap_client = None
+        self._imap_access_token = ""
+        self._imap_message_cache = {}
+        if client is None:
+            return
+        try:
+            client.logout()
+        except Exception:
+            try:
+                client.shutdown()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _imap_auth_payload(email: str, access_token: str) -> bytes:
+        return (
+            f"user={str(email or '').strip()}\x01"
+            f"auth=Bearer {str(access_token or '').strip()}\x01\x01"
+        ).encode("utf-8")
+
+    def _open_imap(self, access_token: str) -> Any:
+        if not self.account:
+            raise MailboxError("IMAP 邮箱账号未绑定")
+        client = imaplib.IMAP4_SSL(
+            MS_IMAP_HOST,
+            MS_IMAP_PORT,
+            timeout=self.timeout,
+        )
+        try:
+            payload = self._imap_auth_payload(self.account.get("email", ""), access_token)
+            status, _ = client.authenticate("XOAUTH2", lambda _challenge: payload)
+            if str(status or "").upper() != "OK":
+                raise imaplib.IMAP4.error("XOAUTH2 rejected")
+            status, _ = client.select("INBOX", readonly=True)
+            if str(status or "").upper() != "OK":
+                raise imaplib.IMAP4.error("INBOX select rejected")
+        except Exception:
+            try:
+                client.logout()
+            except Exception:
+                try:
+                    client.shutdown()
+                except Exception:
+                    pass
+            raise
+        self._imap_client = client
+        self._imap_access_token = access_token
+        return client
+
+    def _ensure_imap(self, access_token: str, *, refresh_on_auth_error: bool = True) -> Any:
+        if self._imap_client is not None and self._imap_access_token == access_token:
+            return self._imap_client
+        self._close_imap()
+        try:
+            return self._open_imap(access_token)
+        except imaplib.IMAP4.error as exc:
+            if refresh_on_auth_error and self.account:
+                refreshed = self._refresh_access_token(self.account)
+                try:
+                    return self._open_imap(refreshed)
+                except Exception as retry_exc:
+                    raise MailboxError("Outlook IMAP XOAUTH2 登录失败") from retry_exc
+            raise MailboxError("Outlook IMAP XOAUTH2 登录失败") from exc
+        except Exception as exc:
+            raise MailboxError("Outlook IMAP 连接失败") from exc
+
+    @staticmethod
+    def _imap_raw_message(payload: Any) -> bytes:
+        if not isinstance(payload, (list, tuple)):
+            return b""
+        for item in payload:
+            if isinstance(item, tuple):
+                for value in reversed(item):
+                    if isinstance(value, bytes) and value:
+                        return value
+        return b""
+
+    @staticmethod
+    def _imap_message(uid: bytes, raw: bytes) -> Dict[str, Any]:
+        parsed = BytesParser(policy=email_policy.default).parsebytes(raw)
+        subject = str(parsed.get("subject") or "")
+        sender = parseaddr(str(parsed.get("from") or ""))[1]
+        received = ""
+        try:
+            from datetime import timezone
+
+            received_dt = parsedate_to_datetime(str(parsed.get("date") or ""))
+            if received_dt is not None:
+                if received_dt.tzinfo is None:
+                    received_dt = received_dt.replace(tzinfo=timezone.utc)
+                received = received_dt.astimezone(timezone.utc).isoformat()
+        except Exception:
+            received = ""
+
+        bodies: List[str] = []
+        parts = parsed.walk() if parsed.is_multipart() else (parsed,)
+        for part in parts:
+            if part.is_multipart():
+                continue
+            if str(part.get_content_disposition() or "").lower() == "attachment":
+                continue
+            if part.get_content_type() not in {"text/plain", "text/html"}:
+                continue
+            try:
+                value = part.get_content()
+            except Exception:
+                payload_bytes = part.get_payload(decode=True) or b""
+                value = payload_bytes.decode(part.get_content_charset() or "utf-8", errors="replace")
+            if isinstance(value, str) and value.strip():
+                if part.get_content_type() == "text/html":
+                    value = re.sub(r"<[^>]+>", " ", value)
+                bodies.append(value)
+        body = "\n".join(bodies)
+        message_id = f"imap:{uid.decode('ascii', errors='ignore')}"
+        return {
+            "id": message_id,
+            "subject": subject,
+            "bodyPreview": body[:4096],
+            "body": {"contentType": "text", "content": body},
+            "receivedDateTime": received,
+            "from": {"emailAddress": {"address": sender}},
+        }
+
+    def _imap_messages_once(self, access_token: str) -> List[Dict[str, Any]]:
+        client = self._ensure_imap(access_token)
+        status, data = client.uid("search", None, "ALL")
+        if str(status or "").upper() != "OK":
+            raise MailboxError("Outlook IMAP SEARCH 失败")
+        raw_ids = data[0] if isinstance(data, (list, tuple)) and data else b""
+        uids = raw_ids.split()[-15:] if isinstance(raw_ids, bytes) else []
+        messages: List[Dict[str, Any]] = []
+        cache: Dict[str, Dict[str, Any]] = {}
+        for uid in reversed(uids):
+            status, payload = client.uid("fetch", uid, "(BODY.PEEK[])")
+            if str(status or "").upper() != "OK":
+                continue
+            raw = self._imap_raw_message(payload)
+            if not raw:
+                continue
+            message = self._imap_message(uid, raw)
+            messages.append(message)
+            cache[str(message.get("id") or "")] = message
+        self._imap_message_cache = cache
+        return messages
+
+    def _imap_messages(self, token: str) -> List[Dict[str, Any]]:
+        access = self._ensure_access_token(token)
+        try:
+            return self._imap_messages_once(access)
+        except (imaplib.IMAP4.abort, OSError) as exc:
+            self._close_imap()
+            try:
+                return self._imap_messages_once(access)
+            except Exception as retry_exc:
+                raise MailboxError("Outlook IMAP 收件箱读取失败") from retry_exc
+        except MailboxError:
+            raise
+        except Exception as exc:
+            raise MailboxError("Outlook IMAP 收件箱读取失败") from exc
 
     def _messages(self, token: str) -> List[Dict[str, Any]]:
+        if self.mail_backend == "imap":
+            return self._imap_messages(token)
         access = self._ensure_access_token(token)
         response = self._request(
             "get",
@@ -3917,6 +4111,8 @@ class MicrosoftGraphMailbox:
         return []
 
     def _message_detail(self, message_id: str, token: str) -> Dict[str, Any]:
+        if self.mail_backend == "imap":
+            return dict(self._imap_message_cache.get(str(message_id or ""), {}))
         access = self._ensure_access_token(token)
         response = self._request(
             "get",

@@ -4,7 +4,7 @@ Put **your own** mail pools and proxy lists here. Real files are gitignored.
 
 | Example file | Purpose |
 | --- | --- |
-| `outlook_mail.example.txt` | Outlook/Hotmail Graph mail pool format |
+| `outlook_mail.example.txt` | Outlook/Hotmail OAuth mail pool format |
 | `proxies.example.txt` | Residential / sticky proxy pool format |
 
 ## Quick start

@@ -1452,7 +1452,7 @@ def build_plan(settings: Settings) -> RunPlan:
     if workers > 1 and (is_graph or has_mail_file):
         # Claim is cross-process flock-safe; parallel workers each get a distinct line.
         warnings.append(
-            "Outlook/Graph 邮箱池已支持多并发领取（文件锁）；"
+            "Outlook Graph/IMAP OAuth 邮箱池已支持多并发领取（文件锁）；"
             "请保证池内可用账号数 ≥ 并发，否则后启动的任务会因池空失败。"
         )
     if workers > 1 and (
@@ -3961,7 +3961,7 @@ def _proxy_file_path(settings: Settings) -> Path:
 
 
 def _ms_mail_file_path(settings: Settings) -> Path:
-    """Resolve Outlook/Hotmail Graph pool file path from config.ms_mail_file."""
+    """Resolve Outlook/Hotmail OAuth pool file path from config.ms_mail_file."""
     raw = str((settings.config or {}).get("ms_mail_file") or "").strip()
     if not raw:
         # Sensible default next to config; user can change path in UI.
