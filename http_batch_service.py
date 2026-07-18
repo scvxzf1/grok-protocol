@@ -3602,23 +3602,34 @@ class BatchRunner:
                     continue
                 blob = self._worker_proxy_failure_blob(worker, reason)
                 category = classify_failure_text(blob)
+                proxy_failed = _looks_like_proxy_failure(blob)
                 if self._uses_independent_turnstile_route_for_failure(worker, blob):
                     self._release_manual_proxy(
                         worker,
                         success=None,
                         reason="independent_turnstile_failure",
                     )
-                else:
+                elif proxy_failed:
                     self._report_manual_proxy_outcome(
                         worker,
                         success=False,
+                        reason=category if category != "unknown" else reason,
+                    )
+                else:
+                    # A mailbox, validation, or other business-flow failure says
+                    # nothing about the selected HTTP route. Release the lease
+                    # neutrally so valid pool capacity is not cooled by an
+                    # unrelated child-process exit.
+                    self._release_manual_proxy(
+                        worker,
+                        success=None,
                         reason=category if category != "unknown" else reason,
                     )
                 self._mark_terminal(worker, "failed")
                 # Attribute proxy/TLS failure to the node only when it looks like egress/TLS.
                 self._release_embedded_proxy(
                     worker,
-                    failed=_looks_like_proxy_failure(blob),
+                    failed=proxy_failed,
                     reason=blob,
                 )
                 self._record_failure(worker, worker.last_log)
