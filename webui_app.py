@@ -432,9 +432,14 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
     @app.get("/api/credential-exports/preview")
     def credential_exports_preview(
         name: str = Query(..., min_length=1),
-        max_chars: int = Query(300000, ge=1000, le=2000000),
+        # 默认直接返回完整原文（每页最多 1000 条 json____sso，通常 < 2MB）
+        max_chars: int = Query(2000000, ge=1000, le=5000000),
     ) -> Dict[str, Any]:
-        """Return export txt content for in-page historical viewing."""
+        """Return export txt content for in-page historical viewing.
+
+        一行一条原始 ``{oauth json}____{sso}``，不做格式化/脱敏。
+        超过 max_chars 时截断并标记 truncated=true。
+        """
         try:
             path = get_service().resolve_export_file(name)
         except TuiConfigError as exc:
@@ -447,9 +452,9 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
             raw = path.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
             raise _err(TuiConfigError(f"读取导出文件失败: {exc}"), 400) from exc
-        limit = max(1000, min(int(max_chars or 300000), 2000000))
+        limit = max(1000, min(int(max_chars or 2000000), 5000000))
         truncated = len(raw) > limit
-        text = raw[:limit]
+        text = raw if not truncated else raw[:limit]
         line_count = raw.count("\n") + (0 if raw.endswith("\n") or not raw else 1)
         return {
             "ok": True,
@@ -457,6 +462,7 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
             "path": str(path),
             "size": path.stat().st_size,
             "line_count": line_count,
+            "char_count": len(raw),
             "truncated": truncated,
             "max_chars": limit,
             "text": text,
