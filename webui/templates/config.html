@@ -8,9 +8,9 @@
   <link rel="icon" href="/static/favicon.ico" sizes="any" />
   <link rel="icon" href="/static/favicon-32.png" type="image/png" sizes="32x32" />
   <link rel="apple-touch-icon" href="/static/apple-touch-icon.png" sizes="180x180" />
-  <link rel="stylesheet" href="/static/app.css?v=config-secret-guard-3" />
+  <link rel="stylesheet" href="/static/app.css?v=config-readability-5" />
 </head>
-<body>
+<body class="config-page">
   <header class="top">
     <div class="top-main">
       <div>
@@ -23,7 +23,7 @@
         <a href="/credentials" class="{% if active == 'credentials' %}active{% endif %}">凭证列表</a>
         <a href="/cpa" class="{% if active == 'cpa' %}active{% endif %}">CPA 巡检</a>
       </nav>
-      
+
       <nav class="nav subnav" aria-label="配置分区">
         <a href="/config" class="active">总览</a>
         <a href="/config/mail" class="">邮箱 / 验证码</a>
@@ -35,46 +35,63 @@
   </header>
 
   <main class="grid">
-<section class="panel wide">
-      <div class="actions" style="margin-top:0" data-config-page="overview">
-        <button type="button" id="btnReloadCfg">重载</button>
-        
-        
+<section class="panel wide config-overview-hero">
+      <div>
+        <p class="eyebrow">配置总览</p>
+        <h2>先看状态，再进入对应分区修改</h2>
+        <p class="muted">运行数量、并发和循环仍在「运行台」调整；这里仅管理全局服务、代理和池文件。</p>
       </div>
-      <p id="cfgMsg" class="msg"></p>
+      <div class="overview-health">
+        <span id="overviewReadyBadge" class="badge">正在读取</span>
+        <span id="overviewReadyText" class="muted">检查推荐注册链路…</span>
+        <button type="button" id="btnReloadCfg">刷新摘要</button>
+      </div>
+      <p id="cfgMsg" class="msg" role="status" aria-live="polite"></p>
     </section>
     <section class="panel wide">
-      <h2>配置分区</h2>
-      <p class="muted">配置中心已按功能拆开，避免单页过长。各分区共用「重载 / 保存配置」；改完记得保存。</p>
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">四个分区</p>
+          <h2>选择要修改的内容</h2>
+        </div>
+        <p class="muted">每个分区独立保存，避免无关配置互相覆盖。</p>
+      </div>
       <div class="config-cards">
         <a class="config-card" href="/config/mail">
           <strong>邮箱 / 验证码</strong>
           <span>邮箱源、Turnstile、微软邮箱池与分裂工具</span>
+          <span class="config-card-status" id="overviewMailSummary">正在读取…</span>
         </a>
         <a class="config-card" href="/config/output">
           <strong>产物 / 推送</strong>
           <span>OAuth 输出目录与 CPA 推送</span>
+          <span class="config-card-status" id="overviewOutputSummary">正在读取…</span>
         </a>
         <a class="config-card" href="/config/proxy">
           <strong>注册代理</strong>
           <span>注册出口、代理池/订阅、内嵌 mihomo</span>
+          <span class="config-card-status" id="overviewProxySummary">正在读取…</span>
         </a>
         <a class="config-card" href="/config/turnstile">
           <strong>求解代理</strong>
           <span>Turnstile 专用代理与求解代理池</span>
+          <span class="config-card-status" id="overviewTurnstileSummary">正在读取…</span>
         </a>
       </div>
     </section>
-    <section class="panel">
-      <h2>快捷说明</h2>
-      <ul class="muted tool-notes">
-        <li>运行参数仍在「运行台」调整；这里只管全局配置与池文件。</li>
-        <li>CPA 巡检台（号池浏览/探测）在主导航「CPA 巡检」；本处「CPA 推送」是把本地凭证上传到 CPA。</li>
-        <li>代理池「随机测试」按钮在注册代理 / 求解代理页顶部可用。</li>
-      </ul>
+    <section class="panel wide">
+      <details class="config-help">
+        <summary>这些入口有什么区别？</summary>
+        <ul class="muted tool-notes">
+          <li>「CPA 巡检」用于浏览和探测号池；「产物 / 推送」里的 CPA 设置负责上传本地凭证。</li>
+          <li>注册代理控制完整注册出口；求解代理只给 Turnstile 求解单独分流。</li>
+          <li>凭证列表默认脱敏，明文需主动临时显示 30 秒。</li>
+          <li>代理池「随机测试」按钮在注册代理 / 求解代理页顶部可用。</li>
+        </ul>
+      </details>
     </section>
 
   </main>
-  <script src="/static/config.js?v=config-secret-guard-3"></script>
+  <script src="/static/config.js?v=config-readability-5"></script>
 </body>
 </html>

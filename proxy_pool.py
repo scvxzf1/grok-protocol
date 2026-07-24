@@ -569,27 +569,33 @@ class ProxyRotator:
         return max(rate * 10.0, 0.1)
 
     def next(self) -> Optional[str]:
+        """Pick one healthy free proxy, or ``None`` when the pool is exhausted.
+
+        Cooled-down and actively leased entries are never returned.  Callers that
+        need failover (hybrid HTTP + embedded) rely on ``None`` to switch source
+        instead of burning another attempt on a known-bad route.
+        """
         if not self._proxies:
             return None
         with self._lock:
-            available: List[str] = []
-            first_bad: Optional[str] = None
-            for proxy in self._proxies:
-                if proxy in self._lease_token_by_proxy:
-                    continue
-                if self._is_available(proxy):
-                    available.append(proxy)
-                elif first_bad is None:
-                    first_bad = proxy
+            self._recover_expired_leases_locked()
+            available: List[str] = [
+                proxy
+                for proxy in self._proxies
+                if proxy not in self._lease_token_by_proxy and self._is_available(proxy)
+            ]
             if not available:
-                return first_bad
+                return None
             if len(available) == 1:
                 return available[0]
-            weights = [self._country_weight(self._proxy_country.get(p, "??")) for p in available]
+            weights = [
+                self._country_weight(self._proxy_country.get(proxy, "??"))
+                for proxy in available
+            ]
             return random.choices(available, weights=weights, k=1)[0]
 
     def next_batch(self, n: int) -> List[str]:
-        """Pick up to n distinct proxies (best-effort, may repeat if pool tiny)."""
+        """Pick up to n distinct healthy free proxies (no cooled/leased padding)."""
         count = max(0, int(n or 0))
         if count <= 0 or not self._proxies:
             return []
@@ -605,14 +611,25 @@ class ProxyRotator:
             picked.append(item)
             if len(picked) >= count:
                 break
+        if len(picked) >= count:
+            return picked[:count]
         with self._lock:
+            self._recover_expired_leases_locked()
             repeatable = [
                 proxy
                 for proxy in self._proxies
-                if proxy not in self._lease_token_by_proxy
+                if (
+                    proxy not in self._lease_token_by_proxy
+                    and proxy not in seen
+                    and self._is_available(proxy)
+                )
             ]
         while len(picked) < count and repeatable:
-            picked.append(random.choice(repeatable))
+            choice = random.choice(repeatable)
+            picked.append(choice)
+            # Avoid tight re-picks of the same entry when the free set is larger.
+            if len(repeatable) > 1:
+                repeatable = [proxy for proxy in repeatable if proxy != choice]
         return picked[:count]
 
     def get_status(self) -> List[Dict[str, Any]]:

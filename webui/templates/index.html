@@ -59,13 +59,13 @@
         <label id="countField">注册数量 <input type="number" name="count" min="1" max="99999999" value="1" /></label>
         <label id="targetSuccessField" style="display:none">成功目标(0=不限) <input type="number" name="target_success" min="0" max="99999999" value="0" /></label>        <label>并发数 <input type="number" name="workers" min="1" max="128" value="8" /></label>
         <label>同时过码数
-          <input type="number" name="local_turnstile_max_inflight" min="1" max="12" value="6" title="真正同时开几个浏览器过码" />
+          <input type="number" name="local_turnstile_max_inflight" min="1" max="6666" value="6" title="真正同时开几个浏览器过码" />
         </label>
         <label>过码超时(秒)
-          <input type="number" name="turnstile_solve_timeout" min="5" max="600" value="30" />
+          <input type="number" name="turnstile_solve_timeout" min="5" max="600" value="60" />
         </label>
         <label>过码重试
-          <input type="number" name="turnstile_solve_retries" min="1" max="10" value="1" />
+          <input type="number" name="turnstile_solve_retries" min="1" max="10" value="2" />
         </label>
         <label>提交并发
           <input type="number" name="submit_workers" min="1" max="128" value="8" />
@@ -75,7 +75,7 @@
         </label>
         <div class="actions" style="margin:0;grid-column:1/-1">
           <button type="button" id="btnSpeedPreset8" class="btn-secondary" title="一键套用冲 8+/分钟参数">套用 8+/分钟参数</button>
-          <span class="muted" id="speedPresetHint">建议：并发8 · 同时过码6 · 过码30s · 等邮件40s · 节点健康≥4可跑，≥8更稳</span>
+          <span class="muted" id="speedPresetHint">建议：并发8 · 同时过码6 · 过码60s · 重试2 · 等邮件40s · 节点健康≥4可跑，≥8更稳</span>
         </div>
         <div class="ms-target-row" id="msTargetRow">
           <button type="button" id="btnFillMsMailCount" class="btn-secondary" title="读取配置中心微软邮箱池有效行数，填入当前目标数量">

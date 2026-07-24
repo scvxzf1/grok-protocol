@@ -130,6 +130,53 @@ class TurnstileBrokerTests(unittest.TestCase):
         self.assertEqual(first_errors, [])
         self.assertFalse(second_started.is_set())
 
+    def test_local_solver_is_not_cancelled_by_broker_solve_wait_for(self):
+        """Local browser captures enforce their own timeout and may first wait
+        for a cross-process Chrome slot. The broker must not wrap that path in
+        wait_for(timeout_sec) or high concurrency surfaces as an empty timeout.
+        """
+
+        async def slow_local_solver(request, sleep):
+            # Exceeds timeout_sec=1 but finishes well under the outer grace.
+            await sleep(1.5)
+            return SolveResult(
+                token="t" * 100,
+                provider=request.provider,
+                received_at=time.monotonic(),
+                elapsed_ms=1500,
+            )
+
+        broker = TurnstileBroker(provider_limits={"local": 1})
+        self.addCleanup(broker.close)
+        request = SolveRequest(
+            provider="local",
+            sitekey="sitekey",
+            page_url="https://example.test",
+            timeout_sec=1,
+        )
+        started = time.monotonic()
+        result = broker.solve_sync(request, slow_local_solver)
+        elapsed = time.monotonic() - started
+        self.assertEqual(result.token, "t" * 100)
+        self.assertGreaterEqual(elapsed, 1.4)
+
+    def test_timeout_errors_include_readable_message(self):
+        async def never_finishes(request, sleep):
+            while True:
+                await sleep(0.05)
+
+        broker = TurnstileBroker(provider_limits={"capsolver": 1})
+        self.addCleanup(broker.close)
+        request = SolveRequest(
+            provider="capsolver",
+            sitekey="sitekey",
+            page_url="https://example.test",
+            timeout_sec=1,
+        )
+        with self.assertRaises(TimeoutError) as ctx:
+            broker.solve_sync(request, never_finishes)
+        self.assertTrue(str(ctx.exception).strip())
+
     def test_close_stops_loop_published_before_run_forever(self):
         broker = TurnstileBroker(provider_limits={"local": 1})
         loop = asyncio.new_event_loop()

@@ -17,6 +17,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
+from local_paths import iter_readable_files
+
 LogFn = Callable[[str], None]
 
 
@@ -277,11 +279,18 @@ def collect_local_cpa_items(
 
     items: List[Dict[str, Any]] = []
     seen_emails: set[str] = set()
-    if not directory.is_dir():
+    try:
+        if not directory.is_dir():
+            return items
+    except OSError:
         return items
 
-    json_files = [p for p in directory.iterdir() if p.is_file() and p.suffix.lower() == ".json"]
-    json_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    # Skip ghost/corrupt FS entries that still appear in readdir.
+    json_files, _skipped = iter_readable_files(
+        directory,
+        suffixes=(".json",),
+        sort_by_mtime=True,
+    )
     for path in json_files:
         if wanted is not None and path.name not in wanted and path.stem not in wanted:
             continue

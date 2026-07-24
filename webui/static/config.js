@@ -29,6 +29,63 @@ function setMsg(text, isError=false) {
   msg.style.color = isError ? "#ff6b6b" : "#f0b429";
 }
 
+
+function renderOverview(data) {
+  const f = (data && data.fields) || {};
+  const flags = (data && data.secret_flags) || {};
+  const pool = (data && data.proxy_pool) || {};
+  const tsPool = (data && data.turnstile_proxy_pool) || {};
+  const msPool = (data && data.ms_mail_pool) || {};
+  const emailLabels = { msgraph: "Outlook", yyds: "YYDS", cloudflare: "Cloudflare", duckmail: "DuckMail" };
+  const emailProvider = String(f.email_provider || "yyds");
+  const mailEl = document.getElementById("overviewMailSummary");
+  if (mailEl) {
+    const msCount = Number(msPool.line_count || 0);
+    mailEl.textContent =
+      `${emailLabels[emailProvider] || emailProvider}` +
+      ` · Turnstile ${f.turnstile_provider || "local"}` +
+      (emailProvider === "msgraph" ? ` · 微软池 ${msCount} 条` : "");
+  }
+  const outEl = document.getElementById("overviewOutputSummary");
+  if (outEl) {
+    outEl.textContent =
+      `输出目录${f.xai_oauth_output_dir ? "已配置" : "未配置"} · CPA 自动推送${f.cpa_auto_upload ? "已开启" : "未开启"}`;
+  }
+  const proxyEl = document.getElementById("overviewProxySummary");
+  if (proxyEl) {
+    const mode = String(f.egress_mode || f.proxy_mode || "auto");
+    const count = Number(pool.line_count || 0);
+    proxyEl.textContent = `出口 ${mode} · 注册池 ${count} 条`;
+  }
+  const tsEl = document.getElementById("overviewTurnstileSummary");
+  if (tsEl) {
+    const enabled = !!f.turnstile_proxy_enabled;
+    const count = Number(tsPool.line_count || 0);
+    tsEl.textContent = enabled
+      ? `专用代理已开启 · 池 ${count} 条 · 模式 ${f.turnstile_proxy_mode || "pool"}`
+      : "专用代理未开启（跟随注册出口）";
+  }
+  const badge = document.getElementById("overviewReadyBadge");
+  const readyText = document.getElementById("overviewReadyText");
+  if (badge || readyText) {
+    const hasMail = emailProvider === "msgraph"
+      ? Number(msPool.line_count || 0) > 0
+      : !!(flags.yyds_api_key || flags.cloudflare_api_key || flags.duckmail_api_key || f.yyds_api_base || f.cloudflare_api_base);
+    const hasOut = !!String(f.xai_oauth_output_dir || "").trim();
+    const ready = hasMail && hasOut;
+    if (badge) {
+      badge.textContent = ready ? "可开始配置" : "待完善";
+      badge.className = "badge" + (ready ? " run" : " busy");
+    }
+    if (readyText) {
+      readyText.textContent = ready
+        ? "邮箱源与输出目录已就绪，可进入分区微调。"
+        : "请至少配置邮箱源和产物输出目录。";
+    }
+  }
+}
+
+
 async function api(path, opts={}) {
   const r = await fetch(path, {
     headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
@@ -75,6 +132,16 @@ function fill(data) {
     f.local_turnstile_max_inflight == null ? 8 : f.local_turnstile_max_inflight
   );
   set(
+    "local_turnstile_block_assets",
+    f.local_turnstile_block_assets == null ? true : !!f.local_turnstile_block_assets,
+    true
+  );
+  set(
+    "local_turnstile_shared_cache",
+    f.local_turnstile_shared_cache == null ? true : !!f.local_turnstile_shared_cache,
+    true
+  );
+  set(
     "submit_workers",
     f.submit_workers == null ? 8 : f.submit_workers
   );
@@ -119,6 +186,16 @@ function fill(data) {
   set(
     "embedded_proxy_max_node_retries",
     f.embedded_proxy_max_node_retries == null ? 3 : f.embedded_proxy_max_node_retries
+  );
+  set(
+    "embedded_proxy_refresh_fetch_subscription",
+    f.embedded_proxy_refresh_fetch_subscription !== false,
+    true
+  );
+  set(
+    "embedded_proxy_refresh_export_healthy",
+    !!f.embedded_proxy_refresh_export_healthy,
+    true
   );
   set("local_proxy_port", f.local_proxy_port || 17890);
   set("proxy_random", !!f.proxy_random, true);
@@ -172,6 +249,7 @@ function fill(data) {
   }
   applyProxyPoolSourceUI(f.proxy_pool_source || "manual");
   updateEgressModeUI();
+  renderOverview(data || {});
 }
 
 function collectFields() {
@@ -221,7 +299,19 @@ function collectFields() {
   putSecret("turnstile_api_key");
   if (present("turnstile_headless")) put("turnstile_headless", g("turnstile_headless", true));
   if (present("local_turnstile_max_workers")) put("local_turnstile_max_workers", Number(g("local_turnstile_max_workers") || 8));
-  if (present("local_turnstile_max_inflight")) put("local_turnstile_max_inflight", Number(g("local_turnstile_max_inflight") || 8));
+  if (present("local_turnstile_max_inflight")) {
+    const inflight = Number(g("local_turnstile_max_inflight") || 8);
+    put(
+      "local_turnstile_max_inflight",
+      Number.isFinite(inflight) ? Math.max(1, Math.min(6666, Math.round(inflight))) : 8
+    );
+  }
+  if (present("local_turnstile_block_assets")) {
+    put("local_turnstile_block_assets", g("local_turnstile_block_assets", true));
+  }
+  if (present("local_turnstile_shared_cache")) {
+    put("local_turnstile_shared_cache", g("local_turnstile_shared_cache", true));
+  }
   if (present("submit_workers")) put("submit_workers", Number(g("submit_workers") || 8));
   if (present("turnstile_solve_timeout")) put("turnstile_solve_timeout", Number(g("turnstile_solve_timeout") || 90));
   if (present("turnstile_solve_retries")) put("turnstile_solve_retries", Number(g("turnstile_solve_retries") || 1));
@@ -248,6 +338,12 @@ function collectFields() {
   if (present("embedded_proxy_probe_port")) put("embedded_proxy_probe_port", Number(g("embedded_proxy_probe_port") || 443));
   if (present("embedded_proxy_probe_timeout_sec")) put("embedded_proxy_probe_timeout_sec", Number(g("embedded_proxy_probe_timeout_sec") || 5));
   if (present("embedded_proxy_max_node_retries")) put("embedded_proxy_max_node_retries", Number(g("embedded_proxy_max_node_retries") || 3));
+  if (present("embedded_proxy_refresh_fetch_subscription")) {
+    put("embedded_proxy_refresh_fetch_subscription", g("embedded_proxy_refresh_fetch_subscription", true, true));
+  }
+  if (present("embedded_proxy_refresh_export_healthy")) {
+    put("embedded_proxy_refresh_export_healthy", g("embedded_proxy_refresh_export_healthy", true, false));
+  }
   if (present("local_proxy_port")) put("local_proxy_port", Number(g("local_proxy_port") || 17890));
   if (present("proxy_random")) put("proxy_random", g("proxy_random", true));
   if (present("proxy_rotate_session")) put("proxy_rotate_session", g("proxy_rotate_session", true));
@@ -831,6 +927,100 @@ async function clearProxyPoolEditor({ save = true } = {}) {
     $("poolMeta").textContent = `代理池文件: ${data.path || "-"} | 有效行: 0 | 存在: ${data.exists ? "是" : "否"}`;
   }
   return data;
+}
+
+async function runEmbeddedNodePoolRefresh(opts) {
+  const options = opts || {};
+  const probeOnly = !!options.probeOnly;
+  const btn = options.button || null;
+  try {
+    setMsg(probeOnly ? "正在探测节点健康（不拉订阅）…" : "正在刷新检查并更新节点池…");
+    if (btn) btn.disabled = true;
+    const saved = await api("/api/config-center", {
+      method: "PUT",
+      body: JSON.stringify(buildConfigCenterPayload()),
+    });
+    fill(saved);
+    // Ensure node pool enabled for full refresh path.
+    if (!probeOnly) {
+      const emb = fieldEl("embedded_proxy_enabled");
+      if (emb && !emb.checked) {
+        emb.checked = true;
+        await api("/api/config-center", {
+          method: "PUT",
+          body: JSON.stringify(buildConfigCenterPayload()),
+        });
+      }
+    }
+    const subUrls = (fieldEl("proxy_subscription_urls") || {}).value || "";
+    const fetchEl = fieldEl("embedded_proxy_refresh_fetch_subscription");
+    const exportEl = fieldEl("embedded_proxy_refresh_export_healthy");
+    const fetchSub = probeOnly
+      ? false
+      : fetchEl
+        ? !!fetchEl.checked
+        : true;
+    const exportHealthy = probeOnly
+      ? false
+      : exportEl
+        ? !!exportEl.checked
+        : false;
+    const data = await api("/api/embedded-proxy/refresh", {
+      method: "POST",
+      body: JSON.stringify({
+        proxy_subscription_urls: subUrls,
+        timeout: 20,
+        fetch_subscription: fetchSub,
+        reload: !probeOnly,
+        probe: true,
+        export_healthy: exportHealthy,
+      }),
+    });
+    renderEmbeddedStatus(data || {});
+    if (data && data.proxy_pool) {
+      if ($("proxyPoolText")) $("proxyPoolText").value = data.proxy_pool.text || "";
+      if ($("proxyPoolTextPreview")) $("proxyPoolTextPreview").value = data.proxy_pool.text || "";
+    }
+    if (data && data.export && data.export.proxy_pool) {
+      const pool = data.export.proxy_pool;
+      if ($("proxyPoolText")) $("proxyPoolText").value = pool.text || "";
+      if ($("proxyPoolTextPreview")) $("proxyPoolTextPreview").value = pool.text || "";
+      if ($("poolMeta")) {
+        $("poolMeta").textContent = `代理池文件: ${pool.path || "-"} | 有效行: ${pool.line_count || 0} | 存在: ${pool.exists ? "是" : "否"}`;
+      }
+    }
+    try { await loadEmbeddedNodeCacheEditor(); } catch (_) { /* ignore */ }
+    setMsg(String((data && data.message) || "节点池已刷新"));
+    bumpEmbeddedStatusPoll(800);
+    return data;
+  } catch (e) {
+    setMsg(String(e.message || e), true);
+    throw e;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+const btnEmbeddedRefresh = $("btnEmbeddedRefresh");
+if (btnEmbeddedRefresh) {
+  btnEmbeddedRefresh.onclick = async () => {
+    try {
+      await runEmbeddedNodePoolRefresh({ button: btnEmbeddedRefresh, probeOnly: false });
+    } catch (_) {
+      /* message already set */
+    }
+  };
+}
+
+const btnEmbeddedRefreshProbeOnly = $("btnEmbeddedRefreshProbeOnly");
+if (btnEmbeddedRefreshProbeOnly) {
+  btnEmbeddedRefreshProbeOnly.onclick = async () => {
+    try {
+      await runEmbeddedNodePoolRefresh({ button: btnEmbeddedRefreshProbeOnly, probeOnly: true });
+    } catch (_) {
+      /* message already set */
+    }
+  };
 }
 
 const btnEmbeddedFetchSub = $("btnEmbeddedFetchSub");

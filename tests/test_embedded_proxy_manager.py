@@ -322,7 +322,7 @@ class LifecycleTests(unittest.TestCase):
 
 
 class CooldownReviveTests(unittest.TestCase):
-    def test_revive_cooled_nodes_makes_them_acquirable(self):
+    def test_revive_marks_pending_not_healthy(self):
         from embedded_proxy_manager import EmbeddedProxyManager, NodeSlot, EmbeddedProxyConfig
         import time
         mgr = EmbeddedProxyManager(EmbeddedProxyConfig())
@@ -341,12 +341,78 @@ class CooldownReviveTests(unittest.TestCase):
         mgr._running = True
         revived = mgr.revive_cooled_nodes()
         self.assertEqual(revived, 1)
-        self.assertTrue(node.healthy)
-        got = mgr.acquire()
+        self.assertFalse(node.healthy)
+        self.assertTrue(node.pending_reprobe)
+        self.assertEqual(float(node.cooldown_until or 0.0), 0.0)
+
+    def test_acquire_reprobes_before_lease(self):
+        from embedded_proxy_manager import EmbeddedProxyManager, NodeSlot, EmbeddedProxyConfig
+        import time
+        mgr = EmbeddedProxyManager(EmbeddedProxyConfig(probe_timeout_sec=1.0))
+        node = NodeSlot(
+            id="n1",
+            name="n1",
+            server="x",
+            port=443,
+            protocol="vless",
+            local_http="http://127.0.0.1:28001",
+            healthy=False,
+            fail_count=2,
+            cooldown_until=time.time() - 1,
+        )
+        mgr._nodes = {"n1": node}
+        mgr._running = True
+
+        def _fake_probe(node_id, timeout_sec=None):
+            n = mgr._nodes[node_id]
+            n.healthy = True
+            n.pending_reprobe = False
+            n.cooldown_until = 0.0
+            n.last_error = ""
+            return {"id": node_id, "healthy": True}
+
+        with mock.patch.object(mgr, "probe_one", side_effect=_fake_probe) as probe:
+            got = mgr.acquire()
         self.assertIsNotNone(got)
         self.assertEqual(got.id, "n1")
+        probe.assert_called()
+        self.assertTrue(node.healthy)
+        self.assertFalse(node.pending_reprobe)
 
-    def test_status_revives_before_counting_healthy(self):
+    def test_acquire_skips_reprobe_when_healthy_available(self):
+        from embedded_proxy_manager import EmbeddedProxyManager, NodeSlot, EmbeddedProxyConfig
+        import time
+        mgr = EmbeddedProxyManager(EmbeddedProxyConfig())
+        good = NodeSlot(
+            id="good",
+            name="good",
+            server="g",
+            port=443,
+            protocol="vless",
+            local_http="http://127.0.0.1:28000",
+            healthy=True,
+        )
+        cooled = NodeSlot(
+            id="cool",
+            name="cool",
+            server="c",
+            port=443,
+            protocol="vless",
+            local_http="http://127.0.0.1:28001",
+            healthy=False,
+            cooldown_until=time.time() - 1,
+        )
+        mgr._nodes = {"good": good, "cool": cooled}
+        mgr._running = True
+        with mock.patch.object(mgr, "probe_one") as probe:
+            got = mgr.acquire()
+        self.assertIsNotNone(got)
+        self.assertEqual(got.id, "good")
+        probe.assert_not_called()
+        self.assertTrue(cooled.pending_reprobe)
+        self.assertFalse(cooled.healthy)
+
+    def test_status_marks_pending_not_healthy(self):
         from embedded_proxy_manager import EmbeddedProxyManager, NodeSlot, EmbeddedProxyConfig
         import time
         mgr = EmbeddedProxyManager(EmbeddedProxyConfig())
@@ -359,4 +425,80 @@ class CooldownReviveTests(unittest.TestCase):
         }
         mgr._running = True
         st = mgr.status()
-        self.assertEqual(st["healthy"], 1)
+        self.assertEqual(st["healthy"], 0)
+        self.assertEqual(st["pending_reprobe"], 1)
+        self.assertTrue(mgr._nodes["n1"].pending_reprobe)
+
+    def test_probe_failure_uses_progressive_tls_cooldown(self):
+        from embedded_proxy_manager import EmbeddedProxyManager, NodeSlot, EmbeddedProxyConfig
+        mgr = EmbeddedProxyManager(
+            EmbeddedProxyConfig(
+                fail_cooldown_sec=30.0,
+                tls_fail_cooldown_sec=60.0,
+                probe_timeout_sec=0.5,
+            )
+        )
+        slot = NodeSlot(
+            id="n0",
+            name="node-0",
+            server="0.example",
+            port=443,
+            protocol="vless",
+            local_http="http://127.0.0.1:28000",
+            healthy=True,
+        )
+        mgr._nodes = {slot.id: slot}
+        mgr._running = True
+
+        with mock.patch("embedded_proxy_manager.urllib.request.build_opener") as build_opener:
+            opener = mock.Mock()
+            opener.open.side_effect = OSError("curl: (35) TLS connect error")
+            build_opener.return_value = opener
+            r1 = mgr.probe_one("n0")
+            self.assertFalse(r1.get("healthy"))
+            self.assertEqual(slot.consecutive_tls_fails, 1)
+            self.assertFalse(slot.healthy)
+            cd1 = slot.cooldown_until - time.time()
+            self.assertGreaterEqual(cd1, 55.0)
+
+            # Force immediate re-probe of same node for second TLS fail.
+            slot.cooldown_until = 0.0
+            slot.pending_reprobe = False
+            r2 = mgr.probe_one("n0")
+            self.assertFalse(r2.get("healthy"))
+            self.assertEqual(slot.consecutive_tls_fails, 2)
+            # 2nd TLS fail should be ~120s (2x base 60).
+            cd2 = slot.cooldown_until - time.time()
+            self.assertGreater(cd2, 100.0)
+
+    def test_probe_non_tls_failure_progressive_base_cooldown(self):
+        from embedded_proxy_manager import EmbeddedProxyManager, NodeSlot, EmbeddedProxyConfig
+        mgr = EmbeddedProxyManager(
+            EmbeddedProxyConfig(fail_cooldown_sec=30.0, probe_timeout_sec=0.5)
+        )
+        slot = NodeSlot(
+            id="n0",
+            name="node-0",
+            server="0.example",
+            port=443,
+            protocol="vless",
+            local_http="http://127.0.0.1:28000",
+            healthy=True,
+        )
+        mgr._nodes = {slot.id: slot}
+        mgr._running = True
+
+        with mock.patch("embedded_proxy_manager.urllib.request.build_opener") as build_opener:
+            opener = mock.Mock()
+            opener.open.side_effect = OSError("Connection refused")
+            build_opener.return_value = opener
+            mgr.probe_one("n0")
+            self.assertEqual(slot.fail_count, 1)
+            self.assertEqual(slot.consecutive_tls_fails, 0)
+            self.assertGreaterEqual(slot.cooldown_until - time.time(), 25.0)
+
+            slot.cooldown_until = 0.0
+            mgr.probe_one("n0")
+            self.assertEqual(slot.fail_count, 2)
+            # 2nd non-TLS: base * 2 = 60
+            self.assertGreaterEqual(slot.cooldown_until - time.time(), 55.0)

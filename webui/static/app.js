@@ -122,10 +122,10 @@ function formData() {
     target_success: Number(fd.get("target_success") || 0),
     count: Number(fd.get("count") || 1),
     workers: Number(fd.get("workers") || 1),
-    local_turnstile_max_inflight: Number(fd.get("local_turnstile_max_inflight") || 8),
-    local_turnstile_max_workers: Number(fd.get("local_turnstile_max_inflight") || fd.get("local_turnstile_max_workers") || 8),
-    turnstile_solve_timeout: Number(fd.get("turnstile_solve_timeout") || 35),
-    turnstile_solve_retries: Number(fd.get("turnstile_solve_retries") || 1),
+    local_turnstile_max_inflight: Math.max(1, Math.min(6666, Number(fd.get("local_turnstile_max_inflight") || 8))),
+    local_turnstile_max_workers: Math.max(1, Math.min(6666, Number(fd.get("local_turnstile_max_inflight") || fd.get("local_turnstile_max_workers") || 8))),
+    turnstile_solve_timeout: Number(fd.get("turnstile_solve_timeout") || 60),
+    turnstile_solve_retries: Number(fd.get("turnstile_solve_retries") || 2),
     submit_workers: Number(fd.get("submit_workers") || 8),
     mail_code_timeout_sec: Number(fd.get("mail_code_timeout_sec") || 40),
     egress_mode: fd.get("egress_mode") || "auto",
@@ -156,11 +156,11 @@ function fillForm(data) {
   }
   if (form.turnstile_solve_timeout) {
     form.turnstile_solve_timeout.value =
-      data.turnstile_solve_timeout != null ? data.turnstile_solve_timeout : 30;
+      data.turnstile_solve_timeout != null ? data.turnstile_solve_timeout : 60;
   }
   if (form.turnstile_solve_retries) {
     form.turnstile_solve_retries.value =
-      data.turnstile_solve_retries != null ? data.turnstile_solve_retries : 1;
+      data.turnstile_solve_retries != null ? data.turnstile_solve_retries : 2;
   }
   if (form.submit_workers) {
     form.submit_workers.value = data.submit_workers != null ? data.submit_workers : 8;
@@ -612,8 +612,8 @@ if ($("btnSpeedPreset8")) {
   $("btnSpeedPreset8").onclick = () => {
     if (form.workers) form.workers.value = 8;
     if (form.local_turnstile_max_inflight) form.local_turnstile_max_inflight.value = 6;
-    if (form.turnstile_solve_timeout) form.turnstile_solve_timeout.value = 30;
-    if (form.turnstile_solve_retries) form.turnstile_solve_retries.value = 1;
+    if (form.turnstile_solve_timeout) form.turnstile_solve_timeout.value = 60;
+    if (form.turnstile_solve_retries) form.turnstile_solve_retries.value = 2;
     if (form.submit_workers) form.submit_workers.value = 8;
     if (form.mail_code_timeout_sec) form.mail_code_timeout_sec.value = 40;
     if (form.turnstile_provider) form.turnstile_provider.value = "local";
@@ -626,7 +626,7 @@ if ($("btnSpeedPreset8")) {
     if (form.target_success) form.target_success.value = 0;
     syncTargetModeFields();
     const hint = $("speedPresetHint");
-    if (hint) hint.textContent = "已套用：并发8 · 同时过码6 · 过码30s · 等邮件40s · 提交8 · 只用节点池。记得保存/开始";
+    if (hint) hint.textContent = "已套用：并发8 · 同时过码6 · 过码60s · 重试2 · 等邮件40s · 提交8 · 只用节点池。记得保存/开始";
     setMsg("已套用 8+/分钟参数（请保存运行参数，并确保节点健康数≥8）");
   };
 }

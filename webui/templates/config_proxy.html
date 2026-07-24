@@ -8,9 +8,9 @@
   <link rel="icon" href="/static/favicon.ico" sizes="any" />
   <link rel="icon" href="/static/favicon-32.png" type="image/png" sizes="32x32" />
   <link rel="apple-touch-icon" href="/static/apple-touch-icon.png" sizes="180x180" />
-  <link rel="stylesheet" href="/static/app.css?v=egress6-1" />
+  <link rel="stylesheet" href="/static/app.css?v=config-readability-5" />
 </head>
-<body>
+<body class="config-page">
   <header class="top">
     <div class="top-main">
       <div>
@@ -147,7 +147,29 @@
 
         <section class="panel proxy-col" id="nodePoolPanel">
           <h2>节点池</h2>
-          <p class="muted" id="nodePoolHint">三步：填订阅 → 拉节点 / 手改缓存 → 启动。订阅和节点都能改、都能一键清空。</p>
+          <p class="muted" id="nodePoolHint">可一键刷新：拉订阅 → 重载 mihomo → 探测健康（可选导出健康节点到 HTTP 池）。也可分步操作。</p>
+
+          <div class="node-step">
+            <div class="node-step-head">
+              <strong>0. 一键刷新节点池</strong>
+              <span class="muted">检查节点状态并更新缓存/运行池</span>
+            </div>
+            <div class="actions">
+              <button type="button" id="btnEmbeddedRefresh" class="primary">刷新检查并更新节点池</button>
+              <button type="button" id="btnEmbeddedRefreshProbeOnly">仅探测（不拉订阅）</button>
+            </div>
+            <div class="actions" style="flex-wrap:wrap;gap:12px">
+              <label class="check">
+                <input type="checkbox" name="embedded_proxy_refresh_fetch_subscription" id="embeddedRefreshFetch" checked />
+                <span class="field-title">刷新时重新拉订阅</span>
+              </label>
+              <label class="check">
+                <input type="checkbox" name="embedded_proxy_refresh_export_healthy" id="embeddedRefreshExport" />
+                <span class="field-title">刷新后导出健康节点到 HTTP 池</span>
+              </label>
+            </div>
+            <p class="muted" id="embeddedRefreshHint">默认：拉订阅 + 重载 + 探测。批次运行中会拒绝重载，可先停任务。</p>
+          </div>
 
           <div class="node-step">
             <div class="node-step-head">
@@ -279,6 +301,6 @@
       </section>
     </form>
   </main>
-  <script src="/static/config.js?v=egress6-1"></script>
+  <script src="/static/config.js?v=config-node-refresh-1"></script>
 </body>
 </html>

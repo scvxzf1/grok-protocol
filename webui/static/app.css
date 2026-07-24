@@ -66,6 +66,16 @@ input, select, button, textarea {
 }
 button { cursor: pointer; }
 button.primary { background: #1d4f91; border-color: #2f6fbd; }
+button.danger {
+  background: #4a1f24;
+  border-color: #8f3d48;
+  color: #ffd8dc;
+}
+button:disabled {
+  cursor: not-allowed;
+  opacity: .5;
+  filter: none;
+}
 button:hover { filter: brightness(1.08); }
 .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
 .msg { min-height: 1.2em; color: var(--warn); }
@@ -86,7 +96,20 @@ button:hover { filter: brightness(1.08); }
 }
 .log { height: 280px; overflow: auto; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
 .box.small { max-height: 220px; overflow: auto; }
-.hist-item { display:flex; justify-content:space-between; gap:8px; padding:6px 0; border-bottom:1px solid var(--line); cursor:pointer; }
+.hist-item {
+  display: flex;
+  justify-content: space-between;
+  width: 100%;
+  gap: 8px;
+  padding: 6px 0;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  border-radius: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
 .hist-item:hover { color: var(--accent); }
 @media (max-width: 960px) {
   .grid { grid-template-columns: 1fr; }
@@ -288,6 +311,43 @@ label.check .field-title {
   min-height: 60vh;
   max-height: none;
   height: calc(100vh - 260px);
+}
+
+.security-note {
+  margin: 0;
+  padding: 9px 11px;
+  border: 1px solid #24553a;
+  border-radius: 8px;
+  background: #13271e;
+  color: var(--good);
+  font-size: 12px;
+}
+.credential-summary-table td:first-child {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.secret-preview {
+  padding: 12px;
+  border: 1px solid #8f6b24;
+  border-radius: 8px;
+  background: #241e12;
+}
+.secret-preview[hidden] { display: none !important; }
+.secret-preview-text {
+  width: 100%;
+  min-height: 240px;
+  max-height: 45vh;
+  margin-top: 8px;
+}
+.sr-only {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  padding: 0 !important;
+  margin: -1px !important;
+  overflow: hidden !important;
+  clip: rect(0, 0, 0, 0) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
 }
 
 
@@ -578,7 +638,292 @@ code { color: #9ec1ff; }
 .proxy-col { display: flex; flex-direction: column; gap: 12px; }
 .cfg-form { display: block; }
 
+/* Config readability pass: clearer hierarchy, fewer competing controls. */
+.config-page {
+  --config-surface: #121821;
+  --config-surface-soft: #141b24;
+}
+.config-page .top {
+  padding: 18px 22px 12px;
+}
+.config-page .top-main {
+  width: min(1420px, 100%);
+  margin: 0 auto;
+  display: grid;
+  grid-template-columns: minmax(220px, .7fr) minmax(420px, 1.3fr);
+  align-items: center;
+  gap: 10px 24px;
+}
+.config-page .top-main > div:first-child { min-width: 0; }
+.config-page h1 { font-size: 22px; letter-spacing: -.01em; }
+.config-page h2 { font-size: 18px; letter-spacing: -.01em; }
+.config-page h3 { font-size: 15px; color: var(--text); }
+.config-page .top-main > .nav:not(.subnav) { justify-content: flex-end; }
+.config-page .subnav {
+  grid-column: 1 / -1;
+  margin: 2px 0 0;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.config-page .subnav::-webkit-scrollbar { display: none; }
+.config-page .subnav a {
+  flex: 0 0 auto;
+  padding: 7px 2px 8px;
+  margin-right: 18px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  background: transparent;
+}
+.config-page .subnav a.active,
+.config-page .subnav a:hover {
+  border-bottom-color: var(--accent);
+  background: transparent;
+  color: var(--text);
+}
+.config-page > .grid {
+  width: min(1420px, 100%);
+  margin: 0 auto;
+  padding: 18px 22px 32px;
+  gap: 16px;
+}
+.config-page > .grid > .cfg-form { grid-column: 1 / -1; }
+.config-page .panel {
+  padding: 18px;
+  border-radius: 10px;
+}
+.config-page .form {
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 14px 16px;
+}
+.config-page [hidden] { display: none !important; }
+.config-page label {
+  gap: 6px;
+  font-size: 13px;
+}
+.config-page input,
+.config-page select,
+.config-page textarea {
+  min-height: 40px;
+}
+.config-page label.check { margin-top: 20px; }
+.config-page .field-title { color: #b4bfca; }
+.config-page .flag,
+.config-page .field-footnote {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.config-page .field-footnote { margin: 8px 0 0; }
+.provider-summary {
+  margin: -2px 0 2px;
+  padding: 8px 10px;
+  border-radius: 7px;
+  background: #101720;
+  color: #a9b8c7;
+  font-size: 12px;
+}
+.config-page .eyebrow {
+  margin: 0 0 4px;
+  color: #7faee8;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+.config-page .section-heading {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 20px;
+  margin-bottom: 16px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--line);
+}
+.config-page .section-heading h2,
+.config-page .section-heading p { margin-bottom: 0; }
+.config-page .section-heading > .muted {
+  max-width: 560px;
+  text-align: right;
+}
+.config-toolbar {
+  position: sticky;
+  top: 10px;
+  z-index: 35;
+  box-shadow: 0 10px 28px rgba(0,0,0,.2);
+}
+.config-toolbar-main {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 18px;
+}
+.config-toolbar-main h2 { margin: 0; }
+.config-toolbar .actions {
+  justify-content: flex-end;
+  margin: 0;
+}
+.config-toolbar-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 26px;
+  margin-top: 8px;
+}
+.config-toolbar-status .msg {
+  min-height: 0;
+  margin: 0;
+  font-size: 12px;
+}
+.config-state {
+  flex: 0 0 auto;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: #243041;
+  color: var(--muted);
+  font-size: 11px;
+}
+.config-state.saved { background: #173528; color: var(--good); }
+.config-state.dirty { background: #3a2a12; color: var(--warn); }
+.config-state.error { background: #3a1717; color: var(--bad); }
+.config-state.loading { color: #9ec1ff; }
+.config-security,
+.config-help,
+.config-diagnostics {
+  margin-top: 8px;
+  border-top: 1px solid var(--line);
+}
+.config-security summary,
+.config-help summary,
+.config-diagnostics summary {
+  padding: 9px 0 2px;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+  user-select: none;
+}
+.config-security[open] summary,
+.config-help[open] summary,
+.config-diagnostics[open] summary { color: var(--text); }
+.config-diagnostics {
+  margin-top: 12px;
+}
+.config-diagnostics .log {
+  height: auto;
+  min-height: 120px;
+  max-height: 260px;
+  margin-top: 10px;
+}
+.form-section-heading {
+  grid-column: 1 / -1;
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 16px;
+  margin-top: 8px;
+  padding: 14px 0 8px;
+  border-top: 1px solid var(--line);
+}
+.form-section-heading:first-child { margin-top: 0; border-top: 0; padding-top: 0; }
+.form-section-heading > div {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.form-section-heading > span:last-child {
+  color: var(--muted);
+  font-size: 12px;
+  text-align: right;
+}
+.section-index {
+  color: #6f8193;
+  font: 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.form-wide { grid-column: 1 / -1; }
+.config-callout {
+  padding: 10px 12px;
+  border: 1px solid #2c4664;
+  border-radius: 8px;
+  background: #132133;
+  color: #b8cce4;
+}
+.config-page textarea.pool { min-height: 210px; }
+.config-page .proxy-sub {
+  padding: 16px;
+  background: var(--config-surface);
+}
+.config-page .proxy-sub > h3 { font-size: 16px; }
+.config-page .btn-quiet {
+  background: transparent;
+  color: var(--muted);
+}
+.config-page .btn-quiet:hover { color: var(--text); border-color: #506176; }
+.config-overview-hero {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px 24px;
+}
+.config-overview-hero h2 { margin-bottom: 6px; }
+.config-overview-hero .msg { grid-column: 1 / -1; margin: 0; min-height: 0; }
+.overview-health {
+  display: grid;
+  justify-items: end;
+  gap: 7px;
+}
+.overview-health .muted { max-width: 420px; text-align: right; font-size: 12px; }
+.config-page .config-cards { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.config-page .config-card {
+  min-height: 154px;
+  padding: 18px;
+  justify-content: flex-start;
+  border-radius: 8px;
+}
+.config-page .config-card strong { font-size: 16px; }
+.config-card-status {
+  margin-top: auto;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+  color: #a9c6e8 !important;
+  font-variant-numeric: tabular-nums;
+}
 
+@media (max-width: 1120px) {
+  .config-page .top-main { grid-template-columns: 1fr; }
+  .config-page .top-main > .nav:not(.subnav) { justify-content: flex-start; }
+  .config-page .config-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .config-toolbar-main { align-items: flex-start; }
+}
+@media (max-width: 720px) {
+  .config-page .top { padding: 14px 14px 10px; }
+  .config-page > .grid { padding: 12px 12px 88px; }
+  .config-page .panel { padding: 14px; }
+  .config-page .form { grid-template-columns: 1fr; }
+  .config-page .nav:not(.subnav) { gap: 6px; }
+  .config-page .nav:not(.subnav) a { padding: 6px 9px; font-size: 12px; }
+  .config-toolbar { position: static; box-shadow: none; }
+  .config-toolbar-main { display: block; }
+  .config-toolbar .actions { justify-content: flex-start; margin-top: 12px; }
+  .config-toolbar .actions button { flex: 1 1 calc(50% - 6px); }
+  .config-toolbar .actions .primary { order: -1; flex-basis: 100%; }
+  .config-toolbar-status { align-items: flex-start; }
+  .config-page .section-heading,
+  .form-section-heading { display: block; }
+  .config-page .section-heading > .muted,
+  .form-section-heading > span:last-child { margin-top: 6px; text-align: left; }
+  .config-overview-hero { grid-template-columns: 1fr; }
+  .overview-health { justify-items: start; }
+  .overview-health .muted { text-align: left; }
+  .config-page .config-cards { grid-template-columns: 1fr; }
+  .config-page .config-card { min-height: 130px; }
+  .tool-opts { grid-template-columns: 1fr; }
+}
+
+
+/* ---- grok-only: proxy egress / simple mode (kept from local) ---- */
 /* ---- proxy egress presets (simple mode) ---- */
 .egress-presets {
   display: grid;

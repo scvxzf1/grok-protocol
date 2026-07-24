@@ -8,9 +8,9 @@
   <link rel="icon" href="/static/favicon.ico" sizes="any" />
   <link rel="icon" href="/static/favicon-32.png" type="image/png" sizes="32x32" />
   <link rel="apple-touch-icon" href="/static/apple-touch-icon.png" sizes="180x180" />
-  <link rel="stylesheet" href="/static/app.css?v=speed8-1" />
+  <link rel="stylesheet" href="/static/app.css?v=config-readability-5" />
 </head>
-<body>
+<body class="config-page">
   <header class="top">
     <div class="top-main">
       <div>
@@ -132,7 +132,21 @@
             本地同时过码数 inflight
             <button type="button" class="help-tip" aria-label="说明" data-tip="真正限制同时开几个 Chrome 过码。想冲 8+/分钟建议 6~8；过高会互相抢资源">?</button>
           </span>
-          <input name="local_turnstile_max_inflight" type="number" min="1" max="12" value="8" />
+          <input name="local_turnstile_max_inflight" type="number" min="1" max="6666" value="8" />
+        </label>
+        <label class="check">
+          <span class="field-title">
+            拦截图片/字体/媒体
+            <button type="button" class="help-tip" aria-label="说明" data-tip="local 过码时用 CDP 拦截图片字体媒体和统计脚本，显著省代理流量；默认开。若过码成功率明显下降可关掉">?</button>
+          </span>
+          <input name="local_turnstile_block_assets" type="checkbox" checked />
+        </label>
+        <label class="check">
+          <span class="field-title">
+            共享 Chrome 磁盘缓存
+            <button type="button" class="help-tip" aria-label="说明" data-tip="临时 profile 共用 disk-cache-dir，重复打开注册页时命中本地缓存；默认开">?</button>
+          </span>
+          <input name="local_turnstile_shared_cache" type="checkbox" checked />
         </label>
         <label>
           <span class="field-title">
@@ -243,6 +257,6 @@
             </div>
           </div>
   </main>
-  <script src="/static/config.js?v=speed8-1"></script>
+  <script src="/static/config.js?v=config-readability-5"></script>
 </body>
 </html>

@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -354,6 +354,8 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
             get_service().update_settings_from_mapping(payload, persist=True)
         except TuiConfigError as exc:
             raise _err(exc, 400) from exc
+        except ValueError as exc:
+            raise _err(TuiConfigError(str(exc)), 400) from exc
         return get_service().public_settings()
 
     @app.post("/api/settings/reload")
@@ -374,6 +376,8 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
             return get_service().update_config_center(payload or {})
         except TuiConfigError as exc:
             raise _err(exc, 400) from exc
+        except ValueError as exc:
+            raise _err(TuiConfigError(str(exc)), 400) from exc
 
     @app.post("/api/cpa-push/test")
     def cpa_push_test(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -393,20 +397,29 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
 
     @app.get("/api/credentials")
     def credentials_list(
+        response: Response,
         page: int = Query(1, ge=1),
         page_size: int = Query(1000, ge=1, le=1000),
+        reveal: bool = Query(True),
     ) -> Dict[str, Any]:
-        """Plaintext credential browser for config-center right panel."""
+        """Plaintext credential browser; one page up to 1000 json____sso lines."""
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        response.headers["Pragma"] = "no-cache"
         try:
-            return get_service().list_credentials(page=page, page_size=page_size)
+            return get_service().list_credentials(page=page, page_size=page_size, reveal=reveal)
         except TuiConfigError as exc:
             raise _err(exc, 400) from exc
         except Exception as exc:
             raise _err(exc, 400) from exc
 
     @app.post("/api/credentials/export-page")
-    def credentials_export_page(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def credentials_export_page(
+        response: Response,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """Export current credentials page to grok+timestamp.txt, then delete local pairs."""
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        response.headers["Pragma"] = "no-cache"
         data = dict(payload or {})
         page = int(data.get("page") or 1)
         page_size = int(data.get("page_size") or 1000)
@@ -431,15 +444,19 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
 
     @app.get("/api/credential-exports/preview")
     def credential_exports_preview(
+        response: Response,
         name: str = Query(..., min_length=1),
         # 默认直接返回完整原文（每页最多 1000 条 json____sso，通常 < 2MB）
         max_chars: int = Query(2000000, ge=1000, le=5000000),
+        reveal: bool = Query(True),
     ) -> Dict[str, Any]:
         """Return export txt content for in-page historical viewing.
 
         一行一条原始 ``{oauth json}____{sso}``，不做格式化/脱敏。
         超过 max_chars 时截断并标记 truncated=true。
         """
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        response.headers["Pragma"] = "no-cache"
         try:
             path = get_service().resolve_export_file(name)
         except TuiConfigError as exc:
@@ -469,7 +486,10 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
         }
 
     @app.get("/api/credential-exports/download")
-    def credential_exports_download(name: str = Query(..., min_length=1)) -> FileResponse:
+    def credential_exports_download(
+        name: str = Query(..., min_length=1),
+        reveal: bool = Query(True),
+    ) -> FileResponse:
         try:
             path = get_service().resolve_export_file(name)
         except TuiConfigError as exc:
@@ -482,6 +502,10 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
             path=str(path),
             filename=path.name,
             media_type="text/plain; charset=utf-8",
+            headers={
+                "Cache-Control": "no-store, max-age=0",
+                "Pragma": "no-cache",
+            },
         )
 
     @app.delete("/api/credential-exports")
@@ -707,6 +731,38 @@ def create_app(service: Optional[BatchService] = None) -> FastAPI:
         except BatchBusyError as exc:
             raise _err(exc, 409) from exc
         except TuiConfigError as exc:
+            raise _err(exc, 400) from exc
+
+    @app.post("/api/embedded-proxy/refresh")
+    def embedded_proxy_refresh(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """One-shot: fetch subscription → reload → probe → optional export healthy to HTTP pool."""
+        data = dict(payload or {})
+        url = str(data.get("url") or data.get("proxy_subscription_url") or "").strip()
+        urls = data.get("urls")
+        if urls is None:
+            urls = data.get("proxy_subscription_urls")
+        timeout = float(data.get("timeout") or 20)
+
+        def _opt_bool(key: str):
+            if key not in data:
+                return None
+            return bool(data.get(key))
+
+        try:
+            return get_service().refresh_embedded_node_pool(
+                fetch_subscription=_opt_bool("fetch_subscription"),
+                reload=True if "reload" not in data else bool(data.get("reload")),
+                probe=True if "probe" not in data else bool(data.get("probe")),
+                export_healthy=_opt_bool("export_healthy"),
+                url=url,
+                urls=urls,
+                timeout=timeout,
+            )
+        except BatchBusyError as exc:
+            raise _err(exc, 409) from exc
+        except TuiConfigError as exc:
+            raise _err(exc, 400) from exc
+        except Exception as exc:
             raise _err(exc, 400) from exc
 
     @app.get("/api/embedded-proxy/node-cache")
