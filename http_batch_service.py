@@ -1478,7 +1478,7 @@ def build_plan(settings: Settings) -> RunPlan:
     if workers > 1 and (is_graph or has_mail_file):
         # Claim is cross-process flock-safe; parallel workers each get a distinct line.
         warnings.append(
-            "Outlook/Graph 邮箱池已支持多并发领取（文件锁）；"
+            "Outlook Graph/IMAP OAuth 邮箱池已支持多并发领取（文件锁）；"
             "请保证池内可用账号数 ≥ 并发，否则后启动的任务会因池空失败。"
         )
     if workers > 1 and (
@@ -3708,23 +3708,34 @@ class BatchRunner:
                     continue
                 blob = self._worker_proxy_failure_blob(worker, reason)
                 category = classify_failure_text(blob)
+                proxy_failed = _looks_like_proxy_failure(blob)
                 if self._uses_independent_turnstile_route_for_failure(worker, blob):
                     self._release_manual_proxy(
                         worker,
                         success=None,
                         reason="independent_turnstile_failure",
                     )
-                else:
+                elif proxy_failed:
                     self._report_manual_proxy_outcome(
                         worker,
                         success=False,
+                        reason=category if category != "unknown" else reason,
+                    )
+                else:
+                    # A mailbox, validation, or other business-flow failure says
+                    # nothing about the selected HTTP route. Release the lease
+                    # neutrally so valid pool capacity is not cooled by an
+                    # unrelated child-process exit.
+                    self._release_manual_proxy(
+                        worker,
+                        success=None,
                         reason=category if category != "unknown" else reason,
                     )
                 self._mark_terminal(worker, "failed")
                 # Attribute proxy/TLS failure to the node only when it looks like egress/TLS.
                 self._release_embedded_proxy(
                     worker,
-                    failed=_looks_like_proxy_failure(blob),
+                    failed=proxy_failed,
                     reason=blob,
                 )
                 self._record_failure(worker, worker.last_log)
@@ -4056,7 +4067,7 @@ def _proxy_file_path(settings: Settings) -> Path:
 
 
 def _ms_mail_file_path(settings: Settings) -> Path:
-    """Resolve Outlook/Hotmail Graph pool file path from config.ms_mail_file."""
+    """Resolve Outlook/Hotmail OAuth pool file path from config.ms_mail_file."""
     raw = str((settings.config or {}).get("ms_mail_file") or "").strip()
     if not raw:
         # Sensible default next to config; user can change path in UI.

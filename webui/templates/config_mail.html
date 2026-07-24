@@ -199,13 +199,13 @@
         <label>
           <span class="field-title">
             MS 邮箱文件
-            <button type="button" class="help-tip" aria-label="说明" data-tip="Outlook 四段账号文件路径（msgraph 用）。下方可直接编辑池内容并保存。">?</button>
+            <button type="button" class="help-tip" aria-label="说明" data-tip="Outlook 四段 OAuth 账号文件路径；自动匹配 Graph 或 Thunderbird IMAP。下方可直接编辑池内容并保存。">?</button>
           </span>
           <input name="ms_mail_file" type="text" placeholder="fixtures/outlook_mail.txt" />
         </label>
         <div class="ms-mail-block" id="msMailBlock">
           <div class="ms-mail-head">
-            <h3>微软邮箱池（Graph）</h3>
+            <h3>微软邮箱池（OAuth）</h3>
             <div class="ms-mail-actions">
               <button type="button" id="btnOpenMsAlias" class="btn-secondary">分裂 / 回填工具</button>
               <button type="button" id="btnSaveMsMailPool">仅保存邮箱池</button>

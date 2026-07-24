@@ -1970,6 +1970,36 @@ class StaticHttpProxyLeaseTests(unittest.TestCase):
             self.assertEqual(runner._manual_proxy_rotator.active_lease_count(), 0)
             self.assertEqual(runner._manual_proxy_rotator.available_lease_count(), 0)
 
+    def test_mailbox_failure_does_not_cool_registration_route(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            runner, _source, _entries = self._runner(root, proxy_count=1, count=1)
+            worker = svc.WorkerState(index=1)
+            worker.log_path = runner.run_dir / "worker.log"
+            worker.log_path.write_text(
+                "Microsoft Graph token exchange failed: invalid_grant\n",
+                encoding="utf-8",
+            )
+            self.assertTrue(runner._acquire_manual_proxy(worker))
+            worker.status = "running"
+            worker.process = mock.Mock()
+            worker.process.poll.return_value = 1
+            runner.workers = [worker]
+            runner.worker_by_index = {1: worker}
+            runner.started_tasks = 1
+            rotator = runner._manual_proxy_rotator
+            with mock.patch.object(
+                rotator,
+                "release_lease",
+                wraps=rotator.release_lease,
+            ) as release:
+                runner._check_processes()
+            self.assertEqual(worker.status, "failed")
+            self.assertEqual(runner.failed, 1)
+            self.assertEqual(rotator.active_lease_count(), 0)
+            self.assertEqual(rotator.available_lease_count(), 1)
+            self.assertIsNone(release.call_args.kwargs["success"])
+
     def test_permanently_bad_static_route_exhausts_logical_retry_budget(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)

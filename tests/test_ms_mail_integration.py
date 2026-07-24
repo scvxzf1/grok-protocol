@@ -23,6 +23,117 @@ def mail_line(email="mailbox@example.test", token="M.Crefresh"):
     return f"{email}----MAIL_PASSWORD----{CLIENT_ID}----{token}"
 
 
+class MicrosoftOAuthBackendTests(unittest.TestCase):
+    class _Response:
+        status_code = 200
+        text = ""
+
+        def __init__(self, data):
+            self._data = dict(data)
+
+        def json(self):
+            return dict(self._data)
+
+    def _mailbox(self, root: Path, line: str = ""):
+        pool = root / "pool.txt"
+        pool.write_text((line or mail_line()) + "\n", encoding="utf-8")
+        return flow.MicrosoftGraphMailbox(str(pool), timeout=5)
+
+    def test_thunderbird_token_uses_imap_profile_and_persists_rotation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            mailbox = self._mailbox(Path(directory))
+            account = flow.parse_ms_mail_line(mail_line(token="M.COLD"))
+            response = self._Response(
+                {
+                    "access_token": "IMAP_ACCESS",
+                    "refresh_token": "M.CROTATED",
+                    "expires_in": 3600,
+                }
+            )
+            with mock.patch.object(mailbox, "_request", return_value=response) as request:
+                with mock.patch.object(mailbox, "_update_account_record") as persist:
+                    access = mailbox._refresh_access_token(account)
+
+            self.assertEqual(access, "IMAP_ACCESS")
+            self.assertEqual(mailbox.mail_backend, "imap")
+            self.assertEqual(account["refresh_token"], "M.CROTATED")
+            persist.assert_called_once_with(account)
+            args, kwargs = request.call_args
+            self.assertEqual(args[:2], ("post", flow.MS_IMAP_TOKEN_URL))
+            self.assertEqual(kwargs["data"]["scope"], flow.MS_IMAP_SCOPE)
+            self.assertEqual(kwargs["data"]["client_id"], CLIENT_ID)
+
+    def test_other_public_client_keeps_graph_profile(self):
+        account = {
+            "client_id": "11111111-2222-4333-8444-555555555555",
+        }
+        self.assertEqual(
+            flow.MicrosoftGraphMailbox._oauth_profile(account),
+            ("graph", flow.MS_GRAPH_TOKEN_URL, flow.MS_GRAPH_SCOPE),
+        )
+
+    def test_imap_xoauth_poll_extracts_xai_code_without_marking_mail_read(self):
+        raw_message = (
+            "From: xAI <accounts@x.ai>\r\n"
+            "To: mailbox@example.test\r\n"
+            "Date: Sun, 19 Jul 2026 02:00:00 +0000\r\n"
+            "Subject: xAI confirmation MWM-AME\r\n"
+            "Content-Type: text/plain; charset=utf-8\r\n"
+            "\r\n"
+            "Use MWM-AME to validate your email.\r\n"
+        ).encode("utf-8")
+
+        class FakeIMAP:
+            def __init__(self):
+                self.auth_payload = b""
+                self.fetch_query = ""
+                self.logged_out = False
+
+            def authenticate(self, mechanism, callback):
+                self.mechanism = mechanism
+                self.auth_payload = callback(b"")
+                return "OK", [b"authenticated"]
+
+            def select(self, mailbox, readonly=False):
+                self.selected = (mailbox, readonly)
+                return "OK", [b"1"]
+
+            def uid(self, command, *args):
+                if command == "search":
+                    return "OK", [b"42"]
+                if command == "fetch":
+                    self.fetch_query = str(args[-1])
+                    return "OK", [(b"42 (BODY[])", raw_message), b")"]
+                raise AssertionError(command)
+
+            def logout(self):
+                self.logged_out = True
+                return "BYE", [b"logout"]
+
+        with tempfile.TemporaryDirectory() as directory:
+            mailbox = self._mailbox(Path(directory))
+            mailbox.account = flow.parse_ms_mail_line(mail_line())
+            mailbox.mail_backend = "imap"
+            mailbox.access_token = "IMAP_ACCESS"
+            mailbox.access_expires_at = flow.time.monotonic() + 3600
+            fake = FakeIMAP()
+            with mock.patch.object(flow.imaplib, "IMAP4_SSL", return_value=fake) as connect:
+                code = mailbox.wait_for_xai_code(
+                    "mailbox@example.test",
+                    "IMAP_ACCESS",
+                    timeout=5,
+                    poll_interval=1,
+                )
+
+            self.assertEqual(code, "MWMAME")
+            connect.assert_called_once_with(flow.MS_IMAP_HOST, flow.MS_IMAP_PORT, timeout=5)
+            self.assertEqual(fake.mechanism, "XOAUTH2")
+            self.assertEqual(fake.selected, ("INBOX", True))
+            self.assertIn(b"user=mailbox@example.test", fake.auth_payload)
+            self.assertIn(b"auth=Bearer IMAP_ACCESS", fake.auth_payload)
+            self.assertEqual(fake.fetch_query, "(BODY.PEEK[])")
+
+
 class MailPoolWebUITests(unittest.TestCase):
     def _service(self, root: Path) -> batch.BatchService:
         config = root / "config.json"
