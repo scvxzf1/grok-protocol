@@ -84,6 +84,8 @@ class NodeSlot:
     last_latency_ms: Optional[float] = None
     cooldown_until: float = 0.0
     last_error: str = ""
+    # Cooldown expired: needs a short re-probe before becoming leasable again.
+    pending_reprobe: bool = False
 
 
 
@@ -720,12 +722,11 @@ class EmbeddedProxyManager:
         self._log_fp = None
 
     def revive_cooled_nodes(self) -> int:
-        """Re-admit nodes whose cooldown has expired.
+        """Mark cooldown-expired nodes as pending re-probe (not yet healthy).
 
-        Failed nodes are marked healthy=False and given a future cooldown_until.
-        After that timestamp passes, revive them for another lease attempt.
-        Nodes with healthy=False and cooldown_until<=0 stay out until probe/start.
-        Returns how many nodes were revived.
+        Failed nodes stay unhealthy until a short re-probe succeeds. Nodes with
+        healthy=False and cooldown_until<=0 (never timed-out) stay out until
+        probe/start. Returns how many nodes were marked pending_reprobe.
         """
         now = time.time()
         revived = 0
@@ -733,59 +734,153 @@ class EmbeddedProxyManager:
             for node in self._nodes.values():
                 if node.healthy:
                     continue
+                if bool(getattr(node, "pending_reprobe", False)):
+                    continue
                 cd = float(node.cooldown_until or 0.0)
                 # Only revive nodes that actually entered a timed cooldown.
                 if cd <= 0.0 or cd > now:
                     continue
-                node.healthy = True
+                node.pending_reprobe = True
                 node.cooldown_until = 0.0
-                if getattr(node, "last_error", None):
-                    node.last_error = ""
+                node.healthy = False
                 revived += 1
         return revived
 
-    def acquire(self, exclude_ids: Optional[Set[str]] = None) -> Optional[NodeSlot]:
-        exclude = exclude_ids or set()
-        # Always re-admit cooled-down nodes before leasing.
-        self.revive_cooled_nodes()
-        now = time.time()
+    def _reprobe_timeout_sec(self) -> float:
+        cfg = getattr(self, "config", None)
+        base = 5.0
+        if cfg is not None:
+            base = float(getattr(cfg, "probe_timeout_sec", 5.0) or 5.0)
+        # Keep revive re-probes short so lease/status paths stay snappy.
+        return max(0.5, min(float(base), 2.0))
+
+    def reprobe_due_nodes(self, *, max_workers: int = 8) -> int:
+        """Short re-probe for nodes marked pending_reprobe after cooldown expiry.
+
+        Successful probes re-enter the healthy lease pool; failures re-apply the
+        shared progressive cooldown. Returns how many nodes were probed.
+        """
         with self._lock:
-            candidates = [
+            due_ids = [
+                n.id
+                for n in self._nodes.values()
+                if bool(getattr(n, "pending_reprobe", False))
+                and not n.healthy
+                and float(n.cooldown_until or 0.0) <= time.time()
+            ]
+        if not due_ids:
+            return 0
+        timeout = self._reprobe_timeout_sec()
+        workers = max(1, min(int(max_workers or 8), len(due_ids), 16))
+        if len(due_ids) == 1 or workers == 1:
+            for nid in due_ids:
+                self.probe_one(nid, timeout_sec=timeout)
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                list(pool.map(lambda nid: self.probe_one(nid, timeout_sec=timeout), due_ids))
+        return len(due_ids)
+
+    def _apply_failure_cooldown(self, node: "NodeSlot", reason: str) -> float:
+        """Mark node failed and apply progressive TLS/non-TLS cooldown.
+
+        Caller must hold ``self._lock``. Returns cooldown seconds applied.
+        """
+        node.fail_count = int(node.fail_count or 0) + 1
+        node.healthy = False
+        node.pending_reprobe = False
+        reason_text = str(reason or node.last_error or "")
+        node.last_error = reason_text[:240]
+        cfg = getattr(self, "config", None)
+        base = 30.0
+        if cfg is not None and hasattr(cfg, "fail_cooldown_sec"):
+            base = float(cfg.fail_cooldown_sec or 30.0)
+
+        tls_hit = _is_tls_failure_text(reason_text)
+        if tls_hit:
+            node.consecutive_tls_fails = int(node.consecutive_tls_fails or 0) + 1
+            tls_base = 60.0
+            tls_cap = 600.0
+            if cfg is not None:
+                tls_base = float(getattr(cfg, "tls_fail_cooldown_sec", 60.0) or 60.0)
+                tls_cap = float(getattr(cfg, "tls_fail_cooldown_cap_sec", 600.0) or 600.0)
+            # 1st TLS: tls_base, then 2x/4x/8x ... capped.
+            mult = 2 ** max(0, min(int(node.consecutive_tls_fails or 1) - 1, 4))
+            seconds = min(tls_cap, tls_base * mult)
+        else:
+            # Non-TLS failure: do not accumulate TLS streak.
+            node.consecutive_tls_fails = 0
+            # Progressive cooldown: 1st fail ~base, then 2x/3x/4x (cap).
+            mult = max(1, min(int(node.fail_count or 1), 4))
+            seconds = base * mult
+        node.cooldown_until = time.time() + float(seconds)
+        return float(seconds)
+
+    def _lease_candidates(
+        self,
+        exclude: Set[str],
+        now: Optional[float] = None,
+    ) -> List["NodeSlot"]:
+        now_ts = time.time() if now is None else float(now)
+        with self._lock:
+            return [
                 node
                 for node in self._nodes.values()
                 if node.healthy
-                and now >= float(node.cooldown_until or 0.0)
+                and now_ts >= float(node.cooldown_until or 0.0)
+                and not bool(getattr(node, "pending_reprobe", False))
                 and node.id not in exclude
             ]
-            if not candidates:
+
+    def acquire(self, exclude_ids: Optional[Set[str]] = None) -> Optional[NodeSlot]:
+        exclude = exclude_ids or set()
+        # Cooldown expiry only marks pending; re-probe must pass before lease.
+        self.revive_cooled_nodes()
+        candidates = self._lease_candidates(exclude)
+        if not candidates:
+            # Only pay re-probe cost when the healthy pool is empty.
+            self.reprobe_due_nodes()
+            candidates = self._lease_candidates(exclude)
+        if not candidates:
+            return None
+
+        preferred = _preferred_local_ports()
+        preferred_rank = {p: i for i, p in enumerate(preferred)}
+
+        def sort_key(node: NodeSlot):
+            # Prefer historically good, lightly loaded, low-latency nodes.
+            # Also deprioritize nodes with recent consecutive TLS failures.
+            # If a verified clean proxy list exists, prefer those local endpoints first,
+            # but ALWAYS load-balance within that preferred group so 4 concurrent
+            # workers do not all pile onto the same clean port (e.g. 28019).
+            latency = node.last_latency_ms
+            latency_key = (latency is None, latency if latency is not None else 0.0)
+            local_http = str(getattr(node, "local_http", "") or "").strip()
+            pref = preferred_rank.get(local_http, 10_000)
+            preferred_group = 0 if pref < 10_000 else 1
+            return (
+                preferred_group,
+                int(node.ref_count or 0),
+                pref,
+                int(getattr(node, "consecutive_tls_fails", 0) or 0),
+                -int(getattr(node, "success_count", 0) or 0),
+                int(getattr(node, "fail_count", 0) or 0),
+                latency_key,
+                str(node.id),
+            )
+
+        with self._lock:
+            # Re-check under lock; selected node may have flipped unhealthy.
+            live = [
+                n
+                for n in self._nodes.values()
+                if n.healthy
+                and time.time() >= float(n.cooldown_until or 0.0)
+                and not bool(getattr(n, "pending_reprobe", False))
+                and n.id not in exclude
+            ]
+            if not live:
                 return None
-
-            preferred = _preferred_local_ports()
-            preferred_rank = {p: i for i, p in enumerate(preferred)}
-
-            def sort_key(node: NodeSlot):
-                # Prefer historically good, lightly loaded, low-latency nodes.
-                # Also deprioritize nodes with recent consecutive TLS failures.
-                # If a verified clean proxy list exists, prefer those local endpoints first,
-                # but ALWAYS load-balance within that preferred group so 4 concurrent
-                # workers do not all pile onto the same clean port (e.g. 28019).
-                latency = node.last_latency_ms
-                latency_key = (latency is None, latency if latency is not None else 0.0)
-                local_http = str(getattr(node, "local_http", "") or "").strip()
-                pref = preferred_rank.get(local_http, 10_000)
-                preferred_group = 0 if pref < 10_000 else 1
-                return (
-                    preferred_group,
-                    int(node.ref_count or 0),
-                    pref,
-                    int(getattr(node, "consecutive_tls_fails", 0) or 0),
-                    -int(getattr(node, "success_count", 0) or 0),
-                    int(getattr(node, "fail_count", 0) or 0),
-                    latency_key,
-                    str(node.id),
-                )
-
-            selected = sorted(candidates, key=sort_key)[0]
+            selected = sorted(live, key=sort_key)[0]
             selected.ref_count += 1
             return copy(selected)
 
@@ -807,41 +902,16 @@ class EmbeddedProxyManager:
                 if reason:
                     node.last_error = ""
                 return
-
-            node.fail_count += 1
-            node.healthy = False
-            reason_text = str(reason or node.last_error or "")
-            node.last_error = reason_text[:240]
-            cfg = getattr(self, "config", None)
-            base = 30.0
-            if cfg is not None and hasattr(cfg, "fail_cooldown_sec"):
-                base = float(cfg.fail_cooldown_sec or 30.0)
-
-            tls_hit = _is_tls_failure_text(reason_text)
-            if tls_hit:
-                node.consecutive_tls_fails = int(node.consecutive_tls_fails or 0) + 1
-                tls_base = 60.0
-                tls_cap = 600.0
-                if cfg is not None:
-                    tls_base = float(getattr(cfg, "tls_fail_cooldown_sec", 60.0) or 60.0)
-                    tls_cap = float(getattr(cfg, "tls_fail_cooldown_cap_sec", 600.0) or 600.0)
-                # 1st TLS: tls_base, then 2x/4x/8x ... capped.
-                mult = 2 ** max(0, min(int(node.consecutive_tls_fails or 1) - 1, 4))
-                seconds = min(tls_cap, tls_base * mult)
-            else:
-                # Non-TLS failure: do not accumulate TLS streak.
-                node.consecutive_tls_fails = 0
-                # Progressive cooldown: 1st fail ~base, then 2x/3x/4x (cap).
-                mult = max(1, min(int(node.fail_count or 1), 4))
-                seconds = base * mult
-            node.cooldown_until = time.time() + float(seconds)
+            self._apply_failure_cooldown(node, reason)
 
     def status(self) -> dict:
-        # Status should reflect post-cooldown availability, not sticky dead flags.
+        # Mark cooldown-expired nodes as pending_reprobe without blocking on probes.
+        # True re-admission happens on acquire (or explicit probe).
         self.revive_cooled_nodes()
         with self._lock:
             nodes = list(self._nodes.values())
-            healthy = sum(1 for n in nodes if n.healthy)
+            healthy = sum(1 for n in nodes if n.healthy and not bool(getattr(n, "pending_reprobe", False)))
+            pending_reprobe = sum(1 for n in nodes if bool(getattr(n, "pending_reprobe", False)))
             leases = sum(n.ref_count for n in nodes)
             sample = [
                 {
@@ -854,6 +924,7 @@ class EmbeddedProxyManager:
                     "success_count": n.success_count,
                     "last_latency_ms": n.last_latency_ms,
                     "cooldown_until": n.cooldown_until,
+                    "pending_reprobe": bool(getattr(n, "pending_reprobe", False)),
                     "local_http": n.local_http,
                 }
                 for n in nodes[:20]
@@ -862,6 +933,7 @@ class EmbeddedProxyManager:
                 "running": bool(getattr(self, "_running", False)),
                 "total": len(nodes),
                 "healthy": healthy,
+                "pending_reprobe": pending_reprobe,
                 "leases": leases,
                 "nodes": sample,
             }
@@ -1115,17 +1187,17 @@ class EmbeddedProxyManager:
         with self._lock:
             node = self._nodes.get(node_id)
             if node is not None:
-                node.healthy = healthy
                 if healthy:
+                    node.healthy = True
+                    node.pending_reprobe = False
                     node.consecutive_tls_fails = 0
                     node.last_latency_ms = latency_ms
                     node.last_error = ""
                     node.cooldown_until = 0.0
                     node.success_count += 1
                 else:
-                    node.last_error = err
-                    node.fail_count += 1
-                    node.cooldown_until = time.time() + float(cfg.fail_cooldown_sec or 30.0)
+                    # Same progressive / TLS-classified cooldown as runtime release.
+                    self._apply_failure_cooldown(node, err)
         return {
             "id": node_id,
             "healthy": healthy,

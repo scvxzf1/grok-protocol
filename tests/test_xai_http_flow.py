@@ -135,6 +135,49 @@ class XAIHttpFlowTests(unittest.TestCase):
                 "test@example.test----password-value----sso-value\n",
             )
 
+    def test_save_registration_info_writes_json_detail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            info_dir = Path(directory) / "registration_info"
+            path = flow.save_registration_info(
+                str(info_dir),
+                email="test@example.test",
+                password="password-value",
+                sso="sso-value",
+                given_name="Alex",
+                family_name="Lee",
+                credential_path="/tmp/xai-test@example.test.json",
+                account_path="/tmp/accounts.txt",
+                sso_path="/tmp/xai-test@example.test.sso",
+                proxy="http://127.0.0.1:8080",
+                turnstile_provider="capsolver",
+            )
+            self.assertTrue(path)
+            target = Path(path)
+            self.assertEqual(target.parent, info_dir.resolve())
+            self.assertEqual(target.name, "xai-test@example.test.json")
+            payload = json.loads(target.read_text(encoding="utf-8"))
+            self.assertEqual(payload["email"], "test@example.test")
+            self.assertEqual(payload["password"], "password-value")
+            self.assertEqual(payload["sso"], "sso-value")
+            self.assertEqual(payload["given_name"], "Alex")
+            self.assertEqual(payload["family_name"], "Lee")
+            self.assertEqual(payload["credential_path"], "/tmp/xai-test@example.test.json")
+            self.assertEqual(payload["turnstile_provider"], "capsolver")
+            self.assertIn("registered_at", payload)
+            self.assertGreater(int(payload["registered_at_unix"]), 0)
+
+    def test_save_registration_info_skips_incomplete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(
+                flow.save_registration_info(
+                    str(Path(directory)),
+                    email="test@example.test",
+                    password="",
+                    sso="sso",
+                ),
+                "",
+            )
+
     def test_parse_ms_mail_line_four_fields(self):
         line = (
             "user@hotmail.com----Secret123----9e5f94bc-e8a4-4e73-b8be-63364c29d753----"
@@ -665,6 +708,114 @@ class XAIHttpFlowTests(unittest.TestCase):
         flow._build_turnstile_browser_options(options=fake, proxy="", headless=False, user_agent="")
         self.assertNotIn("--disable-blink-features=AutomationControlled", fake.args)
 
+    def test_local_turnstile_block_assets_and_shared_cache_defaults(self):
+        with mock.patch.dict(flow.os.environ, {}, clear=False):
+            flow.os.environ.pop("XAI_LOCAL_TURNSTILE_BLOCK_ASSETS", None)
+            flow.os.environ.pop("XAI_LOCAL_TURNSTILE_SHARED_CACHE", None)
+            self.assertTrue(flow.resolve_local_turnstile_block_assets({}))
+            self.assertTrue(flow.resolve_local_turnstile_shared_cache({}))
+            self.assertFalse(
+                flow.resolve_local_turnstile_block_assets(
+                    {"local_turnstile_block_assets": False}
+                )
+            )
+            self.assertFalse(
+                flow.resolve_local_turnstile_shared_cache(
+                    {"local_turnstile_shared_cache": 0}
+                )
+            )
+        with mock.patch.dict(
+            flow.os.environ,
+            {
+                "XAI_LOCAL_TURNSTILE_BLOCK_ASSETS": "0",
+                "XAI_LOCAL_TURNSTILE_SHARED_CACHE": "no",
+            },
+            clear=False,
+        ):
+            self.assertFalse(
+                flow.resolve_local_turnstile_block_assets(
+                    {"local_turnstile_block_assets": True}
+                )
+            )
+            self.assertFalse(
+                flow.resolve_local_turnstile_shared_cache(
+                    {"local_turnstile_shared_cache": True}
+                )
+            )
+
+    def test_build_turnstile_browser_options_adds_shared_disk_cache(self):
+        class FakeOptions:
+            def __init__(self):
+                self.args = []
+
+            def set_argument(self, value):
+                self.args.append(value)
+
+            def set_local_port(self, port):
+                self.port = port
+
+            def set_user_data_path(self, path):
+                self.user_data = path
+
+            def set_pref(self, key, value):
+                return None
+
+            def headless(self, value=True):
+                return None
+
+        with mock.patch.object(flow, "resolve_local_turnstile_shared_cache", return_value=True):
+            fake = FakeOptions()
+            flow._build_turnstile_browser_options(
+                options=fake,
+                proxy="",
+                headless=True,
+                user_agent="ua",
+            )
+        self.assertTrue(any(str(a).startswith("--disk-cache-dir=") for a in fake.args))
+        self.assertTrue(any(str(a).startswith("--disk-cache-size=") for a in fake.args))
+
+        with mock.patch.object(flow, "resolve_local_turnstile_shared_cache", return_value=False):
+            bare = FakeOptions()
+            flow._build_turnstile_browser_options(
+                options=bare,
+                proxy="",
+                headless=True,
+                user_agent="ua",
+            )
+        self.assertFalse(any("disk-cache" in str(a) for a in bare.args))
+
+    def test_apply_turnstile_network_blocks_uses_cdp(self):
+        class FakePage:
+            def __init__(self):
+                self.calls = []
+
+            def run_cdp(self, method, *args, **kwargs):
+                self.calls.append((method, args, kwargs))
+                return {}
+
+        page = FakePage()
+        logs = []
+        count = flow._apply_turnstile_network_blocks(
+            page,
+            enabled=True,
+            patterns=["*.png", "*.woff2"],
+            log_callback=logs.append,
+        )
+        self.assertEqual(count, 2)
+        methods = [item[0] for item in page.calls]
+        self.assertIn("Network.enable", methods)
+        self.assertIn("Network.setBlockedURLs", methods)
+        blocked_call = next(item for item in page.calls if item[0] == "Network.setBlockedURLs")
+        # kwargs form preferred
+        if blocked_call[2]:
+            self.assertEqual(blocked_call[2].get("urls"), ["*.png", "*.woff2"])
+        else:
+            self.assertEqual(blocked_call[1][0].get("urls"), ["*.png", "*.woff2"])
+        self.assertTrue(any("拦截" in msg for msg in logs))
+
+        skipped = flow._apply_turnstile_network_blocks(page, enabled=False)
+        self.assertEqual(skipped, 0)
+
 
 
     def test_ensure_injected_turnstile_widget_retries_until_api_ready(self):
@@ -762,6 +913,76 @@ class XAIHttpFlowTests(unittest.TestCase):
                 for _ in range(5):
                     box.create()
         self.assertEqual(seen, ["a.example", "b.example", "c.example", "a.example", "b.example"])
+
+    def test_yyds_domain_candidates_merge_private_then_public(self):
+        """One private domain must not trap RR; public domains stay in the pool."""
+
+        class FakeResp:
+            def __init__(self, status_code, payload):
+                self.status_code = status_code
+                self.text = json.dumps(payload)
+                self._payload = payload
+
+            def json(self):
+                return self._payload
+
+        domains = [
+            {"domain": "public-b.example", "isVerified": True, "isPublic": True},
+            {"domain": "private.example", "isVerified": True, "isPublic": False},
+            {"domain": "public-a.example", "isVerified": True, "isPublic": True},
+        ]
+
+        class FakeSession:
+            def get(self, url, **kwargs):
+                return FakeResp(200, {"success": True, "data": domains})
+
+        box = flow.YydsTempMailbox({"yyds_api_key": "k"}, timeout=10)
+        box.session = FakeSession()
+        pool = box._domain_candidates()
+        self.assertEqual(
+            pool,
+            ["private.example", "public-b.example", "public-a.example"],
+        )
+
+        seen = []
+
+        class CreateSession(FakeSession):
+            def post(self, url, **kwargs):
+                if "accounts" in url:
+                    domain = kwargs.get("json", {}).get("domain")
+                    seen.append(domain)
+                    return FakeResp(
+                        200,
+                        {
+                            "success": True,
+                            "data": {
+                                "address": f"xai@{domain}",
+                                "token": f"tok-{len(seen)}",
+                            },
+                        },
+                    )
+                return FakeResp(200, {"success": True, "data": {"token": "tok"}})
+
+        with tempfile.TemporaryDirectory() as directory:
+            rr_lock = Path(directory) / "rr.lock"
+            rr_state = Path(directory) / "rr-state.json"
+            box.session = CreateSession()
+            with mock.patch.object(flow, "_YYDS_DOMAIN_RR_LOCK_PATH", rr_lock), mock.patch.object(
+                flow, "_YYDS_DOMAIN_RR_STATE_PATH", rr_state
+            ), mock.patch.object(flow, "_yyds_create_spacing_sec", return_value=0.0), mock.patch.object(
+                flow.time, "sleep"
+            ):
+                for _ in range(4):
+                    box.create()
+        self.assertEqual(
+            seen,
+            [
+                "private.example",
+                "public-b.example",
+                "public-a.example",
+                "private.example",
+            ],
+        )
 
     def test_yyds_domain_whitelist_round_robin(self):
         class FakeResp:

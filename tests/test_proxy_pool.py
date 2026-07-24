@@ -106,6 +106,24 @@ class ProxyRotatorTests(unittest.TestCase):
             countries = {row["country"] for row in rot.get_country_stats()}
             self.assertTrue({"JP", "US"} & countries)
 
+    def test_next_never_returns_cooled_or_leased_entries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pool = [
+                "http://u:p@one.example:8080",
+                "http://u:p@two.example:8080",
+            ]
+            rot = ProxyRotator(pool, stats_file=os.path.join(tmp, "stats.log"))
+            first = rot.next()
+            self.assertIn(first, pool)
+            rot.mark_bad(first, cooldown_seconds=120)
+            second = rot.next()
+            self.assertEqual(second, next(item for item in pool if item != first))
+            rot.mark_bad(second, cooldown_seconds=120)
+            self.assertIsNone(rot.next())
+            self.assertEqual(rot.next_batch(3), [])
+            lease = rot.acquire_lease(owner="worker")
+            self.assertIsNone(lease)
+
     def test_configure_global_and_pick(self):
         pool = [
             "http://u_zone_JP:p@a.example:1000",

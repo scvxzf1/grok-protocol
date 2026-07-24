@@ -27,8 +27,8 @@ print(json.dumps({
     'root': str(p.PROJECT_ROOT),
     'local': str(p.LOCAL_ROOT),
     'config': str(p.CONFIG_PATH),
-    'dirs': [str(p.ACCOUNTS_DIR), str(p.CREDENTIALS_DIR), str(p.RUNS_DIR),
-             str(p.EXPORTS_DIR), str(p.FIXTURES_DIR), str(p.STATE_DIR)],
+    'dirs': [str(p.ACCOUNTS_DIR), str(p.CREDENTIALS_DIR), str(p.REGISTRATION_INFO_DIR),
+             str(p.RUNS_DIR), str(p.EXPORTS_DIR), str(p.FIXTURES_DIR), str(p.STATE_DIR)],
 }))
 """
     env = dict(os.environ)
@@ -147,3 +147,110 @@ def test_active_config_ui_has_no_removed_grok2api_controls_or_copy():
     assert "Grok2API" not in overview
     assert "grok2api" not in output.lower()
     assert "grok2api" not in javascript.lower()
+
+
+class _GhostPath(type(Path())):
+    """Path subclass that mimics NTFS ghost entries raising EINVAL on probe."""
+
+    def is_file(self):  # type: ignore[override]
+        raise OSError(22, "Invalid argument", str(self))
+
+    def stat(self, *args, **kwargs):  # type: ignore[override]
+        raise OSError(22, "Invalid argument", str(self))
+
+
+def test_iter_readable_files_skips_oserror_ghost_entries():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        good = root / "xai-good@example.test.json"
+        good.write_text(
+            json.dumps(
+                {
+                    "type": "xai",
+                    "email": "good@example.test",
+                    "access_token": "a",
+                    "refresh_token": "r",
+                    "id_token": "i",
+                    "expired": "2099-01-01T00:00:00Z",
+                    "sub": "sub-1",
+                }
+            ),
+            encoding="utf-8",
+        )
+        ghost = _GhostPath(root / "xai-ghost@example.test.json")
+
+        with mock.patch.object(Path, "iterdir", return_value=iter([good, ghost])):
+            files, skipped = local_paths.iter_readable_files(
+                root,
+                suffixes=(".json",),
+                sort_by_mtime=True,
+            )
+
+        assert [path.name for path in files] == [good.name]
+        assert skipped == [ghost.name]
+        assert local_paths.path_is_file(good) is True
+        assert local_paths.path_is_file(ghost) is False
+
+
+def test_list_credential_pairs_skips_unreadable_json_and_reports_them():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        good = root / "xai-good@example.test.json"
+        good.write_text(
+            json.dumps(
+                {
+                    "email": "good@example.test",
+                    "account_id": "acct-1234567890",
+                    "access_token": "token-value",
+                    "password": "secret",
+                }
+            ),
+            encoding="utf-8",
+        )
+        (root / "xai-good@example.test.sso").write_text("sso-token\n", encoding="utf-8")
+        ghost = _GhostPath(root / "xai-ghost@example.test.json")
+
+        with mock.patch.object(Path, "iterdir", return_value=iter([good, ghost])):
+            page = batch.list_credential_pairs(
+                root,
+                page=1,
+                page_size=50,
+                include_secrets=True,
+            )
+
+        assert page["total"] == 1
+        assert page["skipped_unreadable_count"] == 1
+        assert page["skipped_unreadable"] == [ghost.name]
+        assert len(page["items"]) == 1
+        assert page["items"][0]["json_name"] == good.name
+        assert page["items"][0]["has_sso"] is True
+        assert "token-value" in page["items"][0]["line"]
+
+
+def test_collect_local_cpa_items_skips_unreadable_json():
+    import cpa_push
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        good = root / "xai-good@example.test.json"
+        good.write_text(
+            json.dumps(
+                {
+                    "type": "xai",
+                    "email": "good@example.test",
+                    "access_token": "access-token-value",
+                    "refresh_token": "refresh-token-value",
+                    "id_token": "id-token-value",
+                    "expired": "2099-01-01T00:00:00Z",
+                    "sub": "sub-1",
+                }
+            ),
+            encoding="utf-8",
+        )
+        ghost = _GhostPath(root / "xai-ghost@example.test.json")
+
+        with mock.patch.object(Path, "iterdir", return_value=iter([good, ghost])):
+            items = cpa_push.collect_local_cpa_items(root)
+
+        assert len(items) == 1
+        assert items[0]["email"] == "good@example.test"

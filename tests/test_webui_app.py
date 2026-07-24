@@ -273,6 +273,63 @@ class WebUIAppTests(unittest.TestCase):
             self.assertIn("btnEmbeddedFetchSub", page.text)
             self.assertIn("proxy_subscription_urls", page.text)
             self.assertIn("btnEmbeddedStatus", page.text)
+            self.assertIn("btnEmbeddedRefresh", page.text)
+            self.assertIn("btnEmbeddedRefreshProbeOnly", page.text)
+            self.assertIn("embedded_proxy_refresh_fetch_subscription", page.text)
+            self.assertIn("embedded_proxy_refresh_export_healthy", page.text)
+
+    def test_embedded_proxy_refresh_api(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            service = self._service(root)
+            app = webui_app.create_app(service=service)
+            client = TestClient(app)
+            payload = {
+                "ok": True,
+                "message": "节点池已刷新：缓存 2 · 已重载 · 健康 1/2",
+                "healthy": 1,
+                "total": 2,
+                "steps": {
+                    "fetch_subscription": True,
+                    "reload": True,
+                    "probe": True,
+                    "export_healthy": False,
+                },
+            }
+            with mock.patch.object(
+                service, "refresh_embedded_node_pool", return_value=payload
+            ) as refresh:
+                r = client.post(
+                    "/api/embedded-proxy/refresh",
+                    json={
+                        "proxy_subscription_urls": "https://example.test/sub",
+                        "fetch_subscription": True,
+                        "reload": True,
+                        "probe": True,
+                        "export_healthy": False,
+                    },
+                )
+            self.assertEqual(r.status_code, 200)
+            body = r.json()
+            self.assertTrue(body.get("ok"))
+            self.assertEqual(body.get("healthy"), 1)
+            refresh.assert_called_once()
+            kwargs = refresh.call_args.kwargs
+            self.assertTrue(kwargs.get("fetch_subscription"))
+            self.assertTrue(kwargs.get("reload"))
+            self.assertTrue(kwargs.get("probe"))
+            self.assertFalse(kwargs.get("export_healthy"))
+
+            busy_exc = __import__(
+                "http_batch_service", fromlist=["BatchBusyError"]
+            ).BatchBusyError("busy")
+            with mock.patch.object(
+                service,
+                "refresh_embedded_node_pool",
+                side_effect=busy_exc,
+            ):
+                r = client.post("/api/embedded-proxy/refresh", json={"reload": True})
+            self.assertEqual(r.status_code, 409)
 
     def test_embedded_proxy_fetch_subscription_api(self):
         with tempfile.TemporaryDirectory() as d:
@@ -368,6 +425,7 @@ class WebUIAppTests(unittest.TestCase):
             self.assertEqual(cfg_page.status_code, 200)
             self.assertIn("凭证列表", cfg_page.text)  # nav link
             self.assertNotIn("credListText", cfg_page.text)
+            self.assertIn("overviewMailSummary", cfg_page.text)
 
             page = client.get("/credentials")
             self.assertEqual(page.status_code, 200)
@@ -378,7 +436,9 @@ class WebUIAppTests(unittest.TestCase):
             self.assertIn("btnExportRefresh", page.text)
             self.assertIn("exportPreviewText", page.text)
             self.assertIn("历史文件预览", page.text)
+            self.assertIn("1000", page.text)
 
+            # Default listing returns full plaintext json____sso lines.
             data = client.get("/api/credentials", params={"page": 1, "page_size": 1000})
             self.assertEqual(data.status_code, 200)
             body = data.json()
@@ -387,7 +447,7 @@ class WebUIAppTests(unittest.TestCase):
             self.assertEqual(body["page_size"], 1000)
             self.assertEqual(body["total_pages"], 1)
             self.assertEqual(len(body["items"]), 2)
-            # newest mtime first roughly; both present
+            self.assertTrue(body.get("revealed"))
             lines = body["text"].splitlines()
             self.assertEqual(len(lines), 2)
             self.assertTrue(all("____" in ln for ln in lines))
@@ -510,7 +570,7 @@ class WebUIAppTests(unittest.TestCase):
 
             # path traversal blocked
             bad = client.get("/api/credential-exports/download", params={"name": "../config.json"})
-            self.assertIn(bad.status_code, {400, 404})
+            self.assertIn(bad.status_code, {400, 403, 404})
 
             # delete
             deleted = client.request("DELETE", "/api/credential-exports", params={"name": fname})

@@ -10,11 +10,28 @@ from __future__ import annotations
 import atexit
 import asyncio
 import concurrent.futures
+import os
 import sys
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, Optional
+
+# Local browser solves also wait on a cross-process Chrome slot.  That admission
+# wait must not be cancelled by the per-solve budget, otherwise high concurrency
+# surfaces as an empty asyncio.TimeoutError right at the configured timeout.
+
+
+def _local_solve_admission_grace_sec() -> int:
+    raw = str(os.environ.get("XAI_LOCAL_TURNSTILE_LOCK_TIMEOUT_SEC") or "120").strip()
+    try:
+        value = int(float(raw))
+    except (TypeError, ValueError):
+        value = 120
+    return max(30, value)
+
+
+_LOCAL_SOLVE_ADMISSION_GRACE_SEC = _local_solve_admission_grace_sec()
 
 
 @dataclass(frozen=True)
@@ -468,20 +485,41 @@ class TurnstileBroker:
                 self._provider_slots[provider] = semaphore
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise asyncio.TimeoutError("Turnstile broker deadline expired in queue")
-            await asyncio.wait_for(semaphore.acquire(), timeout=remaining)
+                raise asyncio.TimeoutError(
+                    "Turnstile broker 排队超时（deadline expired in queue）"
+                )
+            try:
+                await asyncio.wait_for(semaphore.acquire(), timeout=remaining)
+            except asyncio.TimeoutError as exc:
+                raise asyncio.TimeoutError(
+                    "Turnstile broker 排队超时（waiting for provider slot）"
+                ) from exc
             acquired = True
             current_task = asyncio.current_task()
             cancelling = getattr(current_task, "cancelling", None)
             if callable(cancelling) and cancelling():
                 raise asyncio.CancelledError
+            # Local browser capture enforces its own token-wait timeout and may
+            # first block on the cross-process Chrome slot.  Do not wrap it in a
+            # second wait_for equal only to timeout_sec — that cancels slot wait
+            # with an empty TimeoutError under concurrency.
+            if provider == "local":
+                return await solver(request, self.sleep)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise asyncio.TimeoutError("Turnstile broker deadline expired before solve")
-            return await asyncio.wait_for(
-                solver(request, self.sleep),
-                timeout=remaining,
-            )
+                raise asyncio.TimeoutError(
+                    "Turnstile broker 求解超时（deadline expired before solve）"
+                )
+            try:
+                return await asyncio.wait_for(
+                    solver(request, self.sleep),
+                    timeout=remaining,
+                )
+            except asyncio.TimeoutError as exc:
+                budget = max(1, int(request.timeout_sec or 0) or int(remaining) or 1)
+                raise asyncio.TimeoutError(
+                    f"Turnstile broker 求解超时（{budget}s budget exhausted during solve）"
+                ) from exc
         finally:
             if acquired and semaphore is not None:
                 semaphore.release()
@@ -490,6 +528,9 @@ class TurnstileBroker:
 
     def _submit(self, request: SolveRequest, solver: AsyncSolver) -> concurrent.futures.Future[SolveResult]:
         loop = self._ensure_loop()
+        # Admission/queue deadline stays tied to timeout_sec. Local browser
+        # execution after the provider slot is acquired is intentionally not
+        # cancelled by this same deadline (see _solve_on_loop).
         deadline = time.monotonic() + max(1, int(request.timeout_sec or 180))
         coroutine = self._solve_on_loop(request, solver, deadline)
         with self._thread_lock:
@@ -507,11 +548,21 @@ class TurnstileBroker:
 
     def solve_sync(self, request: SolveRequest, solver: AsyncSolver) -> SolveResult:
         future = self._submit(request, solver)
+        budget = max(1, int(request.timeout_sec or 180))
+        provider = str(request.provider or "").strip().lower()
+        # Local path may spend up to the cross-process slot grace waiting for a
+        # browser seat before the actual token wait begins.
+        if provider == "local":
+            outer_timeout = max(6, budget + _LOCAL_SOLVE_ADMISSION_GRACE_SEC + 15)
+        else:
+            outer_timeout = max(6, budget + 5)
         try:
-            return future.result(timeout=max(6, int(request.timeout_sec or 180) + 5))
-        except concurrent.futures.TimeoutError:
+            return future.result(timeout=outer_timeout)
+        except concurrent.futures.TimeoutError as exc:
             future.cancel()
-            raise
+            raise TimeoutError(
+                f"Turnstile broker 同步等待超时（{outer_timeout}s）"
+            ) from exc
 
     def close(self) -> None:
         with self._thread_lock:

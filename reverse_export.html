@@ -1,0 +1,868 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>逆转换 · JSON____SSO → .json + .sso</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --panel: #1a2332;
+      --panel-2: #243044;
+      --border: #2d3a4f;
+      --text: #e7ecf3;
+      --muted: #8b9bb4;
+      --accent: #3b82f6;
+      --accent-2: #2563eb;
+      --ok: #22c55e;
+      --warn: #f59e0b;
+      --err: #ef4444;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      --sans: "Segoe UI", system-ui, -apple-system, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: var(--sans);
+      color: var(--text);
+      background:
+        radial-gradient(1200px 500px at 10% -10%, #1e3a5f55, transparent 60%),
+        radial-gradient(900px 400px at 100% 0%, #0f766e33, transparent 50%),
+        var(--bg);
+    }
+    .wrap {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 28px 18px 48px;
+    }
+    header {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px 20px;
+      align-items: flex-end;
+      justify-content: space-between;
+      margin-bottom: 18px;
+    }
+    h1 {
+      margin: 0;
+      font-size: 1.45rem;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+    }
+    .sub {
+      margin: 6px 0 0;
+      color: var(--muted);
+      font-size: 0.92rem;
+      line-height: 1.45;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: #1e293b;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 0.8rem;
+      white-space: nowrap;
+    }
+    .badge b { color: #93c5fd; font-weight: 600; }
+    .card {
+      background: color-mix(in srgb, var(--panel) 92%, #000 8%);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 16px;
+      margin-bottom: 14px;
+      box-shadow: 0 10px 30px #0004;
+    }
+    label {
+      display: block;
+      font-size: 0.88rem;
+      color: var(--muted);
+      margin-bottom: 8px;
+    }
+    textarea, input[type="text"] {
+      width: 100%;
+      border: 1px solid var(--border);
+      background: #0b1220;
+      color: var(--text);
+      border-radius: 10px;
+      padding: 12px 12px;
+      font-family: var(--mono);
+      font-size: 0.82rem;
+      line-height: 1.45;
+      outline: none;
+      resize: vertical;
+    }
+    textarea:focus, input[type="text"]:focus {
+      border-color: #3b82f6aa;
+      box-shadow: 0 0 0 3px #3b82f633;
+    }
+    #input { min-height: 220px; }
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 12px;
+      align-items: center;
+    }
+    button, .btn {
+      appearance: none;
+      border: 1px solid var(--border);
+      background: var(--panel-2);
+      color: var(--text);
+      border-radius: 10px;
+      padding: 9px 14px;
+      font-size: 0.9rem;
+      cursor: pointer;
+      transition: 0.15s ease;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    button:hover, .btn:hover { filter: brightness(1.08); }
+    button:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+      filter: none;
+    }
+    button.primary {
+      background: linear-gradient(180deg, var(--accent), var(--accent-2));
+      border-color: #1d4ed8;
+      font-weight: 600;
+    }
+    button.ok {
+      background: linear-gradient(180deg, #16a34a, #15803d);
+      border-color: #166534;
+      font-weight: 600;
+    }
+    button.ghost { background: transparent; }
+    .stats {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    .stat {
+      min-width: 110px;
+      background: #0b1220;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 12px;
+    }
+    .stat .k { color: var(--muted); font-size: 0.78rem; }
+    .stat .v { font-size: 1.25rem; font-weight: 700; margin-top: 2px; }
+    .stat.ok .v { color: var(--ok); }
+    .stat.err .v { color: var(--err); }
+    .stat.warn .v { color: var(--warn); }
+    .list { display: grid; gap: 10px; }
+    .item {
+      border: 1px solid var(--border);
+      background: #0b1220;
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    .item-head {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 12px;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 14px;
+      background: #121a28;
+      border-bottom: 1px solid var(--border);
+    }
+    .item-title { font-weight: 600; word-break: break-all; }
+    .item-meta {
+      color: var(--muted);
+      font-size: 0.82rem;
+      font-family: var(--mono);
+    }
+    .tag {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 0.75rem;
+      border: 1px solid var(--border);
+      color: var(--muted);
+    }
+    .tag.ok { color: #86efac; border-color: #166534; background: #052e16; }
+    .tag.err { color: #fca5a5; border-color: #7f1d1d; background: #450a0a; }
+    .item-body {
+      padding: 12px 14px;
+      display: grid;
+      gap: 10px;
+    }
+    .pair {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+    @media (max-width: 800px) {
+      .pair { grid-template-columns: 1fr; }
+    }
+    .box {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: #070d18;
+      overflow: hidden;
+    }
+    .box-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 0.8rem;
+    }
+    .box pre {
+      margin: 0;
+      padding: 10px;
+      max-height: 180px;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+      font-family: var(--mono);
+      font-size: 0.75rem;
+      line-height: 1.4;
+      color: #cbd5e1;
+    }
+    .err-text {
+      color: #fca5a5;
+      font-size: 0.9rem;
+      padding: 4px 0;
+    }
+    .hint {
+      color: var(--muted);
+      font-size: 0.85rem;
+      line-height: 1.5;
+    }
+    .hint code {
+      font-family: var(--mono);
+      background: #0b1220;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 1px 6px;
+      color: #93c5fd;
+    }
+    footer {
+      margin-top: 18px;
+      color: var(--muted);
+      font-size: 0.8rem;
+      line-height: 1.5;
+    }
+    .hidden { display: none !important; }
+    .toast {
+      position: fixed;
+      right: 16px;
+      bottom: 16px;
+      background: #111827;
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 10px 14px;
+      border-radius: 10px;
+      box-shadow: 0 10px 30px #0008;
+      opacity: 0;
+      transform: translateY(8px);
+      transition: 0.2s ease;
+      pointer-events: none;
+      z-index: 50;
+      max-width: min(420px, calc(100vw - 32px));
+      font-size: 0.9rem;
+    }
+    .toast.show {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div>
+        <h1>逆转换 · Export → JSON + SSO</h1>
+        <p class="sub">
+          把 <code style="font-family:var(--mono);color:#93c5fd">{json全文}____sso全文</code>
+          拆回独立的 <b>xai-邮箱.json</b> 与 <b>xai-邮箱.sso</b>。<br />
+          纯本地处理，不上传网络。支持一次粘贴多行，可打包成 ZIP。
+        </p>
+      </div>
+      <div class="badge">分隔符 <b>____</b> / 兼容 <b>----</b></div>
+    </header>
+
+    <section class="card">
+      <label for="input">粘贴 export 行（每行一条；空行与 # 注释忽略）</label>
+      <textarea id="input" placeholder='{"access_token":"...","email":"..."}____eyJ...'></textarea>
+      <div class="toolbar">
+        <button type="button" class="primary" id="btnParse">解析</button>
+        <button type="button" class="ok" id="btnDownloadZip" disabled>下载 ZIP 压缩包</button>
+        <button type="button" id="btnDownloadAll" disabled>下载全部（逐个）</button>
+        <button type="button" id="btnDownloadJsonAll" disabled>仅下载全部 JSON</button>
+        <button type="button" id="btnDownloadSsoAll" disabled>仅下载全部 SSO</button>
+        <button type="button" class="ghost" id="btnCopySummary" disabled>复制摘要</button>
+        <button type="button" class="ghost" id="btnClear">清空</button>
+        <label class="hint" style="margin:0;display:inline-flex;align-items:center;gap:6px;">
+          <input type="checkbox" id="pretty" checked /> 美化 JSON 缩进
+        </label>
+        <label class="hint" style="margin:0;display:inline-flex;align-items:center;gap:6px;">
+          <input type="checkbox" id="includeSummary" checked /> ZIP 内含 summary.txt
+        </label>
+      </div>
+      <p class="hint" style="margin:12px 0 0;">
+        输出命名规则与 Python 版一致：优先 <code>xai-{email}.json</code> / <code>xai-{email}.sso</code>；
+        无邮箱时用 <code>sub</code>；都没有则用时间戳。ZIP 内文件平铺，不建子目录。
+      </p>
+    </section>
+
+    <section class="card" id="resultCard">
+      <div class="stats">
+        <div class="stat"><div class="k">总行</div><div class="v" id="statTotal">0</div></div>
+        <div class="stat ok"><div class="k">成功</div><div class="v" id="statOk">0</div></div>
+        <div class="stat err"><div class="k">失败</div><div class="v" id="statFail">0</div></div>
+        <div class="stat warn"><div class="k">含 SSO</div><div class="v" id="statSso">0</div></div>
+      </div>
+      <div id="emptyHint" class="hint">还没有解析结果。粘贴后点「解析」。</div>
+      <div id="list" class="list"></div>
+    </section>
+
+    <footer>
+      格式兼容 WebUI 导出与 <code>reverse_export_to_credentials.py</code>。
+      ZIP 由浏览器本地生成（STORE，无压缩），无需联网库。
+    </footer>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    const SEP_PRIMARY = "____";
+    const SEP_FALLBACK = "----";
+
+    const $ = (id) => document.getElementById(id);
+    const inputEl = $("input");
+    const listEl = $("list");
+    const emptyHint = $("emptyHint");
+    const prettyEl = $("pretty");
+    const includeSummaryEl = $("includeSummary");
+    const toastEl = $("toast");
+
+    /** @type {Array<any>} */
+    let items = [];
+
+    function toast(msg) {
+      toastEl.textContent = msg;
+      toastEl.classList.add("show");
+      clearTimeout(toast._t);
+      toast._t = setTimeout(() => toastEl.classList.remove("show"), 2200);
+    }
+
+    function sanitizeFileSegment(value) {
+      let text = String(value || "").trim();
+      if (!text) return "";
+      text = text.replace(/[\\/:*?"<>|\s]+/g, "_");
+      text = text.replace(/_+/g, "_").replace(/^[._]+|[._]+$/g, "");
+      return text.slice(0, 180);
+    }
+
+    function credentialFileName(email = "", subject = "") {
+      email = sanitizeFileSegment(email);
+      if (email) return `xai-${email}.json`;
+      subject = sanitizeFileSegment(subject);
+      if (subject) return `xai-${subject}.json`;
+      return `xai-${Date.now()}.json`;
+    }
+
+    function ssoFileName(jsonName) {
+      const name = String(jsonName || "").trim();
+      if (name.endsWith(".json")) return name.slice(0, -5) + ".sso";
+      return name + ".sso";
+    }
+
+    function splitExportLine(line) {
+      const raw = String(line || "").trim();
+      if (!raw) throw new Error("空行");
+      let sep = null;
+      if (raw.includes(SEP_PRIMARY)) sep = SEP_PRIMARY;
+      else if (raw.includes(SEP_FALLBACK)) sep = SEP_FALLBACK;
+      else throw new Error(`缺少分隔符 ${SEP_PRIMARY} 或 ${SEP_FALLBACK}`);
+      const idx = raw.indexOf(sep);
+      const left = raw.slice(0, idx).trim();
+      const right = raw.slice(idx + sep.length).trim();
+      if (!left) throw new Error("JSON 部分为空");
+      return { left, right, sep };
+    }
+
+    function pickNames(data) {
+      const email = String(data.email || data.user_email || "").trim();
+      const subject = String(data.sub || data.user_id || data.principal_id || "").trim();
+      return { email, subject };
+    }
+
+    function formatJson(data, pretty) {
+      return JSON.stringify(data, null, pretty ? 2 : 0) + "\n";
+    }
+
+    function normalizeSso(sso) {
+      let text = String(sso || "").trim();
+      if (!text) return "";
+      return text.replace(/[\r\n]+/g, "").trim();
+    }
+
+    function parseLine(line, index) {
+      try {
+        const { left, right, sep } = splitExportLine(line);
+        let data;
+        try {
+          data = JSON.parse(left);
+        } catch (e) {
+          throw new Error(`JSON 无法解析: ${e.message}`);
+        }
+        if (!data || typeof data !== "object" || Array.isArray(data)) {
+          throw new Error("JSON 根节点必须是对象");
+        }
+        const { email, subject } = pickNames(data);
+        const jsonName = credentialFileName(email, subject);
+        const ssoName = ssoFileName(jsonName);
+        const ssoText = normalizeSso(right);
+        const pretty = !!prettyEl.checked;
+        const jsonText = formatJson(data, pretty);
+        return {
+          ok: true,
+          index,
+          email,
+          subject,
+          sep,
+          data,
+          jsonName,
+          ssoName,
+          jsonText,
+          ssoText,
+          hasSso: !!ssoText,
+          error: "",
+        };
+      } catch (e) {
+        return {
+          ok: false,
+          index,
+          email: "",
+          subject: "",
+          sep: "",
+          data: null,
+          jsonName: "",
+          ssoName: "",
+          jsonText: "",
+          ssoText: "",
+          hasSso: false,
+          error: e && e.message ? e.message : String(e),
+          raw: String(line || ""),
+        };
+      }
+    }
+
+    function parseAll() {
+      const raw = inputEl.value || "";
+      const lines = raw.split(/\r?\n/);
+      const next = [];
+      lines.forEach((line, i) => {
+        const text = String(line || "").trim();
+        if (!text || text.startsWith("#")) return;
+        next.push(parseLine(text, i + 1));
+      });
+      // 文件名冲突时追加序号，避免同邮箱覆盖
+      const used = new Map();
+      for (const item of next) {
+        if (!item.ok) continue;
+        const base = item.jsonName;
+        const n = used.get(base) || 0;
+        if (n > 0) {
+          const stem = base.endsWith(".json") ? base.slice(0, -5) : base;
+          item.jsonName = `${stem}-${n + 1}.json`;
+          item.ssoName = ssoFileName(item.jsonName);
+        }
+        used.set(base, n + 1);
+      }
+      items = next;
+      render();
+      const ok = items.filter((x) => x.ok).length;
+      const fail = items.length - ok;
+      toast(`解析完成：成功 ${ok}，失败 ${fail}`);
+    }
+
+    function downloadBlob(filename, content, mime) {
+      const blob = content instanceof Blob
+        ? content
+        : new Blob([content], { type: mime || "text/plain;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1500);
+    }
+
+    function sleep(ms) {
+      return new Promise((r) => setTimeout(r, ms));
+    }
+
+    // ---------- minimal ZIP (STORE, CRC32) ----------
+    const CRC_TABLE = (() => {
+      const table = new Uint32Array(256);
+      for (let i = 0; i < 256; i++) {
+        let c = i;
+        for (let k = 0; k < 8; k++) {
+          c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+        }
+        table[i] = c >>> 0;
+      }
+      return table;
+    })();
+
+    function crc32(bytes) {
+      let c = 0xffffffff;
+      for (let i = 0; i < bytes.length; i++) {
+        c = CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
+      }
+      return (c ^ 0xffffffff) >>> 0;
+    }
+
+    function u16(n) {
+      return [n & 0xff, (n >>> 8) & 0xff];
+    }
+    function u32(n) {
+      return [n & 0xff, (n >>> 8) & 0xff, (n >>> 16) & 0xff, (n >>> 24) & 0xff];
+    }
+
+    function dosDateTime(date = new Date()) {
+      const year = Math.max(1980, date.getFullYear());
+      const dosTime =
+        (date.getHours() << 11) |
+        (date.getMinutes() << 5) |
+        Math.floor(date.getSeconds() / 2);
+      const dosDate =
+        ((year - 1980) << 9) |
+        ((date.getMonth() + 1) << 5) |
+        date.getDate();
+      return { dosTime, dosDate };
+    }
+
+    function encodeUtf8(str) {
+      return new TextEncoder().encode(String(str ?? ""));
+    }
+
+    /**
+     * @param {{name:string, content:string|Uint8Array}[]} files
+     * @returns {Blob}
+     */
+    function buildZip(files) {
+      const encoder = new TextEncoder();
+      const parts = [];
+      const central = [];
+      let offset = 0;
+      const now = dosDateTime(new Date());
+
+      for (const file of files) {
+        const nameBytes = encoder.encode(file.name.replace(/\\/g, "/"));
+        const data = typeof file.content === "string"
+          ? encoder.encode(file.content)
+          : file.content;
+        const crc = crc32(data);
+        const size = data.length;
+        // general purpose bit 11 = UTF-8
+        const flags = 0x0800;
+        const localHeader = new Uint8Array([
+          ...u32(0x04034b50),
+          ...u16(20), // version needed
+          ...u16(flags),
+          ...u16(0), // store
+          ...u16(now.dosTime),
+          ...u16(now.dosDate),
+          ...u32(crc),
+          ...u32(size),
+          ...u32(size),
+          ...u16(nameBytes.length),
+          ...u16(0), // extra
+          ...nameBytes,
+        ]);
+        parts.push(localHeader, data);
+
+        const centralHeader = new Uint8Array([
+          ...u32(0x02014b50),
+          ...u16(20), // version made by
+          ...u16(20), // version needed
+          ...u16(flags),
+          ...u16(0),
+          ...u16(now.dosTime),
+          ...u16(now.dosDate),
+          ...u32(crc),
+          ...u32(size),
+          ...u32(size),
+          ...u16(nameBytes.length),
+          ...u16(0), // extra
+          ...u16(0), // comment
+          ...u16(0), // disk start
+          ...u16(0), // internal attr
+          ...u32(0), // external attr
+          ...u32(offset),
+          ...nameBytes,
+        ]);
+        central.push(centralHeader);
+        offset += localHeader.length + data.length;
+      }
+
+      const centralSize = central.reduce((s, b) => s + b.length, 0);
+      const end = new Uint8Array([
+        ...u32(0x06054b50),
+        ...u16(0),
+        ...u16(0),
+        ...u16(files.length),
+        ...u16(files.length),
+        ...u32(centralSize),
+        ...u32(offset),
+        ...u16(0),
+      ]);
+
+      return new Blob([...parts, ...central, end], { type: "application/zip" });
+    }
+
+    function buildSummaryText() {
+      const lines = [];
+      lines.push("# reverse_export summary");
+      lines.push(`# generated_at: ${new Date().toISOString()}`);
+      lines.push(`# total: ${items.length}`);
+      lines.push(`# ok: ${items.filter((x) => x.ok).length}`);
+      lines.push(`# fail: ${items.filter((x) => !x.ok).length}`);
+      lines.push("");
+      for (const it of items) {
+        if (!it.ok) {
+          lines.push(`#${it.index}\tFAIL\t${it.error}`);
+        } else {
+          lines.push(
+            `#${it.index}\tOK\t${it.email || "-"}\t${it.jsonName}\t${it.hasSso ? it.ssoName : "-"}`
+          );
+        }
+      }
+      return lines.join("\n") + "\n";
+    }
+
+    function zipFileName() {
+      const d = new Date();
+      const pad = (n) => String(n).padStart(2, "0");
+      const stamp =
+        `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}` +
+        `_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+      return `xai-credentials_${stamp}.zip`;
+    }
+
+    function downloadZip() {
+      const okItems = items.filter((x) => x.ok);
+      if (!okItems.length) {
+        toast("没有可打包的成功项");
+        return;
+      }
+      /** @type {{name:string, content:string}[]} */
+      const files = [];
+      for (const item of okItems) {
+        files.push({ name: item.jsonName, content: item.jsonText });
+        if (item.hasSso) {
+          files.push({ name: item.ssoName, content: item.ssoText + "\n" });
+        }
+      }
+      if (includeSummaryEl.checked) {
+        files.push({ name: "summary.txt", content: buildSummaryText() });
+      }
+      const blob = buildZip(files);
+      const name = zipFileName();
+      downloadBlob(name, blob, "application/zip");
+      toast(`已下载 ${name}（${files.length} 个文件）`);
+    }
+
+    async function downloadAll({ jsonOnly = false, ssoOnly = false } = {}) {
+      const okItems = items.filter((x) => x.ok);
+      if (!okItems.length) {
+        toast("没有可下载的成功项");
+        return;
+      }
+      let count = 0;
+      for (const item of okItems) {
+        if (!ssoOnly) {
+          downloadBlob(item.jsonName, item.jsonText, "application/json;charset=utf-8");
+          count += 1;
+          await sleep(180);
+        }
+        if (!jsonOnly && item.hasSso) {
+          downloadBlob(item.ssoName, item.ssoText + "\n", "text/plain;charset=utf-8");
+          count += 1;
+          await sleep(180);
+        }
+      }
+      toast(`已触发 ${count} 个文件下载`);
+    }
+
+    function copyText(text) {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        return navigator.clipboard.writeText(text);
+      }
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      ta.remove();
+      return Promise.resolve();
+    }
+
+    function render() {
+      const ok = items.filter((x) => x.ok).length;
+      const fail = items.length - ok;
+      const sso = items.filter((x) => x.ok && x.hasSso).length;
+      $("statTotal").textContent = String(items.length);
+      $("statOk").textContent = String(ok);
+      $("statFail").textContent = String(fail);
+      $("statSso").textContent = String(sso);
+
+      const has = items.length > 0;
+      emptyHint.classList.toggle("hidden", has);
+      $("btnDownloadZip").disabled = ok === 0;
+      $("btnDownloadAll").disabled = ok === 0;
+      $("btnDownloadJsonAll").disabled = ok === 0;
+      $("btnDownloadSsoAll").disabled = sso === 0;
+      $("btnCopySummary").disabled = !has;
+
+      listEl.innerHTML = "";
+      for (const item of items) {
+        const el = document.createElement("div");
+        el.className = "item";
+        if (!item.ok) {
+          el.innerHTML = `
+            <div class="item-head">
+              <div>
+                <div class="item-title">第 ${item.index} 行</div>
+                <div class="item-meta">解析失败</div>
+              </div>
+              <span class="tag err">失败</span>
+            </div>
+            <div class="item-body">
+              <div class="err-text">${escapeHtml(item.error)}</div>
+              <div class="box">
+                <div class="box-head"><span>原始行（截断）</span></div>
+                <pre>${escapeHtml((item.raw || "").slice(0, 800))}</pre>
+              </div>
+            </div>`;
+          listEl.appendChild(el);
+          continue;
+        }
+
+        el.innerHTML = `
+          <div class="item-head">
+            <div>
+              <div class="item-title">${escapeHtml(item.email || item.subject || "(无邮箱)")}</div>
+              <div class="item-meta">#${item.index} · ${escapeHtml(item.jsonName)} + ${escapeHtml(item.hasSso ? item.ssoName : "(无sso)")}</div>
+            </div>
+            <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
+              <span class="tag ok">成功</span>
+              ${item.hasSso ? '<span class="tag">SSO</span>' : '<span class="tag">无SSO</span>'}
+              <button type="button" data-act="json" data-i="${item.index}">下 JSON</button>
+              <button type="button" data-act="sso" data-i="${item.index}" ${item.hasSso ? "" : "disabled"}>下 SSO</button>
+              <button type="button" data-act="both" data-i="${item.index}">两个都下</button>
+            </div>
+          </div>
+          <div class="item-body">
+            <div class="pair">
+              <div class="box">
+                <div class="box-head">
+                  <span>JSON · ${escapeHtml(item.jsonName)}</span>
+                  <button type="button" class="ghost" data-act="copy-json" data-i="${item.index}" style="padding:4px 8px;font-size:0.78rem;">复制</button>
+                </div>
+                <pre>${escapeHtml(item.jsonText)}</pre>
+              </div>
+              <div class="box">
+                <div class="box-head">
+                  <span>SSO · ${escapeHtml(item.hasSso ? item.ssoName : "(空)")}</span>
+                  <button type="button" class="ghost" data-act="copy-sso" data-i="${item.index}" style="padding:4px 8px;font-size:0.78rem;" ${item.hasSso ? "" : "disabled"}>复制</button>
+                </div>
+                <pre>${escapeHtml(item.ssoText || "(无 SSO)")}</pre>
+              </div>
+            </div>
+          </div>`;
+        listEl.appendChild(el);
+      }
+    }
+
+    function escapeHtml(s) {
+      return String(s)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+
+    function findItem(index) {
+      return items.find((x) => x.index === Number(index));
+    }
+
+    listEl.addEventListener("click", async (ev) => {
+      const btn = ev.target.closest("button[data-act]");
+      if (!btn) return;
+      const item = findItem(btn.dataset.i);
+      if (!item || !item.ok) return;
+      const act = btn.dataset.act;
+      if (act === "json" || act === "both") {
+        downloadBlob(item.jsonName, item.jsonText, "application/json;charset=utf-8");
+      }
+      if ((act === "sso" || act === "both") && item.hasSso) {
+        if (act === "both") await sleep(180);
+        downloadBlob(item.ssoName, item.ssoText + "\n", "text/plain;charset=utf-8");
+      }
+      if (act === "copy-json") {
+        await copyText(item.jsonText);
+        toast("已复制 JSON");
+      }
+      if (act === "copy-sso") {
+        await copyText(item.ssoText);
+        toast("已复制 SSO");
+      }
+      if (act === "json") toast(`已下载 ${item.jsonName}`);
+      if (act === "sso") toast(`已下载 ${item.ssoName}`);
+      if (act === "both") toast(`已下载 ${item.jsonName} + ${item.ssoName}`);
+    });
+
+    $("btnParse").onclick = parseAll;
+    $("btnDownloadZip").onclick = downloadZip;
+    $("btnDownloadAll").onclick = () => downloadAll();
+    $("btnDownloadJsonAll").onclick = () => downloadAll({ jsonOnly: true });
+    $("btnDownloadSsoAll").onclick = () => downloadAll({ ssoOnly: true });
+    $("btnCopySummary").onclick = async () => {
+      await copyText(buildSummaryText());
+      toast("已复制摘要");
+    };
+    $("btnClear").onclick = () => {
+      inputEl.value = "";
+      items = [];
+      render();
+      toast("已清空");
+    };
+    prettyEl.onchange = () => {
+      if (items.some((x) => x.ok)) parseAll();
+    };
+
+    document.addEventListener("dragover", (e) => e.preventDefault());
+    document.addEventListener("drop", async (e) => {
+      e.preventDefault();
+      const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+      if (!file) return;
+      const text = await file.text();
+      inputEl.value = text;
+      parseAll();
+      toast(`已载入 ${file.name}`);
+    });
+
+    render();
+  </script>
+</body>
+</html>

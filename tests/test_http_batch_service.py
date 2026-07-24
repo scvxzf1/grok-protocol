@@ -2,6 +2,7 @@ import json
 import os
 import stat
 import tempfile
+import time
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -1160,6 +1161,150 @@ class EmbeddedProxyBatchServiceTests(unittest.TestCase):
             self.assertEqual(pr.get("healthy"), 1)
             manager.probe_all.assert_called_once()
 
+    def test_refresh_embedded_node_pool_fetch_reload_probe(self):
+        with tempfile.TemporaryDirectory() as d:
+            service = self._service(
+                Path(d),
+                {
+                    "embedded_proxy_refresh_fetch_subscription": True,
+                    "embedded_proxy_refresh_export_healthy": False,
+                },
+            )
+            fetch_ret = {
+                "cached_node_count": 4,
+                "message": "cached",
+                "cache": {"count": 4},
+            }
+            reload_ret = {
+                "enabled": True,
+                "running": True,
+                "healthy": 2,
+                "total": 4,
+                "leases": 0,
+                "nodes": [],
+                "phase": "ready",
+            }
+            probe_ret = {
+                "enabled": True,
+                "running": True,
+                "healthy": 2,
+                "total": 4,
+                "leases": 0,
+                "nodes": [],
+                "phase": "ready",
+                "message": "探测完成：健康 2/4",
+                "cache": {"count": 4},
+            }
+            with mock.patch.object(
+                service, "fetch_embedded_subscription_nodes", return_value=fetch_ret
+            ) as fetch, mock.patch.object(
+                service, "ensure_embedded_proxy", return_value=reload_ret
+            ) as ensure, mock.patch.object(
+                service, "probe_embedded_proxy", return_value=probe_ret
+            ) as probe, mock.patch.object(
+                service, "export_embedded_nodes_to_proxy_pool"
+            ) as export, mock.patch.object(
+                service, "get_embedded_proxy_status", return_value=probe_ret
+            ), mock.patch.object(
+                service, "is_busy", return_value=False
+            ):
+                out = service.refresh_embedded_node_pool()
+            self.assertTrue(out.get("ok"))
+            self.assertEqual(out.get("healthy"), 2)
+            self.assertEqual(out.get("total"), 4)
+            self.assertEqual(out.get("cached_node_count"), 4)
+            self.assertTrue((out.get("steps") or {}).get("fetch_subscription"))
+            self.assertTrue((out.get("steps") or {}).get("reload"))
+            self.assertTrue((out.get("steps") or {}).get("probe"))
+            self.assertFalse((out.get("steps") or {}).get("export_healthy"))
+            self.assertIn("健康 2/4", str(out.get("message") or ""))
+            fetch.assert_called_once()
+            ensure.assert_called_once_with(force_reload=True)
+            probe.assert_called_once()
+            export.assert_not_called()
+
+    def test_refresh_embedded_node_pool_export_and_busy(self):
+        with tempfile.TemporaryDirectory() as d:
+            service = self._service(
+                Path(d),
+                {
+                    "embedded_proxy_refresh_fetch_subscription": False,
+                    "embedded_proxy_refresh_export_healthy": True,
+                },
+            )
+            reload_ret = {
+                "enabled": True,
+                "running": True,
+                "healthy": 1,
+                "total": 2,
+                "leases": 0,
+                "nodes": [],
+                "phase": "ready",
+            }
+            probe_ret = dict(reload_ret)
+            probe_ret.update({"message": "探测完成：健康 1/2", "cache": {"count": 2}})
+            export_ret = {
+                "ok": True,
+                "exported_count": 1,
+                "proxy_pool": {"text": "http://127.0.0.1:28001\n", "line_count": 1},
+            }
+            with mock.patch.object(
+                service, "fetch_embedded_subscription_nodes"
+            ) as fetch, mock.patch.object(
+                service, "ensure_embedded_proxy", return_value=reload_ret
+            ), mock.patch.object(
+                service, "probe_embedded_proxy", return_value=probe_ret
+            ), mock.patch.object(
+                service, "export_embedded_nodes_to_proxy_pool", return_value=export_ret
+            ) as export, mock.patch.object(
+                service, "get_embedded_proxy_status", return_value=probe_ret
+            ), mock.patch.object(
+                service, "is_busy", return_value=False
+            ):
+                out = service.refresh_embedded_node_pool()
+            self.assertTrue(out.get("ok"))
+            self.assertFalse((out.get("steps") or {}).get("fetch_subscription"))
+            self.assertTrue((out.get("steps") or {}).get("export_healthy"))
+            self.assertEqual((out.get("export") or {}).get("exported_count"), 1)
+            fetch.assert_not_called()
+            export.assert_called_once()
+
+            with mock.patch.object(service, "is_busy", return_value=True):
+                with self.assertRaises(svc.BatchBusyError):
+                    service.refresh_embedded_node_pool(fetch_subscription=True, reload=True)
+
+    def test_config_center_persists_refresh_node_pool_fields(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            cfg = root / "config.json"
+            cfg.write_text(
+                json.dumps(
+                    {
+                        "email_provider": "yyds",
+                        "yyds_api_key": "k",
+                        "turnstile_provider": "local",
+                        "register_count": 1,
+                        "concurrent_workers": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            service = svc.BatchService(config_path=cfg, root_dir=root)
+            updated = service.update_config_center(
+                {
+                    "fields": {
+                        "embedded_proxy_refresh_fetch_subscription": False,
+                        "embedded_proxy_refresh_export_healthy": True,
+                    }
+                }
+            )
+            fields = updated["fields"]
+            self.assertFalse(fields["embedded_proxy_refresh_fetch_subscription"])
+            self.assertTrue(fields["embedded_proxy_refresh_export_healthy"])
+            disk = json.loads(cfg.read_text(encoding="utf-8"))
+            self.assertFalse(disk.get("embedded_proxy_refresh_fetch_subscription"))
+            self.assertTrue(disk.get("embedded_proxy_refresh_export_healthy"))
+
     def test_config_center_persists_turnstile_proxy_fields_and_pool(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
@@ -1430,6 +1575,42 @@ class EmbeddedProxyAssignmentTests(unittest.TestCase):
         self.assertFalse(manager.release.call_args.kwargs.get("failed"))
         self.assertEqual(worker.status, "succeeded")
 
+    def test_proxy_transport_exit_without_log_markers_still_retries(self):
+        plan = self._make_plan(embedded=True, max_retries=3, count=1)
+        runner = svc.BatchRunner(plan)
+        manager = mock.Mock()
+        manager.acquire.side_effect = [
+            self._node("n1", "jp", 28001),
+            self._node("n2", "sg", 28002),
+        ]
+        runner.embedded_proxy_manager = manager
+        worker = svc.WorkerState(index=1)
+        runner.workers = [worker]
+        runner.worker_by_index = {1: worker}
+        worker.accounts_path = Path("accounts_001.txt")
+        worker.log_path = Path("worker_001.log")
+        self.assertTrue(runner._acquire_embedded_proxy(worker))
+        worker.status = "running"
+        worker.process = mock.Mock()
+        worker.process.poll.return_value = 3
+        worker.last_log = ""
+
+        def fake_spawn(w, *, acquire_proxy=True):
+            if acquire_proxy and runner.plan.embedded_proxy_enabled and not w.proxy_node_id:
+                assert runner._acquire_embedded_proxy(w)
+            w.status = "running"
+            w.process = mock.Mock()
+            w.process.poll.return_value = None
+            return True
+
+        with mock.patch.object(Path, "is_file", return_value=True), mock.patch.object(
+            Path, "read_text", return_value=""
+        ), mock.patch.object(runner, "_spawn_one", side_effect=fake_spawn):
+            runner._check_processes()
+        self.assertEqual(worker.status, "running")
+        self.assertEqual(worker.proxy_node_id, "n2")
+        self.assertIn("n1", worker.tried_node_ids)
+
     def test_start_run_ensures_embedded_proxy(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
@@ -1697,6 +1878,51 @@ class StaticHttpProxyLeaseTests(unittest.TestCase):
             self.assertEqual(len(runner.active), 4)
             self.assertEqual(sum(bool(w.manual_proxy) for w in runner.active), 1)
             self.assertEqual(sum(bool(w.proxy_node_id) for w in runner.active), 3)
+
+    def test_hybrid_prefers_embedded_when_http_pool_is_exhausted(self):
+        class Manager:
+            def __init__(self):
+                self.acquire_calls = 0
+
+            def status(self):
+                return {"running": True, "healthy": 5, "total": 5}
+
+            def acquire(self, exclude_ids=()):
+                from embedded_proxy_manager import NodeSlot
+
+                self.acquire_calls += 1
+                return NodeSlot(
+                    id=f"node-{self.acquire_calls}",
+                    name=f"node-{self.acquire_calls}",
+                    server="node.example",
+                    port=443,
+                    protocol="vless",
+                    local_http=f"http://127.0.0.1:{28010 + self.acquire_calls}",
+                    healthy=True,
+                    ref_count=1,
+                )
+
+            def release(self, node_id, **kwargs):
+                return None
+
+        with tempfile.TemporaryDirectory() as d:
+            runner, _source, _entries = self._runner(
+                Path(d), proxy_count=1, workers=2, count=2, embedded=True
+            )
+            manager = Manager()
+            runner.embedded_proxy_manager = manager
+            # Burn the single HTTP lease and cool it so available_lease_count == 0.
+            burner = svc.WorkerState(index=99)
+            self.assertTrue(runner._acquire_manual_proxy(burner))
+            runner._release_manual_proxy(burner, success=False, reason="curl: (56)")
+            self.assertEqual(runner._manual_proxy_rotator.available_lease_count(), 0)
+
+            worker = svc.WorkerState(index=1)
+            self.assertTrue(runner._acquire_worker_proxy(worker))
+            self.assertTrue(worker.proxy_node_id)
+            self.assertFalse(worker.manual_proxy)
+            self.assertEqual(manager.acquire_calls, 1)
+            self.assertGreater(runner._hybrid_prefer_embedded_until, time.time())
 
     def test_local_turnstile_shares_registration_route_unless_dedicated(self):
         with tempfile.TemporaryDirectory() as d:

@@ -49,6 +49,9 @@ from local_paths import (
     FIXTURES_DIR as LOCAL_FIXTURES_DIR,
     LOCAL_ROOT,
     RUNS_DIR as LOCAL_RUNS_DIR,
+    iter_readable_files,
+    path_is_file,
+    path_mtime,
 )
 
 
@@ -815,16 +818,21 @@ def require_proxy_pool_source(settings: Settings, expected: str, *, action: str)
 
 PROXY_FAILURE_MARKERS = (
     "CONNECT tunnel failed",
+    "Proxy CONNECT aborted",
     "ProxyError",
     "Connection refused",
+    "Connection reset by peer",
+    "Recv failure",
     "curl: (56)",
     "curl: (7)",
+    "curl: (28)",
     "curl: (35)",
     "TLS connect error",
     "OPENSSL_internal",
     "Tunnel connection failed",
     "407 Proxy Authentication Required",
     "Read timed out",
+    "Connection timed out",
     # Cloudflare / xAI egress quality failures: rotate the node.
     "abusive traffic patterns",
     "Blocked due to abusive traffic",
@@ -834,6 +842,7 @@ PROXY_FAILURE_MARKERS = (
     "与页面的连接已断开",
     "浏览器启动/连接失败",
     "token_len=0",
+    "proxy_transport_exit",
 )
 
 # Challenge, mail, and token-verify issues should not burn embedded proxy retries.
@@ -882,11 +891,17 @@ def _looks_like_proxy_failure(text: str) -> bool:
         "curl: (35)",
         "curl: (56)",
         "curl: (7)",
+        "curl: (28)",
         "tls connect error",
         "openssl_internal",
         "connect tunnel failed",
+        "proxy connect aborted",
         "proxyerror",
         "connection refused",
+        "connection reset by peer",
+        "recv failure",
+        "connection timed out",
+        "proxy_transport_exit",
         "打开注册页 http 403",
     )
     last_strong_signal = max((lower.rfind(sig) for sig in strong_proxy_signals), default=-1)
@@ -1100,7 +1115,7 @@ def resolve_yyds_create_spacing_sec(
 
 
 def resolve_local_turnstile_max_inflight_cfg(config: object = None, *, strict: bool = False) -> int:
-    """UI/config helper for cross-process local Turnstile inflight slots (1-12)."""
+    """UI/config helper for cross-process local Turnstile inflight slots (1-6666)."""
     try:
         from xai_http_flow import resolve_local_turnstile_max_inflight
     except Exception:
@@ -1113,8 +1128,19 @@ def resolve_local_turnstile_max_inflight_cfg(config: object = None, *, strict: b
             value = int(float(raw if raw is not None else 2))
         except Exception:
             value = 2
-        return max(1, min(12, value))
-    return int(resolve_local_turnstile_max_inflight(config if isinstance(config, dict) else None, strict=strict))
+        return max(1, min(ABS_MAX_LOCAL_TURNSTILE_WORKERS, value))
+    try:
+        return int(
+            resolve_local_turnstile_max_inflight(
+                config if isinstance(config, dict) else None,
+                strict=strict,
+            )
+        )
+    except ValueError as exc:
+        # Config-center save path expects TuiConfigError → HTTP 400, not a 500.
+        if strict:
+            raise TuiConfigError(str(exc)) from exc
+        raise
 
 
 def resolve_local_turnstile_max_workers(
@@ -1649,9 +1675,14 @@ def classify_failure_text(text: str) -> str:
     if (
         "curl: (56)" in t
         or "curl: (7)" in t
+        or "curl: (28)" in t
         or "proxyerror" in t
+        or "proxy connect aborted" in t
+        or "connection reset by peer" in t
+        or "recv failure" in t
         or "407" in t
         or "connect tunnel failed" in t
+        or "proxy_transport_exit" in t
         or "没有可用的内嵌代理节点" in raw
         or "内嵌代理" in raw and "未就绪" in raw
     ):
@@ -1725,6 +1756,10 @@ class BatchRunner:
         # Carry its proxy-attempt budget across that replacement so a fixed
         # count run cannot refill forever on permanently failing routes.
         self._static_proxy_retry_queue: Deque[int] = deque()
+        # Hybrid preference memory: when the HTTP subscription pool collapses,
+        # bias future acquires toward embedded mihomo until HTTP recovers.
+        self._hybrid_prefer_embedded_until: float = 0.0
+        self._last_hybrid_bias_log_at: float = 0.0
 
     @staticmethod
     def _free_loopback_port() -> int:
@@ -2994,10 +3029,14 @@ class BatchRunner:
             self._log(f"W{worker.index:02d}", worker.last_log)
             return False
         lease = None
-        if self._uses_static_proxy_leases():
+        proxy = ""
+        # Prefer exclusive leases even outside the sticky-snapshot path so concurrent
+        # workers cannot all pile onto the same already-failing HTTP endpoint.
+        if hasattr(rotator, "acquire_lease"):
             lease = rotator.acquire_lease(owner=f"worker-{worker.index}")
             proxy = str(getattr(lease, "proxy", "") or "").strip()
-        else:
+        if not proxy and not self._uses_static_proxy_leases():
+            # Legacy rotator without lease API.
             proxy = str(rotator.next() or "").strip()
         if not proxy:
             worker.last_log = "HTTP 代理池暂时无空闲健康租约（可能占用中或冷却中）"
@@ -3022,11 +3061,51 @@ class BatchRunner:
         )
         return True
 
+    def _http_pool_available_count(self) -> int:
+        """Healthy free HTTP routes currently leaseable (0 when pool inactive)."""
+        if not self._http_proxy_pool_active():
+            return 0
+        rotator = self._ensure_manual_proxy_rotator()
+        if rotator is None:
+            return 0
+        try:
+            if hasattr(rotator, "available_lease_count"):
+                return max(0, int(rotator.available_lease_count() or 0))
+            return max(0, int(len(rotator)))
+        except Exception:
+            return 0
+
+    def _note_http_pool_exhausted(self, reason: str = "") -> None:
+        """Temporarily prefer embedded nodes after HTTP pool dry-outs."""
+        if not self.plan.embedded_proxy_enabled:
+            return
+        now = time.time()
+        # Keep bias sticky long enough to skip a few dead HTTP attempts.
+        self._hybrid_prefer_embedded_until = max(
+            float(self._hybrid_prefer_embedded_until or 0.0),
+            now + 45.0,
+        )
+        if (now - float(self._last_hybrid_bias_log_at or 0.0)) >= 15.0:
+            self._last_hybrid_bias_log_at = now
+            detail = _safe_text(reason, 80)
+            self._log(
+                "SYSTEM",
+                f"[Proxy] HTTP 池暂不可用，优先内嵌节点 45s"
+                + (f" | {detail}" if detail else ""),
+            )
+
+    def _note_http_pool_healthy(self) -> None:
+        """Clear hybrid bias once an HTTP route is successfully leased."""
+        if float(self._hybrid_prefer_embedded_until or 0.0) > 0:
+            self._hybrid_prefer_embedded_until = 0.0
+
     def _acquire_worker_proxy(self, worker: WorkerState) -> bool:
         """Acquire egress for one worker: embedded mihomo and/or HTTP pool (hybrid).
 
-        Preference is round-robin when both sources are available, with fallback
-        to the other source if the preferred one has no free node/proxy.
+        Preference is round-robin when both sources look healthy.  When the HTTP
+        subscription pool has no free healthy lease (or recently collapsed),
+        embedded mihomo is tried first so dead best-cn HTTP routes do not burn
+        half of every hybrid attempt budget.
         """
         use_embedded = bool(self.plan.embedded_proxy_enabled)
         use_http = bool(self._http_proxy_pool_active())
@@ -3035,10 +3114,19 @@ class BatchRunner:
 
         order: List[str] = []
         if use_embedded and use_http:
-            # Round-robin so best-cn HTTP and mihomo nodes share registration load.
-            seq = int(getattr(self, "_hybrid_proxy_seq", 0) or 0)
-            self._hybrid_proxy_seq = seq + 1
-            order = ["http", "embedded"] if (seq % 2) else ["embedded", "http"]
+            now = time.time()
+            prefer_embedded = now < float(self._hybrid_prefer_embedded_until or 0.0)
+            http_free = self._http_pool_available_count()
+            if http_free <= 0:
+                prefer_embedded = True
+                self._note_http_pool_exhausted("available=0")
+            if prefer_embedded:
+                order = ["embedded", "http"]
+            else:
+                # Round-robin so best-cn HTTP and mihomo nodes share load.
+                seq = int(getattr(self, "_hybrid_proxy_seq", 0) or 0)
+                self._hybrid_proxy_seq = seq + 1
+                order = ["http", "embedded"] if (seq % 2) else ["embedded", "http"]
         elif use_embedded:
             order = ["embedded"]
         else:
@@ -3057,8 +3145,11 @@ class BatchRunner:
                 if worker.proxy_node_id:
                     self._release_embedded_proxy(worker, failed=False)
                 if self._acquire_manual_proxy(worker):
+                    self._note_http_pool_healthy()
                     return True
-                errors.append(worker.last_log or "HTTP 代理池无可用代理")
+                msg = worker.last_log or "HTTP 代理池无可用代理"
+                errors.append(msg)
+                self._note_http_pool_exhausted(msg)
 
         worker.last_log = " / ".join([e for e in errors if e][:2]) or "没有可用代理"
         self._log(f"W{worker.index:02d}", worker.last_log)
@@ -3131,7 +3222,20 @@ class BatchRunner:
                 parts.append(worker.log_path.read_text(encoding="utf-8", errors="replace")[-4000:])
             except OSError:
                 pass
-        return "\n".join(str(p) for p in parts if p)
+        blob = "\n".join(str(p) for p in parts if p)
+        # Early transport crashes often leave only "协议任务退出，退出码 3" in the
+        # parent reason while the worker log already has curl CONNECT/TLS detail.
+        # When the combined blob still has no proxy marker, treat abrupt non-zero
+        # exits on an assigned egress as infrastructure failures so hybrid can
+        # rotate instead of charging a business failure to a dead route.
+        if blob and not _looks_like_proxy_failure(blob):
+            has_route = bool(worker.proxy_node_id or worker.manual_proxy or worker.proxy_local_http)
+            code = worker.return_code
+            if has_route and code not in (None, 0) and (
+                "协议任务退出" in blob or "退出码" in blob
+            ):
+                blob = f"{blob}\nproxy_transport_exit code={code}"
+        return blob
 
     @staticmethod
     def _uses_independent_turnstile_route_for_failure(
@@ -3330,7 +3434,9 @@ class BatchRunner:
                 inflight = resolve_local_turnstile_max_inflight_cfg(cfg_for_env, strict=False)
             except Exception:
                 inflight = 2
-            child_env["XAI_LOCAL_TURNSTILE_MAX_INFLIGHT"] = str(max(1, min(12, int(inflight))))
+            child_env["XAI_LOCAL_TURNSTILE_MAX_INFLIGHT"] = str(
+                max(1, min(ABS_MAX_LOCAL_TURNSTILE_WORKERS, int(inflight)))
+            )
             child_env["XAI_CONFIG_PATH"] = str(self.plan.config_path)
             child_env["XAI_MAIL_CONFIG"] = str(self.plan.config_path)
             process = subprocess.Popen(
@@ -4078,16 +4184,66 @@ def _credential_single_line(text: object) -> str:
     )
 
 
+def _mask_credential_identity(value: object) -> str:
+    """Mask credential filenames/emails for the default browser listing."""
+    text_value = str(value or "").strip()
+    if not text_value:
+        return "-"
+    if "@" in text_value:
+        local, domain = text_value.rsplit("@", 1)
+        if len(local) <= 2:
+            masked_local = (local[:1] or "*") + "*"
+        else:
+            masked_local = local[:2] + "***" + local[-1:]
+        return f"{masked_local}@{domain}"
+    if len(text_value) <= 6:
+        return text_value[:1] + "***"
+    return text_value[:3] + "***" + text_value[-2:]
+
+
+def _credential_summary(json_text: str, json_path: Path, *, has_sso: bool, mtime: float) -> Dict[str, object]:
+    """Return non-secret metadata suitable for the default credentials page."""
+    payload: Dict[str, object] = {}
+    try:
+        loaded = json.loads(json_text)
+        if isinstance(loaded, dict):
+            payload = loaded
+    except Exception:
+        payload = {}
+
+    email = str(payload.get("email") or "").strip()
+    account_id = str(payload.get("account_id") or payload.get("accountId") or "").strip()
+    token = str(
+        payload.get("api_token")
+        or payload.get("access_token")
+        or payload.get("token")
+        or ""
+    ).strip()
+    password = str(payload.get("password") or "").strip()
+    identity = email or json_path.stem
+    return {
+        "display_name": _mask_credential_identity(identity),
+        "display_email": _mask_credential_identity(email) if email else "-",
+        "account_id_hint": (account_id[:8] + "…" + account_id[-4:]) if len(account_id) > 14 else (account_id or "-"),
+        "has_password": bool(password),
+        "has_token": bool(token),
+        "has_sso": bool(has_sso),
+        "mtime": float(mtime or 0),
+    }
+
+
 def list_credential_pairs(
     output_dir: Path,
     *,
     page: int = 1,
     page_size: int = 1000,
+    include_secrets: bool = True,
 ) -> Dict[str, object]:
     """List credential JSON + matching SSO pairs as plain text lines.
 
     Line format: ``<json-full-text>____<sso-full-text>``
     Only ``*.json`` files are primary rows; missing ``.sso`` yields an empty right side.
+    When include_secrets=False, return redacted metadata only.
     """
     directory = Path(output_dir).expanduser()
     try:
@@ -4099,35 +4255,50 @@ def list_credential_pairs(
     size_i = max(1, min(1000, int(page_size or 1000)))
 
     rows: list[Dict[str, object]] = []
-    if directory.is_dir():
-        json_files = [p for p in directory.iterdir() if p.is_file() and p.suffix.lower() == ".json"]
-        json_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    skipped_unreadable: list[str] = []
+    try:
+        directory_exists = directory.is_dir()
+    except OSError:
+        directory_exists = False
+    if directory_exists:
+        # Skip ghost/corrupt FS entries (e.g. damaged NTFS MFT records that
+        # still appear in readdir but raise EINVAL on stat/open).
+        json_files, skipped_unreadable = iter_readable_files(
+            directory,
+            suffixes=(".json",),
+            sort_by_mtime=True,
+        )
         for json_path in json_files:
             try:
                 json_text = json_path.read_text(encoding="utf-8", errors="replace")
             except OSError:
+                skipped_unreadable.append(json_path.name)
                 continue
             sso_path = json_path.with_suffix(".sso")
             sso_text = ""
-            if sso_path.is_file():
+            has_sso = path_is_file(sso_path)
+            if has_sso:
                 try:
                     sso_text = sso_path.read_text(encoding="utf-8", errors="replace")
                 except OSError:
+                    # JSON is usable; treat the matching SSO as missing.
                     sso_text = ""
+                    has_sso = False
             left = _credential_single_line(json_text)
             right = _credential_single_line(sso_text)
-            rows.append(
-                {
-                    "name": json_path.stem,
-                    "json_name": json_path.name,
-                    "json_path": str(json_path),
-                    "sso_name": sso_path.name if sso_path.is_file() else "",
-                    "sso_path": str(sso_path) if sso_path.is_file() else "",
-                    "has_sso": bool(sso_path.is_file()),
-                    "mtime": float(json_path.stat().st_mtime),
-                    "line": f"{left}____{right}",
-                }
-            )
+            mtime = path_mtime(json_path, 0.0)
+            row: Dict[str, object] = {
+                "name": json_path.stem,
+                "json_name": json_path.name,
+                "json_path": str(json_path),
+                "sso_name": sso_path.name if has_sso else "",
+                "sso_path": str(sso_path) if has_sso else "",
+                "has_sso": has_sso,
+                "mtime": mtime,
+                "line": f"{left}____{right}",
+            }
+            row.update(_credential_summary(json_text, json_path, has_sso=has_sso, mtime=mtime))
+            rows.append(row)
 
     total = len(rows)
     total_pages = max(1, (total + size_i - 1) // size_i) if total else 1
@@ -4138,24 +4309,39 @@ def list_credential_pairs(
     page_rows = rows[start:end]
     return {
         "output_dir": str(directory),
-        "exists": directory.is_dir(),
+        "exists": directory_exists,
         "total": total,
         "page": page_i,
         "page_size": size_i,
         "total_pages": total_pages,
+        "revealed": bool(include_secrets),
+        "skipped_unreadable_count": len(skipped_unreadable),
+        "skipped_unreadable": skipped_unreadable,
         "items": [
             {
-                "name": r["name"],
-                "json_name": r["json_name"],
-                "json_path": r.get("json_path") or "",
-                "sso_name": r["sso_name"],
-                "sso_path": r.get("sso_path") or "",
-                "has_sso": r["has_sso"],
-                "line": r["line"],
+                "display_name": r.get("display_name") or "-",
+                "display_email": r.get("display_email") or "-",
+                "account_id_hint": r.get("account_id_hint") or "-",
+                "has_password": bool(r.get("has_password")),
+                "has_token": bool(r.get("has_token")),
+                "has_sso": bool(r.get("has_sso")),
+                "mtime": float(r.get("mtime") or 0),
+                **(
+                    {
+                        "name": r["name"],
+                        "json_name": r["json_name"],
+                        "json_path": r.get("json_path") or "",
+                        "sso_name": r["sso_name"],
+                        "sso_path": r.get("sso_path") or "",
+                        "line": r["line"],
+                    }
+                    if include_secrets
+                    else {}
+                ),
             }
             for r in page_rows
         ],
-        "text": "\n".join(str(r["line"]) for r in page_rows),
+        "text": "\n".join(str(r["line"]) for r in page_rows) if include_secrets else "",
     }
 
 
@@ -4178,7 +4364,13 @@ def export_credential_page_and_delete(
     """
     from datetime import datetime
 
-    page_data = list_credential_pairs(output_dir, page=page, page_size=page_size)
+    # Export is an explicit destructive action and needs source paths + raw lines.
+    page_data = list_credential_pairs(
+        output_dir,
+        page=page,
+        page_size=page_size,
+        include_secrets=True,
+    )
     items = list(page_data.get("items") or [])
     if not items:
         raise TuiConfigError("当前页没有可导出的凭证")
@@ -4233,7 +4425,8 @@ def export_credential_page_and_delete(
             except ValueError:
                 delete_errors.append(f"拒绝删除目录外文件: {resolved}")
                 continue
-            if not resolved.is_file():
+            if not path_is_file(resolved):
+                # Missing or unreadable (corrupt FS entry) — do not fail export.
                 continue
             try:
                 resolved.unlink()
@@ -4744,6 +4937,16 @@ def build_config_center(settings: Settings) -> Dict[str, object]:
             "turnstile_headless": bool(settings.turnstile_headless),
             "local_turnstile_max_workers": resolve_local_turnstile_max_workers(raw, strict=False),
             "local_turnstile_max_inflight": resolve_local_turnstile_max_inflight_cfg(raw, strict=False),
+            "local_turnstile_block_assets": (
+                True
+                if "local_turnstile_block_assets" not in raw
+                else _as_bool(raw.get("local_turnstile_block_assets"))
+            ),
+            "local_turnstile_shared_cache": (
+                True
+                if "local_turnstile_shared_cache" not in raw
+                else _as_bool(raw.get("local_turnstile_shared_cache"))
+            ),
             "submit_workers": max(
                 1,
                 min(
@@ -4827,6 +5030,12 @@ def build_config_center(settings: Settings) -> Dict[str, object]:
                 minimum=0,
                 maximum=20,
                 default=3,
+            ),
+            "embedded_proxy_refresh_fetch_subscription": _as_bool(
+                raw.get("embedded_proxy_refresh_fetch_subscription", True)
+            ),
+            "embedded_proxy_refresh_export_healthy": _as_bool(
+                raw.get("embedded_proxy_refresh_export_healthy", False)
             ),
             "proxy_random": _as_bool(raw.get("proxy_random")),
             "proxy_rotate_session": _as_bool(raw.get("proxy_rotate_session")),
@@ -5152,8 +5361,12 @@ class BatchService:
             "cpa_use_local_name",
             "cpa_skip_duplicates",
             "embedded_proxy_enabled",
+            "embedded_proxy_refresh_fetch_subscription",
+            "embedded_proxy_refresh_export_healthy",
             "turnstile_proxy_enabled",
             "turnstile_proxy_random",
+            "local_turnstile_block_assets",
+            "local_turnstile_shared_cache",
         ]
         for key in bool_keys:
             if key in fields:
@@ -5322,9 +5535,23 @@ class BatchService:
             _load_runtime_fields(self.settings)
         return self.get_config_center()
 
-    def list_credentials(self, *, page: int = 1, page_size: int = 1000) -> Dict[str, object]:
-        """Return paginated plaintext credential lines from the OAuth output directory."""
-        return list_credential_pairs(self.settings.output_dir, page=page, page_size=page_size)
+    def list_credentials(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 1000,
+        reveal: bool = True,
+    ) -> Dict[str, object]:
+        """Return paginated plaintext credential lines from the OAuth output directory.
+
+        reveal remains accepted for compatibility; default is full plaintext.
+        """
+        return list_credential_pairs(
+            self.settings.output_dir,
+            page=page,
+            page_size=page_size,
+            include_secrets=bool(reveal),
+        )
 
     def export_dir(self) -> Path:
         return resolve_export_dir(self.config_path.parent)
@@ -5814,22 +6041,54 @@ class BatchService:
     def _write_vless_cache(self, slots, *, urls: Optional[List[str]] = None) -> Path:
         return self._write_embedded_node_cache(slots, urls=urls)
 
+    def _legacy_embedded_node_cache_paths(self) -> List[Path]:
+        """Pre-local_paths cache locations kept for soft migration."""
+        root = Path(self.config_path).expanduser().resolve(strict=False).parent
+        return [
+            root / ".embedded_mihomo" / "nodes.txt",
+            root / ".embedded_mihomo" / "vless_nodes.txt",
+            root / "embedded_mihomo" / "nodes.txt",
+            root / "embedded_mihomo" / "vless_nodes.txt",
+        ]
+
     def _read_embedded_node_cache_lines(self) -> List[str]:
         from embedded_proxy_manager import is_embedded_share_link
 
-        candidates = [self.embedded_node_cache_path(), self.embedded_vless_cache_path()]
+        primary = self.embedded_node_cache_path()
+        candidates = [primary, self.embedded_vless_cache_path()]
+        candidates.extend(self._legacy_embedded_node_cache_paths())
+        seen: set[str] = set()
         for path in candidates:
+            key = str(path)
+            if key in seen:
+                continue
+            seen.add(key)
             if not path.is_file():
                 continue
             out: List[str] = []
-            for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                raw_text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for line in raw_text.splitlines():
                 text = line.strip()
                 if not text or text.startswith("#"):
                     continue
                 if is_embedded_share_link(text):
                     out.append(text)
-            if out:
-                return out
+            if not out:
+                continue
+            # Soft-migrate legacy root cache into the post-PR state path once.
+            try:
+                if path.resolve(strict=False) != primary.resolve(strict=False) and not primary.is_file():
+                    primary.parent.mkdir(parents=True, exist_ok=True)
+                    primary.write_text(raw_text if raw_text.endswith("\n") else raw_text + "\n", encoding="utf-8")
+                    legacy_vless = self.embedded_vless_cache_path()
+                    if not legacy_vless.is_file():
+                        legacy_vless.write_text(primary.read_text(encoding="utf-8"), encoding="utf-8")
+            except OSError:
+                pass
+            return out
         return []
 
     def _read_vless_cache_lines(self) -> List[str]:
@@ -6503,6 +6762,175 @@ class BatchService:
             raise BatchBusyError("批次运行中，禁止重载内嵌代理")
         # Force rebuild even if currently running.
         return self.ensure_embedded_proxy(force_reload=True)
+
+    def refresh_embedded_node_pool(
+        self,
+        *,
+        fetch_subscription: Optional[bool] = None,
+        reload: bool = True,
+        probe: bool = True,
+        export_healthy: Optional[bool] = None,
+        urls: object = None,
+        url: str = "",
+        timeout: float = 20.0,
+    ) -> Dict[str, object]:
+        """Manual one-shot: pull subscription → reload pool → probe → optional export.
+
+        Defaults for fetch/export come from config:
+          - embedded_proxy_refresh_fetch_subscription (default True)
+          - embedded_proxy_refresh_export_healthy (default False)
+        """
+        cfg = dict(self.settings.config or {})
+        do_fetch = (
+            bool(fetch_subscription)
+            if fetch_subscription is not None
+            else _as_bool(cfg.get("embedded_proxy_refresh_fetch_subscription", True))
+        )
+        do_export = (
+            bool(export_healthy)
+            if export_healthy is not None
+            else _as_bool(cfg.get("embedded_proxy_refresh_export_healthy", False))
+        )
+        do_reload = bool(reload)
+        do_probe = bool(probe)
+
+        if (do_reload or do_fetch) and self.is_busy():
+            raise BatchBusyError("批次运行中，禁止刷新/重载节点池（可先停止任务，或仅探测：reload=false,fetch_subscription=false）")
+
+        # Enable node pool so subsequent ensure/probe work.
+        if not _as_bool(cfg.get("embedded_proxy_enabled")):
+            cfg["embedded_proxy_enabled"] = True
+            self.settings.config = cfg
+            persist_settings(self.settings)
+            self.settings.config = _read_config(self.settings.config_path)
+            _load_runtime_fields(self.settings)
+            cfg = dict(self.settings.config or {})
+
+        steps: Dict[str, object] = {
+            "fetch_subscription": do_fetch,
+            "reload": do_reload,
+            "probe": do_probe,
+            "export_healthy": do_export,
+        }
+        fetch_result: Optional[Dict[str, object]] = None
+        reload_result: Optional[Dict[str, object]] = None
+        probe_result: Optional[Dict[str, object]] = None
+        export_result: Optional[Dict[str, object]] = None
+
+        self._set_embedded_boot(
+            phase="starting",
+            message="正在刷新节点池…",
+            auto=False,
+        )
+
+        try:
+            if do_fetch:
+                self._set_embedded_boot(phase="starting", message="刷新中：拉取订阅…")
+                fetch_result = self.fetch_embedded_subscription_nodes(
+                    urls=urls,
+                    url=url,
+                    timeout=float(timeout or 20.0),
+                )
+
+            if do_reload:
+                self._set_embedded_boot(phase="starting", message="刷新中：重载 mihomo…")
+                reload_result = self.ensure_embedded_proxy(force_reload=True)
+                # ensure already probed; still allow explicit full probe below.
+                if not do_probe and isinstance(reload_result, dict):
+                    probe_result = {
+                        "healthy": reload_result.get("healthy"),
+                        "total": reload_result.get("total"),
+                        "from": "reload",
+                    }
+            elif do_probe:
+                manager = self._embedded_proxy_manager
+                if manager is None or not getattr(manager, "_running", False):
+                    self._set_embedded_boot(phase="starting", message="刷新中：启动 mihomo…")
+                    reload_result = self.ensure_embedded_proxy(force_reload=False)
+                    steps["reload"] = True  # implicit start so probe can run
+                    do_reload = True
+
+            if do_probe:
+                self._set_embedded_boot(phase="starting", message="刷新中：探测节点健康…")
+                probe_result = self.probe_embedded_proxy()
+
+            if do_export:
+                self._set_embedded_boot(phase="starting", message="刷新中：导出健康节点到 HTTP 池…")
+                export_result = self.export_embedded_nodes_to_proxy_pool(
+                    healthy_only=True,
+                    switch_to_manual=True,
+                    set_proxy_mode="pool",
+                    keep_embedded_enabled=True,
+                )
+        except Exception as exc:
+            err = str(exc)
+            self._set_embedded_boot(phase="error", message=f"刷新节点池失败: {err}")
+            raise
+
+        status = self.get_embedded_proxy_status()
+        healthy = int(
+            (probe_result or {}).get("healthy")
+            if probe_result is not None and (probe_result or {}).get("healthy") is not None
+            else status.get("healthy") or 0
+        )
+        total = int(
+            (probe_result or {}).get("total")
+            if probe_result is not None and (probe_result or {}).get("total") is not None
+            else status.get("total") or 0
+        )
+        cached = 0
+        if fetch_result is not None:
+            cached = int(fetch_result.get("cached_node_count") or 0)
+        else:
+            cached = int((status.get("cache") or {}).get("count") or 0)
+
+        parts = []
+        if do_fetch:
+            parts.append(f"缓存 {cached}")
+        if do_reload or steps.get("reload"):
+            parts.append("已重载")
+        if do_probe:
+            parts.append(f"健康 {healthy}/{total}")
+        if do_export and export_result is not None:
+            try:
+                exported_n = int((export_result or {}).get("exported_count") or 0)
+            except (TypeError, ValueError):
+                exported_n = 0
+            parts.append(f"导出 {exported_n} 条")
+        msg = "节点池已刷新：" + (" · ".join(parts) if parts else "完成")
+
+        out: Dict[str, object] = {
+            "ok": True,
+            "enabled": True,
+            "running": bool(status.get("running")),
+            "phase": "ready" if status.get("running") else str(status.get("phase") or "idle"),
+            "message": msg,
+            "healthy": healthy,
+            "total": total,
+            "leases": int(status.get("leases") or 0),
+            "node_count": int(status.get("total") or total or 0),
+            "nodes": status.get("nodes") or [],
+            "cache": status.get("cache") or self.get_embedded_vless_cache_info(),
+            "steps": steps,
+            "fetch": fetch_result,
+            "reload": reload_result,
+            "probe": probe_result,
+            "export": export_result,
+            "cached_node_count": cached,
+        }
+        self._embedded_proxy_last = {
+            "enabled": True,
+            "running": bool(out.get("running")),
+            "total": total,
+            "healthy": healthy,
+            "leases": int(out.get("leases") or 0),
+            "phase": out["phase"],
+            "message": msg,
+            "last_error": "",
+            "cache": out.get("cache"),
+        }
+        self._set_embedded_boot(phase=str(out["phase"]), message=msg, auto=False)
+        return out
 
     def test_proxy_pool(self, *, count: int = 5, text_value: Optional[str] = None, timeout: float = 12.0) -> Dict[str, object]:
         return test_proxy_pool_sample(

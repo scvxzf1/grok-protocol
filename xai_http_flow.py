@@ -51,7 +51,13 @@ from cross_process_lock import (
     ensure_private_file,
 )
 from project_browser_registry import register_project_browser, unregister_project_browser
-from local_paths import ACCOUNTS_DIR, CONFIG_PATH, CREDENTIALS_DIR, STATE_DIR
+from local_paths import (
+    ACCOUNTS_DIR,
+    CONFIG_PATH,
+    CREDENTIALS_DIR,
+    REGISTRATION_INFO_DIR,
+    STATE_DIR,
+)
 
 from turnstile_broker import (
     FingerprintProfile,
@@ -264,9 +270,12 @@ class RegistrationResult:
     email: str
     password: str
     sso: str
+    given_name: str = ""
+    family_name: str = ""
     credential_path: str = ""
     account_path: str = ""
     sso_path: str = ""
+    registration_info_path: str = ""
 
 
 def _log(callback: LogFn, message: str) -> None:
@@ -1613,13 +1622,20 @@ async def _solve_request_async(request: SolveRequest, _sleep: Callable[[float], 
         )
 
     if request.provider == "local":
+        # Batch workers capture stdout into per-worker logs. Keep local browser
+        # diagnostics visible instead of silently dropping them (log_callback=None).
+        def _solver_log(message: str) -> None:
+            text = str(message or "").rstrip()
+            if text:
+                print(text, flush=True)
+
         captured = await asyncio.to_thread(
             _solve_turnstile_local,
             page_url=request.page_url,
             proxy=request.proxy,
             timeout=request.timeout_sec,
             headless=request.headless,
-            log_callback=None,
+            log_callback=_solver_log,
             sitekey=request.sitekey,
             action=request.action,
             cdata=request.cdata,
@@ -1711,7 +1727,15 @@ def solve_turnstile_result(
             workers=selected_workers,
             queue_limit=max(1, int(queue_size or 64)),
         )
-        result = selected_broker.solve_sync(request, _solve_request_async)
+        try:
+            result = selected_broker.solve_sync(request, _solve_request_async)
+        except TimeoutError as exc:
+            # asyncio/concurrent TimeoutError often stringify to "" which made
+            # worker logs look like `err=` with no cause.
+            detail = _safe_error_text(exc) or "budget exhausted"
+            raise VerificationRequiredError(
+                f"Turnstile 求解超时（{request.timeout_sec}s）: {detail}"
+            ) from exc
     token_length = len(str(result.token or "").strip())
     result_extras = result.extras if isinstance(result.extras, dict) else {}
     lease_id = str(result_extras.get("lease_id") or "").strip()
@@ -2783,10 +2807,57 @@ _LOCAL_TURNSTILE_SLOT_DIR = Path(
 )
 DEFAULT_LOCAL_TURNSTILE_MAX_INFLIGHT = 2
 MIN_LOCAL_TURNSTILE_MAX_INFLIGHT = 1
-MAX_LOCAL_TURNSTILE_MAX_INFLIGHT = 12
+MAX_LOCAL_TURNSTILE_MAX_INFLIGHT = 6666
 LOCAL_TURNSTILE_LOCK_TIMEOUT_SEC = configured_lock_timeout(
     "XAI_LOCAL_TURNSTILE_LOCK_TIMEOUT_SEC",
     default=120.0,
+)
+# Shared disk cache across ephemeral profiles (repeat SPA/static downloads).
+_LOCAL_TURNSTILE_DISK_CACHE_DIR = Path(
+    os.environ.get("XAI_LOCAL_TURNSTILE_DISK_CACHE_DIR")
+    or (STATE_DIR / "chrome_disk_cache")
+)
+# Default 256 MiB; enough for signup SPA + Turnstile assets without unbounded growth.
+_LOCAL_TURNSTILE_DISK_CACHE_SIZE = max(
+    32 * 1024 * 1024,
+    int(str(os.environ.get("XAI_LOCAL_TURNSTILE_DISK_CACHE_SIZE") or str(256 * 1024 * 1024)).strip() or str(256 * 1024 * 1024)),
+)
+# Safe-ish traffic cuts for local Chrome: keep document/script/css/xhr/fetch.
+# Avoid blanket host blocks on challenges.cloudflare.com (widget may need assets).
+LOCAL_TURNSTILE_BLOCKED_URL_PATTERNS: tuple[str, ...] = (
+    "*.png",
+    "*.jpg",
+    "*.jpeg",
+    "*.gif",
+    "*.webp",
+    "*.svg",
+    "*.ico",
+    "*.bmp",
+    "*.avif",
+    "*.woff",
+    "*.woff2",
+    "*.ttf",
+    "*.otf",
+    "*.eot",
+    "*.mp4",
+    "*.webm",
+    "*.mp3",
+    "*.m4a",
+    "*.wav",
+    "*.ogg",
+    "*.avi",
+    "*.mov",
+    "*google-analytics.com*",
+    "*googletagmanager.com*",
+    "*googleadservices.com*",
+    "*doubleclick.net*",
+    "*facebook.net*",
+    "*facebook.com/tr*",
+    "*hotjar.com*",
+    "*sentry.io*",
+    "*newrelic.com*",
+    "*nr-data.net*",
+    "*clarity.ms*",
 )
 
 
@@ -2807,6 +2878,121 @@ def _load_turnstile_inflight_config_fallback() -> Dict[str, Any]:
         except Exception:
             continue
     return {}
+
+
+def _as_bool_config(value: object, *, default: bool = False) -> bool:
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if not text:
+        return bool(default)
+    if text in {"1", "true", "yes", "on", "y"}:
+        return True
+    if text in {"0", "false", "no", "off", "n"}:
+        return False
+    return bool(default)
+
+
+def resolve_local_turnstile_block_assets(
+    config: Optional[Dict[str, Any]] = None,
+    *,
+    default: bool = True,
+) -> bool:
+    """Whether local Chrome should block images/fonts/media/analytics.
+
+    Priority: env XAI_LOCAL_TURNSTILE_BLOCK_ASSETS > config > default(True).
+    """
+    env_raw = str(os.environ.get("XAI_LOCAL_TURNSTILE_BLOCK_ASSETS") or "").strip()
+    if env_raw:
+        return _as_bool_config(env_raw, default=default)
+    cfg = config if isinstance(config, dict) else _load_turnstile_inflight_config_fallback()
+    if isinstance(cfg, dict) and "local_turnstile_block_assets" in cfg:
+        return _as_bool_config(cfg.get("local_turnstile_block_assets"), default=default)
+    return bool(default)
+
+
+def resolve_local_turnstile_shared_cache(
+    config: Optional[Dict[str, Any]] = None,
+    *,
+    default: bool = True,
+) -> bool:
+    """Whether ephemeral profiles share one Chrome disk-cache-dir.
+
+    Priority: env XAI_LOCAL_TURNSTILE_SHARED_CACHE > config > default(True).
+    """
+    env_raw = str(os.environ.get("XAI_LOCAL_TURNSTILE_SHARED_CACHE") or "").strip()
+    if env_raw:
+        return _as_bool_config(env_raw, default=default)
+    cfg = config if isinstance(config, dict) else _load_turnstile_inflight_config_fallback()
+    if isinstance(cfg, dict) and "local_turnstile_shared_cache" in cfg:
+        return _as_bool_config(cfg.get("local_turnstile_shared_cache"), default=default)
+    return bool(default)
+
+
+def _ensure_local_turnstile_disk_cache_dir() -> Path:
+    path = Path(_LOCAL_TURNSTILE_DISK_CACHE_DIR)
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+    return path
+
+
+def local_turnstile_blocked_url_patterns() -> list[str]:
+    """Return CDP Network.setBlockedURLs patterns (copy, mutable for tests)."""
+    return list(LOCAL_TURNSTILE_BLOCKED_URL_PATTERNS)
+
+
+def _apply_turnstile_network_blocks(
+    page: Any,
+    *,
+    enabled: bool = True,
+    patterns: Optional[Sequence[str]] = None,
+    log_callback: LogFn = None,
+) -> int:
+    """Block nonessential browser assets before navigation to cut proxy traffic.
+
+    Uses CDP Network.setBlockedURLs. Keeps document/script/css/xhr so Turnstile
+    and the signup SPA can still function. Returns the number of patterns applied.
+    """
+    if not enabled:
+        return 0
+    selected = [
+        str(item).strip()
+        for item in (patterns if patterns is not None else LOCAL_TURNSTILE_BLOCKED_URL_PATTERNS)
+        if str(item or "").strip()
+    ]
+    if not selected:
+        return 0
+    run_cdp = getattr(page, "run_cdp", None)
+    if not callable(run_cdp):
+        _log(log_callback, "[Turnstile][warn] 当前页面不支持 CDP，跳过资源拦截")
+        return 0
+    try:
+        run_cdp("Network.enable")
+    except Exception as exc:
+        _log(log_callback, f"[Turnstile][warn] Network.enable 失败，跳过资源拦截: {_safe_error_text(exc)}")
+        return 0
+    try:
+        run_cdp("Network.setBlockedURLs", urls=selected)
+    except TypeError:
+        # Some DrissionPage builds expect a single params dict.
+        try:
+            run_cdp("Network.setBlockedURLs", {"urls": selected})
+        except Exception as exc:
+            _log(log_callback, f"[Turnstile][warn] setBlockedURLs 失败: {_safe_error_text(exc)}")
+            return 0
+    except Exception as exc:
+        _log(log_callback, f"[Turnstile][warn] setBlockedURLs 失败: {_safe_error_text(exc)}")
+        return 0
+    _log(
+        log_callback,
+        f"[Turnstile] 已拦截非必要资源 patterns={len(selected)}（图片/字体/媒体/统计）",
+    )
+    return len(selected)
 
 
 def resolve_local_turnstile_max_inflight(
@@ -3264,20 +3450,25 @@ class YydsTempMailbox:
     def _domain_candidates(self) -> List[str]:
         """Build ordered domain pool, then callers round-robin over it.
 
-        Priority group:
-          1) verified private
-          2) verified public
-          3) verified any
-          4) all returned domains
+        Pool construction (private first, then public — both stay in the RR pool):
+          1) verified private domains (front of pool)
+          2) verified public domains (appended after private)
+          3) if none of the above: any verified, else all returned domains
+
+        A single private domain no longer traps RR on that domain alone; public
+        domains are always merged in so multi-domain rotation still works when
+        the account only owns one private domain.
+
         Optional config.yyds_domains / yyds_domain_whitelist filters the pool.
         """
         rows = self._domains()
         if not rows:
             raise MailboxError("YYDS 没有返回任何可用域名")
 
-        def _names(group: List[Dict[str, Any]]) -> List[str]:
+        def _names(group: List[Dict[str, Any]], *, seen: Optional[set] = None) -> List[str]:
             out: List[str] = []
-            seen = set()
+            if seen is None:
+                seen = set()
             for item in group:
                 domain = str(item.get("domain") or "").strip()
                 if not domain:
@@ -3292,12 +3483,13 @@ class YydsTempMailbox:
         private = [d for d in rows if d.get("isVerified") and not d.get("isPublic")]
         public = [d for d in rows if d.get("isVerified") and d.get("isPublic")]
         verified = [d for d in rows if d.get("isVerified")]
+        seen: set = set()
         pool: List[str] = []
-        for group in (private, public, verified, rows):
-            names = _names(group)
-            if names:
-                pool = names
-                break
+        # Prefer private, but always append public so RR can rotate across both.
+        pool.extend(_names(private, seen=seen))
+        pool.extend(_names(public, seen=seen))
+        if not pool:
+            pool = _names(verified) or _names(rows)
         if not pool:
             raise MailboxError("YYDS 无已验证域名可用")
 
@@ -3356,12 +3548,26 @@ class YydsTempMailbox:
                 )
             code = int(getattr(response, "status_code", 0) or 0)
             body_text = str(getattr(response, "text", "") or "")
-            if code == 429 or "too many account creation requests" in body_text.lower():
+            body_lower = body_text.lower()
+            if code == 429 or "too many account creation requests" in body_lower:
                 last_error = MailboxError(
                     f"YYDS create HTTP {code or 429}: {_safe_error_text(body_text)}"
                 )
                 # Exponential-ish backoff for provider-side create limits.
                 time.sleep(min(12.0, 1.2 * attempt + (attempt - 1) * 0.8))
+                continue
+            # Shared domains can be temporarily closed by YYDS; mark and try another domain.
+            if (
+                "shared_domain_restricted" in body_lower
+                or "not accepting new public addresses" in body_lower
+            ):
+                last_error = MailboxError(
+                    f"YYDS create HTTP {code or 403}: {_safe_error_text(body_text)}"
+                )
+                try:
+                    _yyds_mark_domain_rejected(domain)
+                except Exception:
+                    pass
                 continue
             try:
                 data = self._json_ok(response, "create")
@@ -3370,6 +3576,16 @@ class YydsTempMailbox:
                 if "429" in msg or "too many" in msg:
                     last_error = exc
                     time.sleep(min(12.0, 1.2 * attempt + (attempt - 1) * 0.8))
+                    continue
+                if (
+                    "shared_domain_restricted" in msg
+                    or "not accepting new public addresses" in msg
+                ):
+                    last_error = exc
+                    try:
+                        _yyds_mark_domain_rejected(domain)
+                    except Exception:
+                        pass
                     continue
                 raise
             address = str(data.get("address") or f"{username}@{domain}").strip()
@@ -4302,6 +4518,73 @@ def save_account_record(path: str, *, email: str, password: str, sso: str) -> st
     return str(target)
 
 
+def registration_info_file_name(email: str = "") -> str:
+    """Stable basename for one registration-info JSON under REGISTRATION_INFO_DIR."""
+    from sso_to_auth_json import sanitize_file_segment
+
+    email_part = sanitize_file_segment(email)
+    if email_part:
+        return f"xai-{email_part}.json"
+    return f"xai-{int(time.time() * 1000)}.json"
+
+
+def save_registration_info(
+    output_dir: str = "",
+    *,
+    email: str,
+    password: str,
+    sso: str,
+    given_name: str = "",
+    family_name: str = "",
+    credential_path: str = "",
+    account_path: str = "",
+    sso_path: str = "",
+    proxy: str = "",
+    turnstile_provider: str = "",
+) -> str:
+    """Write one registration-info JSON (email/password/name/sso/paths/time).
+
+    Default directory is ``.local/registration_info``. Empty ``output_dir`` uses
+    that default; pass a non-empty path to override (useful for tests).
+    """
+    email = str(email or "").strip()
+    password = str(password or "")
+    sso = str(sso or "").strip()
+    if not email or not password or not sso:
+        return ""
+    root = str(output_dir or "").strip()
+    target_dir = Path(root).expanduser().resolve() if root else REGISTRATION_INFO_DIR.resolve()
+    target_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        if os.name != "nt":
+            os.chmod(target_dir, 0o700)
+    except OSError:
+        pass
+    target = target_dir / registration_info_file_name(email)
+    payload = {
+        "email": email,
+        "password": password,
+        "given_name": str(given_name or "").strip(),
+        "family_name": str(family_name or "").strip(),
+        "sso": sso,
+        "credential_path": str(credential_path or "").strip(),
+        "account_path": str(account_path or "").strip(),
+        "sso_path": str(sso_path or "").strip(),
+        "proxy": str(proxy or "").strip(),
+        "turnstile_provider": str(turnstile_provider or "").strip(),
+        "registered_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "registered_at_unix": int(time.time()),
+    }
+    text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    atomic_write_private_text(target, text)
+    try:
+        if os.name != "nt":
+            os.chmod(target, 0o600)
+    except OSError:
+        pass
+    return str(target)
+
+
 class _MailboxReservationLifecycle:
     """Own one mailbox reservation across a complete registration attempt."""
 
@@ -4352,6 +4635,7 @@ def _run_registration_impl(
     password: str = "",
     output_dir: str = "",
     accounts_output: str = "",
+    registration_info_dir: str = "",
     _mailbox_lifecycle: Optional[_MailboxReservationLifecycle] = None,
 ) -> RegistrationResult:
     lifecycle = _mailbox_lifecycle or _MailboxReservationLifecycle()
@@ -4656,13 +4940,34 @@ def _run_registration_impl(
         password=password,
         sso=sso,
     )
+    registration_info_path = save_registration_info(
+        registration_info_dir,
+        email=email,
+        password=password,
+        sso=sso,
+        given_name=given_name,
+        family_name=family_name,
+        credential_path=credential_path,
+        account_path=account_path,
+        sso_path=sso_path,
+        proxy=getattr(client, "proxy", "") or "",
+        turnstile_provider=turnstile_provider,
+    )
+    if registration_info_path:
+        _log(
+            client.log_callback,
+            f"[HTTP] 注册信息已保存 | email={mask_email(email)} | {registration_info_path}",
+        )
     return RegistrationResult(
         email=email,
         password=password,
         sso=sso,
+        given_name=given_name,
+        family_name=family_name,
         credential_path=credential_path,
         account_path=account_path,
         sso_path=sso_path,
+        registration_info_path=registration_info_path,
     )
 
 
@@ -4784,6 +5089,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--accounts-output",
         default="",
         help="账号输出文件；默认 accounts_http_时间戳.txt（包含密码和 sso）",
+    )
+    register.add_argument(
+        "--registration-info-dir",
+        default="",
+        help=(
+            "注册信息 JSON 目录；默认 .local/registration_info "
+            "（每账号一份，含邮箱/密码/姓名/sso/凭证路径/时间）"
+        ),
     )
     _add_token_options(register, registration=True)
 
@@ -4913,6 +5226,27 @@ def _build_turnstile_browser_options(
         "--no-sandbox",
         "--window-size=1365,900",
     ]
+    # Shared HTTP disk cache across ephemeral user-data dirs. Profiles stay
+    # isolated, but repeat signup SPA / Turnstile static assets hit disk first.
+    if resolve_local_turnstile_shared_cache():
+        try:
+            cache_dir = _ensure_local_turnstile_disk_cache_dir()
+            args.extend(
+                [
+                    f"--disk-cache-dir={cache_dir}",
+                    f"--disk-cache-size={int(_LOCAL_TURNSTILE_DISK_CACHE_SIZE)}",
+                ]
+            )
+            _log(
+                log_callback,
+                f"[Turnstile] 共享磁盘缓存: {cache_dir.name} "
+                f"size_mb={int(_LOCAL_TURNSTILE_DISK_CACHE_SIZE) // (1024 * 1024)}",
+            )
+        except Exception as exc:
+            _log(
+                log_callback,
+                f"[Turnstile][warn] 共享磁盘缓存不可用: {_safe_error_text(exc)}",
+            )
     for arg in args:
         _safe_call(getattr(options, "set_argument", None), arg)
 
@@ -5855,6 +6189,20 @@ def _capture_turnstile_token_impl(
             user_agent=user_agent,
             log_callback=log_callback,
         )
+        # DrissionPage defaults page_load=30s. Under concurrent local solves that
+        # budget alone can exhaust a 35s outer timeout and surface as an empty
+        # asyncio.TimeoutError. Align navigation with the solve budget.
+        try:
+            page_load_timeout = max(30, min(120, int(timeout or 30)))
+            set_timeouts = getattr(options, "set_timeouts", None)
+            if callable(set_timeouts):
+                set_timeouts(base=20, page_load=page_load_timeout, script=30)
+                _log(
+                    log_callback,
+                    f"[Turnstile] 浏览器超时 page_load={page_load_timeout}s script=30s",
+                )
+        except Exception as exc:
+            _log(log_callback, f"[Turnstile][warn] 设置浏览器超时失败: {_safe_error_text(exc)}")
         _log(log_callback, f"[Turnstile] 正在启动浏览器 mode={mode} headless={use_headless}")
         browser = _launch_turnstile_browser(options, log_callback=log_callback)
         register_project_browser(
@@ -5890,6 +6238,12 @@ def _capture_turnstile_token_impl(
                 log_callback,
                 f"[Turnstile] CDP 指纹已对齐 Chrome/{match.group(1).split('.', 1)[0]}",
             )
+        # Apply before first navigation so signup SPA assets are filtered.
+        _apply_turnstile_network_blocks(
+            page,
+            enabled=resolve_local_turnstile_block_assets(),
+            log_callback=log_callback,
+        )
         target_url = str(page_url or SIGNUP_URL).strip() or SIGNUP_URL
         page.get(target_url)
         _log(log_callback, f"[Turnstile] 已打开注册页: {target_url}")
@@ -6413,10 +6767,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 args.accounts_output
                 or str(ACCOUNTS_DIR / f"accounts_http_{time.strftime('%Y%m%d_%H%M%S')}.txt")
             ),
+            registration_info_dir=getattr(args, "registration_info_dir", "") or "",
         )
         print(
             "[+] 注册与凭证获取完成: "
-            f"email={mask_email(result.email)} cred={result.credential_path} accounts={result.account_path}"
+            f"email={mask_email(result.email)} cred={result.credential_path} "
+            f"accounts={result.account_path} info={result.registration_info_path}"
         )
         return 0
     except XAIHttpFlowError as exc:
